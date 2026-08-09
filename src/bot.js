@@ -47,6 +47,17 @@ const dashboard = require('./dashboard/server');
 // In-memory heist timers (leaderId -> timeout)
 const heistTimers = new Map();
 
+// Health/debug state for /debug (staff-only)
+let lastError = null;
+let commitHash = null;
+try {
+  commitHash =
+    process.env.RENDER_GIT_COMMIT ||
+    require('child_process').execSync('git rev-parse --short HEAD', { timeout: 2000 }).toString().trim();
+} catch (e) {
+  commitHash = null;
+}
+
 // Owner emoji reaction keywords (config.reactions)
 const REACT_KEYS = Object.keys(config.reactions).filter((k) => k !== 'fallback');
 
@@ -88,6 +99,12 @@ function createBot() {
     } catch (e) {
       return false;
     }
+  }
+
+  /** Staff check (owner + dashboard moderators). Used by the group gate,
+   *  Rimuru personality split, /debug and /restart. */
+  function isStaff(userId) {
+    return isAuthorized(userId);
   }
 
   /**
@@ -218,6 +235,116 @@ function createBot() {
       console.warn('[sticker] send failed:', e.message);
       return null;
     }
+  }
+
+  /* ---------- GROUP MEMBERSHIP GATE (@the_jtf) ---------- */
+  // Before any non-staff user can use the bot (games/economy/commands),
+  // they must be a member of config.requiredGroup. Staff bypass entirely.
+  // Membership results are cached for config.groupGateCacheMs (60s) to avoid
+  // hammering the Telegram API; the /verify button always re-checks fresh.
+
+  const membershipCache = new Map(); // userId -> { ok: boolean, at: number }
+
+  let resolvedGroupId = config.requiredGroupId || 0;
+  let groupResolvePromise = null;
+
+  /** Resolve the required group's numeric chat id via getChat('@the_jtf').
+   *  Uses the REQUIRED_GROUP_ID override when set. Cached after first OK. */
+  async function resolveRequiredGroup() {
+    if (resolvedGroupId) return resolvedGroupId;
+    if (groupResolvePromise) return groupResolvePromise;
+    if (!config.requiredGroup) return 0; // gate disabled
+    groupResolvePromise = (async () => {
+      try {
+        const chat = await bot.getChat(config.requiredGroup);
+        if (chat && chat.id) {
+          resolvedGroupId = chat.id;
+          console.log(`[gate] required group ${config.requiredGroup} resolved to chat ${resolvedGroupId}`);
+        } else {
+          console.warn(`[gate] getChat(${config.requiredGroup}) returned no id — gate OFF`);
+        }
+      } catch (e) {
+        console.warn(`[gate] could not resolve ${config.requiredGroup}: ${e.message} — gate OFF until resolved`);
+      } finally {
+        groupResolvePromise = null;
+      }
+      return resolvedGroupId;
+    })();
+    return groupResolvePromise;
+  }
+
+  /** Fresh membership check (never cached) — used by /verify. */
+  async function checkMembershipFresh(userId) {
+    if (isStaff(userId)) return { ok: true, staff: true };
+    const gid = await resolveRequiredGroup();
+    if (!gid) return { ok: true, gateOff: true }; // gate disabled/unresolved → allow
+    try {
+      const m = await bot.getChatMember(gid, userId);
+      const status = m && m.status;
+      const member = ['creator', 'administrator', 'member'].includes(status);
+      membershipCache.set(userId, { ok: member, at: Date.now() });
+      return { ok: member, status };
+    } catch (e) {
+      console.warn(`[gate] getChatMember(${gid}, ${userId}) error: ${e.message}`);
+      return { ok: false, status: 'error' };
+    }
+  }
+
+  /** Cached gate check (60s TTL). Fresh when expired. */
+  async function gateAllowed(userId) {
+    if (isStaff(userId)) return { ok: true, staff: true };
+    const cached = membershipCache.get(userId);
+    if (cached && Date.now() - cached.at < config.groupGateCacheMs) {
+      return { ok: cached.ok, cached: true };
+    }
+    return checkMembershipFresh(userId);
+  }
+
+  /** Is the gate actually active right now? (group configured + resolved) */
+  async function gateActive() {
+    if (!config.requiredGroup) return false;
+    if (config.requiredGroupId) return true;
+    const gid = await resolveRequiredGroup();
+    return !!gid;
+  }
+
+  /** The join-prompt message + inline "✅ Verify" button (always shown). */
+  function gatePrompt(chatId) {
+    const link = config.requiredGroup ? `https://t.me/${config.requiredGroup.replace(/^@/, '')}` : '';
+    return {
+      text:
+        `🔒 <b>JOIN THE GROUP FIRST</b>\n\n` +
+        `Mortal, you must be a member of <a href="${link}">${config.requiredGroup}</a> to use the casino.\n\n` +
+        `1️⃣ Tap the group link above and press <b>Join</b>\n` +
+        `2️⃣ Come back and tap <b>✅ Verify</b>\n\n` +
+        `Only members of the house get to play. 🐉`,
+      opts: {
+        title: '🔒 MEMBERS ONLY',
+        color: THEME.gold,
+        html: true,
+        reply_markup: {
+          inline_keyboard: [[{ text: '✅ Verify', callback_data: 'gate:verify' }]],
+        },
+        // The Verify button is essential to the gate flow — it must render
+        // even when SHOW_INLINE_BUTTONS=false.
+        alwaysShowMarkup: true,
+      },
+    };
+  }
+
+  /** /verify — force a FRESH membership check and report the result. */
+  async function verifyCommand(ctx) {
+    const res = await checkMembershipFresh(ctx.userId);
+    if (res.ok) {
+      await ctx.reply(
+        `✅ <b>VERIFIED!</b>\n\nWelcome to the house, ${ctx.msg.from.first_name || 'mortal'}. Everything is unlocked. 🎰`,
+        { title: '✅ VERIFIED', color: THEME.gold, html: true }
+      );
+    } else {
+      const p = gatePrompt(ctx.chatId);
+      await ctx.reply(p.text, p.opts);
+    }
+    return res;
   }
 
   /* ---------- owner smart reactions (dynamic, owner-only) ---------- */
@@ -430,6 +557,15 @@ function createBot() {
           reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('main') : undefined,
         }
       );
+      // GROUP GATE: even /start checks membership for non-staff — if they
+      // haven't joined the required group yet, show the join prompt.
+      if (!isStaff(ctx.userId)) {
+        const gate = await gateAllowed(ctx.userId);
+        if (!gate.ok) {
+          const p = gatePrompt(ctx.chatId);
+          await ctx.reply(p.text, p.opts);
+        }
+      }
     },
 
     menu: async (ctx) => sendMenu(ctx.chatId),
@@ -729,9 +865,12 @@ function createBot() {
       await ctx.reply(r.message, { title: '👑 ADMIN — UNMUTE', color: THEME.cyan });
     },
 
-    // ----- owner reset: clear ALL active state -----
+    // ----- staff reset: clear ALL active state (owner + moderators) -----
     restart: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      if (!isStaff(ctx.userId)) return ctx.reply('Only the King and his moderators can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      const actor = metaOf(ctx.msg);
+      db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'restart', 0, 'full state reset');
+      db.logActivity('mod', `/restart by ${actor.username || ctx.userId}`, { target: ctx.userId });
       const cleared = [];
 
       // 1) In-memory game sessions
@@ -784,6 +923,40 @@ function createBot() {
     sb: async (ctx) => {
       const r = staffCoin(ctx, 'set');
       await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
+    },
+
+    // ----- group gate -----
+    verify: async (ctx) => verifyCommand(ctx),
+
+    // ----- staff health dump (owner + moderators) -----
+    debug: async (ctx) => {
+      if (!isStaff(ctx.userId)) {
+        return ctx.reply('Only staff can do that. 👑', { title: '🔒 STAFF ONLY', color: THEME.red });
+      }
+      try {
+        const pkg = require('../package.json');
+        const stats = db.dashboardStats();
+        const cdCount = db.db.prepare('SELECT COUNT(*) AS c FROM cooldowns').get().c;
+        const mem = process.memoryUsage();
+        const gid = await resolveRequiredGroup();
+        const lines = [
+          `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
+          `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
+          `👥 <b>Users</b>: ${fmt(stats.totalUsers)} (${fmt(stats.activeUsers)} active)`,
+          `👪 <b>Groups</b>: ${fmt(stats.totalGroups)}`,
+          `💰 <b>Coins in circulation</b>: ${fmt(stats.coinsInCirculation)}`,
+          `⏳ <b>Active cooldowns</b>: ${fmt(cdCount)}`,
+          `🔒 <b>Required group</b>: ${config.requiredGroup || 'off'} (chat ${gid || 'unresolved'})`,
+          `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
+          `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
+        ];
+        const actor = metaOf(ctx.msg);
+        db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'debug', 0, 'staff debug dump');
+        db.logActivity('mod', `/debug by ${actor.username || ctx.userId}`, { target: ctx.userId });
+        await ctx.reply(lines.join('\n'), { title: '🛠 DEBUG', color: THEME.cyan, html: true });
+      } catch (e) {
+        await ctx.reply(`⚠️ Debug failed: ${e.message}`, { title: '🛠 DEBUG', color: THEME.red });
+      }
     },
   };
 
@@ -899,6 +1072,20 @@ function createBot() {
     }
 
     try {
+      /* ----- group gate: Verify button (FRESH membership re-check) ----- */
+      if (data === 'gate:verify') {
+        const res = await checkMembershipFresh(userId);
+        if (res.ok) {
+          await editMsg(chatId, messageId,
+            `✅ <b>VERIFIED!</b>\n\nWelcome to the house, ${from.first_name || 'mortal'}. Everything is unlocked. 🎰`,
+            { title: '✅ VERIFIED', color: THEME.gold, html: true });
+          await answerCb('✅ Verified! Enjoy the casino.');
+        } else {
+          await answerCb('Still not a member — join the group first!');
+        }
+        return;
+      }
+
       /* ----- menu system ----- */
       if (data.startsWith('menu:')) {
         const parts = data.split(':');
@@ -987,6 +1174,7 @@ function createBot() {
       await answerCb('Unknown button.');
     } catch (e) {
       console.error('[callback] error:', e.message);
+      lastError = e;
       await answerCb('Something went wrong.');
     }
   }
@@ -1044,9 +1232,22 @@ function createBot() {
         ctx.args = args;
         // (reply_to_message_id already set via msg._replyTarget at the top)
         try {
+          // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
+          // group to use games/economy/commands. Exempt: /start, /help,
+          // /verify, and staff commands (owner + moderators always bypass).
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug'];
+          if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
+            const gate = await gateAllowed(ctx.userId);
+            if (!gate.ok) {
+              const p = gatePrompt(chatId);
+              await reply(chatId, p.text, p.opts);
+              return;
+            }
+          }
           await handler(ctx);
         } catch (e) {
           console.error(`[cmd /${cmd}] error:`, e.message, e.stack);
+          lastError = e;
           await reply(chatId, `⚠️ Something went wrong with /${cmd}. Try again.`, { title: '💥 ERROR', color: THEME.red });
         }
         return;
@@ -1102,16 +1303,31 @@ function createBot() {
       msg.reply_to_message.from &&
       msg.reply_to_message.from.is_bot === true;
     if (rimuru.shouldTrigger(text) || isReplyToBot) {
+      // GROUP GATE: non-staff must be a member to chat with Rimuru.
+      if (!isStaff(userId)) {
+        const gate = await gateAllowed(userId);
+        if (!gate.ok) {
+          const p = gatePrompt(chatId);
+          await reply(chatId, p.text, p.opts);
+          return;
+        }
+      }
       const from = msg.from;
       const owner = isOwner(userId);
       const name = from.first_name || from.username || 'mortal';
       try {
         // Text FIRST, sticker AFTER — never the other way around.
-        const ans = await rimuru.reply(text, { id: userId, first_name: name, username: from.username, isOwner: owner });
+        // Personality split: staff (owner + moderators) get the warm
+        // colleague tone; everyone else gets strict Rimuru.
+        const ans = await rimuru.reply(text, {
+          id: userId, first_name: name, username: from.username,
+          isOwner: owner, isStaff: isStaff(userId),
+        });
         const textPromise = reply(chatId, ans, { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
         await stickerAfterText(chatId, textPromise);
       } catch (e) {
         console.error('[rimuru] reply error:', e.message);
+        lastError = e;
         await reply(chatId, 'Hmph. The void ate my words. Try again, mortal.', { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
       }
       return;

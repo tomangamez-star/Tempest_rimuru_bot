@@ -44,6 +44,20 @@ const config = {
   // default. Set SHOW_REPLY_KEYBOARD=false to disable it entirely.
   showReplyKeyboard: String(process.env.SHOW_REPLY_KEYBOARD || 'true').toLowerCase() === 'true',
 
+  // ===================== GROUP MEMBERSHIP GATE =====================
+  // Before any non-staff user can use the bot (games, economy, commands),
+  // they must be a member of REQUIRED_GROUP (default @the_jtf).
+  //  - REQUIRED_GROUP:    the group's @username; resolved to its numeric
+  //                       chat ID at runtime via getChat('@the_jtf').
+  //  - REQUIRED_GROUP_ID: optional numeric override (skips getChat).
+  //  - Set REQUIRED_GROUP to '' to disable the gate entirely.
+  // Staff (owner + dashboard moderators) always bypass the gate.
+  requiredGroup: process.env.REQUIRED_GROUP || '@the_jtf',
+  requiredGroupId: process.env.REQUIRED_GROUP_ID ? Number(process.env.REQUIRED_GROUP_ID) : 0,
+  // Membership checks are cached briefly (60s) to avoid hammering the
+  // Telegram API; the /verify button always does a FRESH check.
+  groupGateCacheMs: Number(process.env.GROUP_GATE_CACHE_MS || 60 * 1000),
+
   // Owner smart reactions (emoji reacts on the owner's messages)
   reactions: {
     die: '☠️',
