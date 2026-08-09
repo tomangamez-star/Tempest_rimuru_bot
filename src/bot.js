@@ -59,15 +59,19 @@ function createBot() {
   /**
    * Reply wrapper — auto-wraps in notebook-note style (HTML) unless `raw`.
    * opts: { title, color, icon, raw, html, parse_mode, reply_markup, ... }
+   * NOTE: game modules pass raw HTML with { parse_mode: 'HTML' } — that is
+   * treated as trusted HTML (opts.html === true OR parse_mode === 'HTML'),
+   * so it must NOT be escaped a second time.
    */
   async function reply(chatId, text, opts = {}) {
     let out = text;
     let parseMode = opts.parse_mode;
+    const trustedHtml = opts.html === true || opts.parse_mode === 'HTML';
     if (!opts.raw) {
       out = note(opts.title || 'RIMURU', text, {
         color: opts.color,
         icon: opts.icon,
-        html: opts.html === true,
+        html: trustedHtml,
       });
       parseMode = 'HTML';
     } else if (parseMode === 'HTML') {
@@ -93,11 +97,12 @@ function createBot() {
   async function editMsg(chatId, messageId, text, opts = {}) {
     let out = text;
     let parseMode = opts.parse_mode;
+    const trustedHtml = opts.html === true || opts.parse_mode === 'HTML';
     if (!opts.raw) {
       out = note(opts.title || 'RIMURU', text, {
         color: opts.color,
         icon: opts.icon,
-        html: opts.html === true,
+        html: trustedHtml,
       });
       parseMode = 'HTML';
     } else if (parseMode === 'HTML') {
@@ -780,19 +785,25 @@ function createBot() {
 
   /* ---------- boot: persistent command menu + bot identity ---------- */
 
+  const MENU_COMMANDS = [
+    { command: 'leaderboard', description: '🏆 Leaderboard' },
+    { command: 'balance', description: '💰 Balance' },
+    { command: 'casino', description: '🎰 Casino' },
+    { command: 'games', description: '🎮 Games' },
+    { command: 'economy', description: '💼 Economy' },
+    { command: 'help', description: '❓ Help' },
+  ];
+
   let botMeId = null;
   bot.getMe().then((me) => {
     botMeId = me.id;
-    return bot.setMyCommands([
-      { command: 'leaderboard', description: '🏆 Leaderboard' },
-      { command: 'balance', description: '💰 Balance' },
-      { command: 'casino', description: '🎰 Casino' },
-      { command: 'games', description: '🎮 Games' },
-      { command: 'economy', description: '💼 Economy' },
-      { command: 'help', description: '❓ Help' },
-    ]);
-  }).then(() => {
-    console.log('📜 Persistent command menu registered (setMyCommands).');
+    // Persistent command menu — the "☰ Menu" button next to the text input
+    // (Telegram shows these commands in the input-bar dropdown).
+    return bot.setMyCommands(MENU_COMMANDS)
+      .then(() => bot.setChatMenuButton({ menu_button: { type: 'commands' } }))
+      .then(() => bot.getMyCommands());
+  }).then((cmds) => {
+    console.log(`📜 Persistent command menu registered (setMyCommands): ${cmds.map((c) => `/${c.command}`).join(' ')}`);
   }).catch((e) => {
     console.warn('[boot] getMe/setMyCommands failed:', e.message);
   });

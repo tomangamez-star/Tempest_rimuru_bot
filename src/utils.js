@@ -144,19 +144,49 @@ function note(title, body, opts = {}) {
   // NOTE: no <span> allowed — Telegram HTML rejects bare <span> tags
   // (only <span class="tg-spoiler"> is valid). The colored look comes from
   // the emoji + <b>; the left red margin comes from <blockquote> itself.
+  const safeTitle = sanitizeHtml(t);
+  const safeBody = sanitizeHtml(b).trim();
+  if (!safeBody) {
+    // Telegram does not render the blockquote bar for empty content —
+    // always keep at least one text line inside the quote.
+    return `<blockquote><b>${icon} ${safeTitle}</b></blockquote>`;
+  }
   return (
-    `<blockquote><b>${icon} ${t}</b><br>` +
-    `${sanitizeHtml(b)}</blockquote>`
+    `<blockquote><b>${icon} ${safeTitle}</b>\n${safeBody}</blockquote>`
   );
 }
 
 /**
  * Safety net: strip ANY tag Telegram HTML does not support
  * (e.g. <span ...>, <div>, <style>, <font>) so a bad tag can never
- * cause a "can't parse entities" 400. Allowed: b,i,u,s,a,code,pre,blockquote,tg-spoiler,br.
+ * cause a "can't parse entities" 400.
+ *
+ * Rules (Telegram Bot API HTML subset):
+ *  - Allowed tags: b, i, u, s, a, code, pre, blockquote, tg-spoiler, br.
+ *  - ALL tag ATTRIBUTES are stripped (no attribute is legal on allowed
+ *    tags — e.g. <b style="..."> is rejected by Telegram).
+ *  - Empty pairs and duplicated opens are removed so no dangling/unmatched
+ *    tag can reach Telegram's parser.
+ *  - Anything that isn't a clean allowed tag is escaped to &lt; so it
+ *    renders as plain text instead of failing the whole message.
  */
 function sanitizeHtml(html) {
-  return String(html == null ? '' : html).replace(/<(?!\/?(?:b|i|u|s|a|code|pre|blockquote|tg-spoiler|br)(?:\s|>|\/))/gi, '&lt;');
+  let out = String(html == null ? '' : html)
+    // 1) <span class="tg-spoiler"> is legal (spoiler text)
+    .replace(/<span\s+class=["']tg-spoiler["']\s*>/gi, '<tg-spoiler>')
+    .replace(/<\/span\s*>/gi, '</tg-spoiler>')
+    // 2) strip attributes from every remaining tag
+    .replace(/<(\/?)(b|i|u|s|a|code|pre|blockquote|tg-spoiler|br)(\s[^>]*)?>/gi, '<$1$2>');
+  // 3) fixpoint: drop empty pairs + duplicate opens so no dangling tags remain
+  for (let i = 0; i < 5; i++) {
+    const prev = out;
+    out = out
+      .replace(/<(b|i|u|s|code|pre|tg-spoiler)>\s*<\/\1>/gi, '')
+      .replace(/<(b|i|u|s|code|pre|tg-spoiler)>(?=<\1>)/gi, '');
+    if (out === prev) break;
+  }
+  // 4) escape anything else that still looks like a tag
+  return out.replace(/<(?!\/?(?:b|i|u|s|a|code|pre|blockquote|tg-spoiler|br)\s*>)/gi, '&lt;');
 }
 
 /** Default Rimuru note header used across the bot. */
