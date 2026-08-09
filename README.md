@@ -104,8 +104,18 @@ npm run check     # node --check on every file
 4. Deploy.
 
 ### Storage notes (important)
-- **Free tier:** the filesystem is **ephemeral** — the SQLite DB resets whenever the service restarts/idles (~15 min of no traffic). Fine for testing; economy resets.
-- **Starter ($7/mo)+:** attach a **disk** (render.yaml includes a `/data` mount) and set `DB_PATH=/data/rimuru.db`, `DATA_DIR=/data` so the DB **persists** across restarts.
+- **Free tier:** the filesystem is **ephemeral** — the SQLite DB (`. /data/rimuru.db`) resets whenever the service restarts/idles (~15 min of no traffic). The bot works fine on free tier; it creates the DB file at runtime in the working directory. Economy just resets on sleep/restart — fine for testing.
+- **Starter ($7/mo) + persistent disk:** attach a disk so the DB **survives restarts**. In Render's dashboard: your service → **Disks** → **Add Disk** (mount path `/data`, 1 GB), then set these env vars:
+  - `DB_PATH=/data/rimuru.db`
+  - `DATA_DIR=/data`
+- **Blueprint users:** the `disk:` block is commented out in `render.yaml` because **Render free tier rejects disks** (`services[0] disks are not supported for free tier services`). After upgrading your plan, uncomment it to provision the disk automatically:
+  ```yaml
+  # in render.yaml, under the service:
+  disk:
+    name: rimuru-data
+    mountPath: /data
+    sizeGB: 1
+  ```
 
 ---
 

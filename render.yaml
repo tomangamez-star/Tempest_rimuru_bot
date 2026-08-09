@@ -20,15 +20,22 @@ services:
         value: production
       - key: PORT
         value: "10000"
+      # Relative DB path → works on FREE tier (no disk mount needed).
+      # The SQLite file lives in the service's ephemeral filesystem and
+      # resets on restart/idle. See README "Storage notes" for persistence.
       - key: DB_PATH
-        value: /tmp/rimuru.db
+        value: ./data/rimuru.db
       - key: DATA_DIR
-        value: /tmp/rimuru-data
+        value: ./data
       - key: ALLOWED_UPDATES
         value: "messages,callback_query"
       - key: PUBLIC_URL
         value: "" # optional: set to your Render URL if you enable webhooks
-    disk:
-      name: rimuru-data
-      mountPath: /data
-      sizeGB: 1
+    # 💡 PERSISTENT DISK (paid tiers only — Starter $7/mo and up).
+    # Free tier does NOT support disks, so this block is commented out.
+    # If you upgrade, uncomment it and change the env vars above to:
+    #   DB_PATH=/data/rimuru.db  DATA_DIR=/data
+    # disk:
+    #   name: rimuru-data
+    #   mountPath: /data
+    #   sizeGB: 1

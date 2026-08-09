@@ -23,8 +23,11 @@ const config = {
   isProd: (process.env.NODE_ENV || 'development') === 'production',
 
   // Storage
-  dbPath: process.env.DB_PATH || '/tmp/rimuru.db',
-  dataDir: process.env.DATA_DIR || '/tmp/rimuru-data',
+  // Relative path → works anywhere (local dev AND Render free tier without a disk).
+  // Override with DB_PATH=/data/rimuru.db + DATA_DIR=/data when using a
+  // persistent disk on Starter+ (see README "Storage notes").
+  dbPath: process.env.DB_PATH || './data/rimuru.db',
+  dataDir: process.env.DATA_DIR || './data',
 
   // Economy
   startBalance: 500000,
