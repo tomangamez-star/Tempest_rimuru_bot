@@ -26,7 +26,7 @@ const admin = require('./admin');
 const leaderboard = require('./leaderboard');
 const rimuru = require('./rimuru');
 const income = require('./income');
-const { fmt, humanDuration, note, THEME } = require('./utils');
+const { fmt, humanDuration, note, pick, THEME } = require('./utils');
 const send = require('./send');
 
 const slots = require('./games/slots');
@@ -208,21 +208,52 @@ function createBot() {
     }
   }
 
-  /* ---------- owner smart reactions ---------- */
+  /* ---------- owner smart reactions (dynamic, owner-only) ---------- */
 
+  // Dynamic fallback pool — picked at random so reactions feel alive.
+  const REACT_POOL = ['👍', '❤️', '😄', '😂', '👏', '🔥', '💯', '😎'];
+
+  /** Does this message target Rimuru (mention, reply-to-bot, or command)? */
+  function targetsRimuru(msg) {
+    const text = String(msg.text || msg.caption || '');
+    if (text.startsWith('/')) return true;            // bot command
+    if (rimuru.shouldTrigger(text)) return true;      // "rimuru" / mention
+    const r = msg.reply_to_message;
+    return !!(r && r.from && r.from.is_bot === true); // reply to the bot
+  }
+
+  /**
+   * Pick a dynamic emoji for the owner's message: keyword reactions win
+   * (e.g. "nice" → 👏), then sentiment hints, then a random pool pick so
+   * it feels alive and varied.
+   */
   function reactionFor(text) {
     const t = String(text || '').toLowerCase();
     for (const key of REACT_KEYS) {
       if (t.includes(key)) return config.reactions[key];
     }
-    return THEME.acc.slime; // 🐉 default vibe
+    if (/\b(win|won|rich|profit|gain|lucky|jackpot|nice|great|love|good|yay)\b/.test(t)) {
+      return pick(['🎉', '🔥', '💯', '😄', '💰']);
+    }
+    if (/\b(lose|lost|broke|bad|sad|cry|rip|ouch|damn|fail|unlucky)\b/.test(t)) {
+      return pick(['💸', '😢', '😅', '🫠', '🙃']);
+    }
+    if (/\b(angry|mad|hate|rage|wtf|fuck|annoying)\b/.test(t)) {
+      return pick(['😡', '🤬', '😤']);
+    }
+    if (t.includes('?')) {
+      return pick(['🤔', '🧐']);
+    }
+    return pick(REACT_POOL);
   }
 
+  /** Owner-only dynamic emoji reaction, fired before the text reply. */
   async function maybeReact(msg) {
     if (!msg.from || msg.from.is_bot) return;
-    if (!isOwner(msg.from.id)) return; // owner only
+    if (!isOwner(msg.from.id)) return;                 // owner only
+    if (!targetsRimuru(msg)) return;                   // tag / reply / command only
     const text = String(msg.text || msg.caption || '');
-    if (!text || text.startsWith('/')) return; // skip commands
+    if (!text) return;
     try {
       await bot.setMessageReaction(msg.chat.id, msg.message_id, {
         reaction: [{ type: 'emoji', emoji: reactionFor(text) }],
@@ -341,15 +372,22 @@ function createBot() {
   /** Build a menu message (text + markup) and send it. */
   async function sendMenu(chatId, page = 'main', opts = {}) {
     const m = MENU[page]();
-    const text = note('📜 RIMURU MENU', m.text, { color: THEME.gold, icon: '📜', html: true });
-    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: send.inlineMarkup(m.markup), ...opts });
+    // Route through reply() so the menu message is a blockquote note too
+    // (bar renders) and reply_to_message_id is honoured.
+    return reply(chatId, m.text, {
+      title: '\ud83d\udcdc RIMURU MENU', color: THEME.gold, icon: '\ud83d\udcdc',
+      html: true, reply_markup: send.inlineMarkup(m.markup), ...opts,
+    });
   }
 
   /** Edit an existing menu message to a different page. */
   async function editMenu(chatId, messageId, page = 'main') {
     const m = MENU[page]();
-    const text = note('📜 RIMURU MENU', m.text, { color: THEME.gold, icon: '📜', html: true });
-    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: send.inlineMarkup(m.markup) }).catch((e) => {
+    // Route through editMsg() — same blockquote-note style, parse-error safe.
+    return editMsg(chatId, messageId, m.text, {
+      title: '\ud83d\udcdc RIMURU MENU', color: THEME.gold, icon: '\ud83d\udcdc',
+      html: true, reply_markup: send.inlineMarkup(m.markup),
+    }).catch((e) => {
       console.warn('[menu] edit failed:', e.message);
       return null;
     });
@@ -835,6 +873,10 @@ function createBot() {
     const text = String(msg.text || msg.caption || '');
     const userId = msg.from.id;
     const chatId = msg.chat.id;
+    // Quote the triggering message on EVERY response from this handler —
+    // commands, reply-keyboard taps, Rimuru replies, even penalty/error
+    // messages show the "replying to @user" bubble above the reply.
+    msg._replyTarget = msg.message_id;
     const ctx = buildCtx(msg, []);
 
     // Expire temporary penalties periodically (cheap)
@@ -857,9 +899,7 @@ function createBot() {
       const handler = handlers[cmd];
       if (handler) {
         ctx.args = args;
-        // Reply-to-message: bot commands quote the triggering message so
-        // the response shows "replying to @user" above it.
-        ctx.msg._replyTarget = msg.message_id;
+        // (reply_to_message_id already set via msg._replyTarget at the top)
         try {
           await handler(ctx);
         } catch (e) {
@@ -876,7 +916,6 @@ function createBot() {
     // casino sub-keyboard instead of triggering an AI reply.)
     const kbRoute = keyboards.routeButton(text);
     if (kbRoute) {
-      ctx.msg._replyTarget = msg.message_id;
       if (kbRoute.back) {
         // 🔙 Back → main keyboard (and a hint message)
         await reply(chatId, `⌨️ <b>Main menu</b> — pick a category.`, {
