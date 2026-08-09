@@ -80,6 +80,16 @@ function createBot() {
     return String(userId) === String(config.ownerId);
   }
 
+  /** Authorized staff = the owner OR a moderator registered in the dashboard. */
+  function isAuthorized(userId) {
+    if (isOwner(userId)) return true;
+    try {
+      return !!db.getAdminUser(Number(userId));
+    } catch (e) {
+      return false;
+    }
+  }
+
   /**
    * Reply wrapper — EVERY message is a blockquote notebook note (HTML).
    * opts: { title, color, icon, raw, html, parse_mode, reply_markup,
@@ -765,6 +775,16 @@ function createBot() {
         { title: '👑 ADMIN — RESTART', color: THEME.gold, html: true }
       );
     },
+
+    // ----- staff coin commands (owner + dashboard moderators) -----
+    addcoin: async (ctx) => {
+      const r = staffCoin(ctx, 'add');
+      await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
+    },
+    sb: async (ctx) => {
+      const r = staffCoin(ctx, 'set');
+      await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
+    },
   };
 
   /** Split "/ban 2h spamming" → { dur: '2h', reason: 'spamming' } */
@@ -774,6 +794,68 @@ function createBot() {
       return { dur: args[0], reason: args.slice(1).join(' ') };
     }
     return { dur: null, reason: args.join(' ') };
+  }
+
+  /**
+   * /addcoin <amount> [@username | reply] — add coins to a user's wallet.
+   * /sb <amount> [@username | reply]     — set a user's wallet exactly.
+   * Owner + dashboard moderators only (moderators table in the dashboard DB).
+   * No target → the command sender. Amount must be a positive number.
+   */
+  function staffCoin(ctx, mode) {
+    if (!isAuthorized(ctx.userId)) {
+      return {
+        title: '🔒 STAFF ONLY',
+        color: THEME.red,
+        message: 'Only the King and his moderators can do that. 👑',
+      };
+    }
+    const raw = String((ctx.args || [])[0] || '').trim();
+    const amt = Math.floor(Number(raw.replace(/,/g, '')));
+    if (!Number.isFinite(amt) || amt <= 0) {
+      return {
+        title: mode === 'add' ? '➕ ADDCOIN' : '🎯 SET BALANCE',
+        color: THEME.red,
+        message: `Usage: <code>/${mode} [amount] [@username or reply]</code> — amount must be a positive number.`,
+      };
+    }
+    // Target resolution: replied-to user > @username > the sender
+    let targetId = ctx.userId;
+    const replied = repliedUser(ctx.msg);
+    const mention = (ctx.args || []).find((a) => String(a).startsWith('@'));
+    if (replied) {
+      targetId = replied.id;
+    } else if (mention) {
+      const uname = String(mention).slice(1).toLowerCase();
+      const row = db.db.prepare('SELECT user_id FROM users WHERE LOWER(username) = ? LIMIT 1').get(uname);
+      if (!row) {
+        return {
+          title: '❓ UNKNOWN USER',
+          color: THEME.red,
+          message: `No user found for <code>@${uname}</code> — they must /start the bot first.`,
+        };
+      }
+      targetId = row.user_id;
+    }
+    const actor = metaOf(ctx.msg);
+    const target = db.getOrCreateUser(targetId);
+    if (mode === 'add') db.addWallet(targetId, amt);
+    else db.setWallet(targetId, amt);
+    const after = db.getUser(targetId);
+    db.logActivity('admin', `/${mode} ${fmt(amt)} -> ${target.first_name || targetId} by ${actor.username || ctx.userId}`, {
+      target: targetId,
+      actor: ctx.userId,
+    });
+    return {
+      title: mode === 'add' ? '➕ COINS ADDED' : '🎯 BALANCE SET',
+      color: THEME.gold,
+      message:
+        (mode === 'add'
+          ? `➕ <b>Added</b> ${fmt(amt)} coins to `
+          : `🎯 <b>Set</b> balance to <b>${fmt(amt)}</b> for `) +
+        `<a href="tg://user?id=${targetId}">${target.first_name || targetId}</a>.\n` +
+        `💰 Wallet: <b>${fmt(after.wallet)}</b> · 🏦 Bank: <b>${fmt(after.bank)}</b> · 💎 Net: <b>${fmt(after.wallet + after.bank)}</b>`,
+    };
   }
 
   /** Schedule heist execution after the 60s open window. */

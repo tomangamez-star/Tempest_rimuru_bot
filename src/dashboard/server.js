@@ -91,19 +91,14 @@ const MOD_HISTORY_MAX = 200;
 
 /** Generate a random dashboard password if none configured. */
 function ensureOwnerPassword() {
-  let pw = config.dashboard.password;
-  if (!pw) {
-    pw = crypto.randomBytes(4).toString('hex'); // 8 chars
-    console.log(`[dashboard] No DASHBOARD_PASSWORD set — generated owner password: ${pw}`);
-    console.log(`[dashboard] Set DASHBOARD_PASSWORD on Render to make it permanent.`);
-  }
+  // Always uses the CURRENT configured password (DASHBOARD_PASSWORD env or
+  // the fixed default in config) and upserts the owner row, so the password
+  // takes effect even on instances that already have an owner account.
+  const pw = config.dashboard.password || '';
   const owner = db.getAdminUser(OWNER_ID);
+  db.addAdminUser(OWNER_ID, (owner && owner.username) || 'thedevilslord', 'owner', pw);
   if (!owner) {
-    db.addAdminUser(OWNER_ID, 'thedevilslord', 'owner', pw);
     console.log(`[dashboard] Owner admin account created (user_id ${OWNER_ID}).`);
-  } else if (owner.role !== 'owner') {
-    // keep role=owner even if the row exists as mod
-    db.addAdminUser(OWNER_ID, owner.username || 'thedevilslord', 'owner', owner.password || pw);
   }
   return pw;
 }

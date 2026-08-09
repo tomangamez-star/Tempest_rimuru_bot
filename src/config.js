@@ -70,7 +70,9 @@ const config = {
   //  - DASHBOARD_ENABLED: set to 'false' to disable the dashboard entirely.
   dashboard: {
     enabled: String(process.env.DASHBOARD_ENABLED || 'true').toLowerCase() !== 'false',
-    password: process.env.DASHBOARD_PASSWORD || '',
+    // Fixed default password so the owner never has to dig through Render
+    // logs. Override anytime by setting DASHBOARD_PASSWORD on Render.
+    password: process.env.DASHBOARD_PASSWORD || 'RimuruTempest2024!',
     sessionTtlMs: 7 * 24 * 3600 * 1000, // 7-day session cookie
     // Max chat-log lines kept per message for the feed
     feedLimit: 100,
