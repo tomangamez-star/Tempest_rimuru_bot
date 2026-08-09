@@ -19,7 +19,7 @@ const admin = require('./admin');
 const leaderboard = require('./leaderboard');
 const rimuru = require('./rimuru');
 const income = require('./income');
-const { fmt, humanDuration, note, THEME } = require('./utils');
+const { fmt, humanDuration, note, THEME, sanitizeHtml } = require('./utils');
 
 const slots = require('./games/slots');
 const dice = require('./games/dice');
@@ -70,13 +70,18 @@ function createBot() {
         html: opts.html === true,
       });
       parseMode = 'HTML';
+    } else if (parseMode === 'HTML') {
+      // Raw HTML still gets the safety net — strip unsupported tags.
+      out = sanitizeHtml(out);
     }
     try {
       return await bot.sendMessage(chatId, out, { ...opts, parse_mode: parseMode });
     } catch (e) {
       console.warn('[reply] fallback (plain):', e.message);
       try {
-        return await bot.sendMessage(chatId, String(text).replace(/[*_`\[\]]/g, ''), { ...opts, parse_mode: undefined });
+        // Strip ALL tags + markdown so plain text can never fail to parse.
+        const plain = String(text).replace(/<[^>]*>/g, '').replace(/[*_`\[\]]/g, '');
+        return await bot.sendMessage(chatId, plain, { ...opts, parse_mode: undefined });
       } catch (e2) {
         console.error('[reply] failed:', e2.message);
         return null;
@@ -95,11 +100,23 @@ function createBot() {
         html: opts.html === true,
       });
       parseMode = 'HTML';
+    } else if (parseMode === 'HTML') {
+      out = sanitizeHtml(out);
     }
     try {
       return await bot.editMessageText(out, { chat_id: chatId, message_id: messageId, ...opts, parse_mode: parseMode });
     } catch (e) {
       console.warn('[edit] failed:', e.message);
+      // Parse-error rescue: retry once with plain text (no parse_mode).
+      if (/can't parse entities|parse entities/i.test(e.message)) {
+        try {
+          const plain = String(text).replace(/<[^>]*>/g, '').replace(/[*_`\[\]]/g, '');
+          return await bot.editMessageText(plain, { chat_id: chatId, message_id: messageId, ...opts, parse_mode: undefined });
+        } catch (e2) {
+          console.error('[edit] retry failed:', e2.message);
+          return null;
+        }
+      }
       return null;
     }
   }

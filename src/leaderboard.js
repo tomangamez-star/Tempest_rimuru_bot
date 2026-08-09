@@ -17,8 +17,8 @@ function render() {
   const lines = top.map((u, i) => {
     const name = esc(u.first_name || u.username || `User${u.user_id}`, false);
     const rank = MEDALS[i] || `${i + 1}.`;
-    // Shiny bright gold numbers — pop on dark themes
-    return `${rank} <b>${name}</b> — 💎 <b><span style="color:#FFD54F">${fmt(u.networth)}</span></b>`;
+    // Bright gold numbers via emoji + <b> (no <span> — Telegram rejects bare spans)
+    return `${rank} <b>${name}</b> — 💎 <b>${fmt(u.networth)}</b>`;
   });
 
   return (

@@ -141,10 +141,22 @@ function note(title, body, opts = {}) {
       .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
       .replace(/`([^`]+)`/g, '<code>$1</code>');
   }
+  // NOTE: no <span> allowed — Telegram HTML rejects bare <span> tags
+  // (only <span class="tg-spoiler"> is valid). The colored look comes from
+  // the emoji + <b>; the left red margin comes from <blockquote> itself.
   return (
-    `<blockquote><b><span style="color:${color}">${icon} ${t}</span></b><br>` +
-    `${b}</blockquote>`
+    `<blockquote><b>${icon} ${t}</b><br>` +
+    `${sanitizeHtml(b)}</blockquote>`
   );
+}
+
+/**
+ * Safety net: strip ANY tag Telegram HTML does not support
+ * (e.g. <span ...>, <div>, <style>, <font>) so a bad tag can never
+ * cause a "can't parse entities" 400. Allowed: b,i,u,s,a,code,pre,blockquote,tg-spoiler,br.
+ */
+function sanitizeHtml(html) {
+  return String(html == null ? '' : html).replace(/<(?!\/?(?:b|i|u|s|a|code|pre|blockquote|tg-spoiler|br)(?:\s|>|\/))/gi, '&lt;');
 }
 
 /** Default Rimuru note header used across the bot. */
@@ -166,4 +178,5 @@ module.exports = {
   THEME,
   note,
   noteHeader,
+  sanitizeHtml,
 };

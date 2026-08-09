@@ -20,6 +20,12 @@ services:
         value: production
       - key: PORT
         value: "10000"
+      # Single instance: Render sometimes briefly runs 2 processes during a
+      # deploy (old + new) → Telegram "409 Conflict: terminated by other
+      # getUpdates request". Force ONE worker + let the app's instance guard
+      # (src/index.js) pick the primary when RENDER_INSTANCE_ID is present.
+      - key: WEB_CONCURRENCY
+        value: "1"
       # Relative DB path → works on FREE tier (no disk mount needed).
       # The SQLite file lives in the service's ephemeral filesystem and
       # resets on restart/idle. See README "Storage notes" for persistence.
