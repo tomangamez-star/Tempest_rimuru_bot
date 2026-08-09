@@ -23,12 +23,12 @@ async function play(ctx) {
   const bet = parseBet(args[1], eco, userId);
   if (bet.error) return reply(bet.error);
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'coinflip', 'Coin Flip');
   if (g.blocked) return reply(g.message);
 
   const charge = eco.chargeWallet(userId, bet.amount, 'flip');
   if (!charge.ok) return reply(charge.message);
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'coinflip', config.perGameCooldownMs);
 
   const r = flipCoin(bet.amount, norm);
   let net = -bet.amount;

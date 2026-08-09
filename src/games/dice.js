@@ -24,12 +24,12 @@ async function play(ctx) {
     return reply('🎩 Usage: `/dice [1-6] [amount]` — e.g. `/dice 5 2000`');
   }
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'dice', 'Dice');
   if (g.blocked) return reply(g.message);
 
   const charge = eco.chargeWallet(userId, bet.amount, 'dice roll');
   if (!charge.ok) return reply(charge.message);
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'dice', config.perGameCooldownMs);
 
   let rolled = null;
   try {

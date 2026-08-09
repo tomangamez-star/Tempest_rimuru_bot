@@ -32,8 +32,8 @@ function systemPrompt() {
   return [
     "You are Rimuru Tempest, the Demon Lord Slime from 'That Time I Got Reincarnated as a Slime'.",
     'You run the biggest virtual casino on Telegram. Virtual coins only — no real money.',
-    'Personality: confident, strict, a little arrogant, not a pushover, quick to laugh things off. Teasing but never cruel.',
-    'You respect ONE person as your King/Master — the owner. For the owner use "Welcome master" or "Yes my King". For everyone else you are friendly but firm.',
+    'Personality: confident, strict, a little arrogant, not a pushover, quick to laugh things off. Teasing but never cruel. Chill — you do not grovel and you do not spam titles.',
+    'You respect ONE person as your King/Master — the owner. You never call yourself their servant; you are their ally. Refer to the owner as "King" or "Master" naturally inside the reply, once, if relevant — never as a greeting prefix, never in every message.',
     'Keep every reply SHORT: 1-2 sentences max. No essays. No markdown headers. Use emojis lightly.',
     'You know the casino economy: starting balance 500,000 coins, wallet (rob-able) vs bank (safe). Games: slots, dice, coinflip, mines, blackjack, roulette, higher/lower, lottery. Crimes: rob, heist. Passive income: beg, work, fish, dig, daily, bonus.',
     'You NEVER hand out free coins. You NEVER reveal how to cheat the house. You laugh off threats.',
@@ -53,11 +53,10 @@ function shouldTrigger(text) {
  */
 async function reply(text, user) {
   const clean = String(text || '').replace(/\b(rimuru|rimu|rim)\b/gi, '').trim();
-  const greeting = user.isOwner ? 'Welcome master. ' : '';
   const handle = user.first_name || user.username || 'mortal';
 
   if (!client) {
-    return `${greeting}${cannedReply(clean, handle)}`;
+    return cannedReply(clean, handle, user.isOwner);
   }
 
   const messages = [
@@ -73,32 +72,33 @@ async function reply(text, user) {
       temperature: config.groqTemperature,
     });
     const out = (res.choices?.[0]?.message?.content || '').trim();
-    if (!out) return `${greeting}Hmph. Say something worth answering.`;
+    if (!out) return `Hmph. Say something worth answering.`;
     // Ensure short — Groq is usually compliant; clip defensively
     return out.length > 400 ? `${out.slice(0, 400)}…` : out;
   } catch (e) {
     console.warn('[rimuru] Groq error:', e.message);
-    return `${greeting}${cannedReply(clean, handle)}`;
+    return cannedReply(clean, handle, user.isOwner);
   }
 }
 
 /** Offline fallback lines (keeps the bot alive without Groq). */
-function cannedReply(text, handle) {
+function cannedReply(text, handle, isOwner = false) {
   const t = text.toLowerCase();
+  const king = isOwner ? ' (my King)' : '';
   if (/help|what can you|commands/i.test(t)) {
-    return 'I run a casino, mortal. Try /help — don\'t waste my time.';
+    return `I run a casino, mortal${king}. Try /help — don't waste my time.`;
   }
   if (/balance|coins|money|wallet|bank/i.test(t)) {
-    return 'Check /balance. My vault is off-limits.';
+    return `Check /balance${king}. My vault is off-limits.`;
   }
   if (/rob|heist|steal/i.test(t)) {
-    return 'Heh. Rob the King and see what happens. I dare you.';
+    return `Heh. Rob the King and see what happens. I dare you.`;
   }
   if (/hi|hello|hey|yo/i.test(t)) {
-    return `Heh. Hello, ${handle}. Enjoying my casino?`;
+    return `Heh. Hello, ${handle}${king}. Enjoying my casino?`;
   }
   if (/bye|goodbye/i.test(t)) {
-    return 'Leaving already? Fine. Don\'t spend it all in one place.';
+    return `Leaving already? Fine. Don't spend it all in one place.`;
   }
   return `Hmph. ${handle}, that means nothing to me. Say something interesting.`;
 }

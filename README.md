@@ -8,17 +8,20 @@ Built with **Node.js + node-telegram-bot-api + better-sqlite3**, with **Rimuru A
 
 ## ✨ Features
 
-### 🎮 Games (2 min cooldown)
+### 🎮 Games (per-game cooldown — no global gambling cooldown)
 | Command | Description |
 |---|---|
 | `/slots [amt]` | 3-reel slots. 2 match = 2×, 3 match = 4× |
 | `/dice [1-6] [amt]` | Telegram animated dice. Hit your number = 6× (rare) |
 | `/cf [heads\|tails] [amt]` | Coin flip. Win = 2× |
-| `/mines [amt]` | 5×5 minefield, 3 hidden mines, inline-button grid. Safe pick → 💎 and multiplier climbs (1.25× → 1.5× → …). Cash out anytime. Hit a mine = lose everything |
+| `/mines [amt]` | 5×5 minefield, 3 hidden mines, inline-button grid. Safe pick → 💎 (the tapped cell grows bigger!) and multiplier climbs (1.25× → 1.5× → …). Cash out anytime. Hit a mine = lose everything |
 | `/bj [amt]` | Blackjack. Hit/Stand/Double, dealer stands on 17+, blackjack pays 3:2 |
 | `/roulette … [amt]` | `color red/black`, `even/odd`, `low/high`, `dozen 1-3`, `column 1-3`, `straight 0-36` (36×), `split a,b` (18×) |
 | `/hl [amt]` | Higher or Lower. Streak multiplier, cash out anytime, wrong guess = bust |
 | `/lottery [buy\|draw\|status] [n]` | Ticket = 10,000. Base pot 5,000,000 grows with tickets. 5 buyers needed for the draw. Weighted winner takes the pot |
+
+> ⚡ **No global cooldown** — you can jump between games instantly. Each game
+> has its own individual cooldown (2 min) so you can't spam the same table.
 
 ### 💰 Economy
 - New users start with **500,000 coins**
@@ -45,10 +48,18 @@ Built with **Node.js + node-telegram-bot-api + better-sqlite3**, with **Rimuru A
 Durations like `30m`, `2h`, `1d`, `1w` — omit for permanent. Reason + duration are announced when the penalty ends.
 
 ### 🏆 Leaderboard
-`/lb` — live top 10 by net worth (wallet + bank), shiny medals 🥇–🔟.
+`/lb` — live top 10 by net worth (wallet + bank), shiny gold medals 🥇–🔟.
 
-### 🤖 Rimuru AI
-Say **"Rimuru"** anywhere in chat → he replies via **Groq** (`llama-3.3-70b-versatile`), with full knowledge of the economy and live leaderboard context. Short, confident, teasing replies. He greets the King (owner) with *"Welcome master"*. Falls back to canned lines if Groq is down.
+### 📜 Menus
+- **Persistent command menu** under the input box: 🏆 Leaderboard · 💰 Balance · 🎰 Casino · 🎮 Games · 💼 Economy · ❓ Help (set via `setMyCommands` on boot)
+- **`/menu`** — multi-level inline menu: main page → **Casino** (Blackjack, Roulette, Slots, Lottery) and **Games** (Coin Flip, Mines, Dice, Higher/Lower) sub-pages with ⬅️ Back buttons. Leaderboard/Balance/Help/Game-details reply *threaded under* the menu message.
+
+### 🐉 Rimuru AI
+- Say **"Rimuru"** anywhere in chat — or simply **reply to one of the bot's messages** — and Rimuru replies via **Groq** (`llama-3.3-70b-versatile`), with full knowledge of the economy and live leaderboard context. Short, confident, teasing. He respects the King (owner) naturally — no "Welcome master" spam. Falls back to canned lines if Groq is down.
+- **Stickers** — every Rimuru reply sends a random sticker from the pack `Tensei_Shitara_Slime_Datta_Ken2` (a big Tensura/Rimuru pack). Set `STICKER_PACK` to change it; unset/invalid → stickers are skipped gracefully.
+
+### 👑 Owner perks
+- **Smart emoji reactions**: Rimuru reacts to the *owner's* messages with a fitting emoji — `die`→☠️, `lol`/`haha`→😂, `win`/`rich`→💰, `lose`/`broke`→💸, `love`→❤️, `mad`/`angry`→😡, `gg`/`nice`→👏, `?`→🤔, otherwise 🐉.
 
 ---
 

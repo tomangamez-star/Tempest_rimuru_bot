@@ -67,7 +67,7 @@ async function play(ctx) {
   const bet = parseBet(args[0], eco, userId);
   if (bet.error) return reply(bet.error);
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'higherlower', 'Higher or Lower');
   if (g.blocked) return reply(g.message);
 
   if (sessions.has(userId)) {
@@ -76,7 +76,7 @@ async function play(ctx) {
 
   const charge = eco.chargeWallet(userId, bet.amount, 'round');
   if (!charge.ok) return reply(charge.message);
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'higherlower', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
   const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'Markdown', reply_markup: keyboard(s) });

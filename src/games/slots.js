@@ -30,13 +30,13 @@ async function play(ctx) {
   const bet = parseBet(args[0], eco, userId);
   if (bet.error) return ctx.reply(bet.error);
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'slots', 'Slots');
   if (g.blocked) return ctx.reply(g.message);
 
   const charge = eco.chargeWallet(userId, bet.amount, 'spin');
   if (!charge.ok) return ctx.reply(charge.message);
 
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'slots', config.perGameCooldownMs);
   const r = spin(bet.amount);
   let net = -bet.amount;
   let text;

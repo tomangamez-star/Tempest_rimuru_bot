@@ -89,7 +89,7 @@ async function play(ctx) {
   const bet = parseBet(args[0], eco, userId);
   if (bet.error) return reply(bet.error);
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'blackjack', 'Blackjack');
   if (g.blocked) return reply(g.message);
 
   if (sessions.has(userId)) {
@@ -98,7 +98,7 @@ async function play(ctx) {
 
   const charge = eco.chargeWallet(userId, bet.amount, 'blackjack hand');
   if (!charge.ok) return reply(charge.message);
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'blackjack', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
 

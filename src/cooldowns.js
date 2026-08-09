@@ -32,4 +32,27 @@ function start(userId, action, ms) {
   db.setCooldown(userId, action, Date.now() + ms);
 }
 
-module.exports = { remaining, guard, start };
+/* ------------------------------------------------------------------ *
+ *  PER-GAME COOLDOWNS (no global gambling cooldown).                  *
+ *  Each game has its own cooldown key: "game:slots", "game:dice", …   *
+ *  Switching between different games is always instant.               *
+ * ------------------------------------------------------------------ */
+
+/** Guard for a specific game. Returns { blocked, message }. */
+function guardGame(userId, gameName, what = 'That game') {
+  const left = remaining(userId, `game:${gameName}`);
+  if (left > 0) {
+    return {
+      blocked: true,
+      message: `⏳ **${what} is cooling down.** Try again in \`${humanDuration(left)}\`.`,
+    };
+  }
+  return { blocked: false };
+}
+
+/** Start a per-game cooldown for (user, gameName). */
+function startGame(userId, gameName, ms) {
+  start(userId, `game:${gameName}`, ms);
+}
+
+module.exports = { remaining, guard, start, guardGame, startGame };

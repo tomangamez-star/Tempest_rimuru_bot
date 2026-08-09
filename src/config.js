@@ -29,13 +29,37 @@ const config = {
   dbPath: process.env.DB_PATH || './data/rimuru.db',
   dataDir: process.env.DATA_DIR || './data',
 
+  // Rimuru sticker pack — sends a random sticker with Rimuru's replies.
+  // Set STICKER_PACK to any public pack name (e.g. Tensei_Shitara_Slime_Datta_Ken2).
+  // If unset or invalid, the bot skips stickers gracefully (never crashes).
+  stickerPack: process.env.STICKER_PACK || 'Tensei_Shitara_Slime_Datta_Ken2',
+
+  // Owner smart reactions (emoji reacts on the owner's messages)
+  reactions: {
+    die: '☠️',
+    lol: '😂',
+    haha: '😂',
+    win: '💰',
+    rich: '💰',
+    lose: '💸',
+    broke: '💸',
+    love: '❤️',
+    mad: '😡',
+    angry: '😡',
+    gg: '👏',
+    nice: '👏',
+    '?': '🤔',
+    fallback: ['🐉', '🔥', '😎'],
+  },
+
   // Economy
   startBalance: 500000,
   houseEdge: 0.55, // house wins 55% of the time on skill-less games
 
-  // Cooldowns (ms)
+  // Cooldowns (ms) — NOTE: no global game cooldown.
+  // Gambling itself has NO cooldown. Each game keeps its own per-game
+  // cooldown via PER_GAME_COOLDOWN_MS below (per game per user).
   cooldowns: {
-    game: 2 * 60 * 1000,      // games
     rob: 10 * 60 * 1000,      // robbery
     heist: 20 * 60 * 1000,    // heist
     daily: 24 * 60 * 60 * 1000,
@@ -45,6 +69,10 @@ const config = {
     fish: 2 * 60 * 1000,
     dig: 3 * 60 * 1000,
   },
+
+  // Per-game cooldown (ms) — applies to EACH game individually per user,
+  // so switching between games is always instant.
+  perGameCooldownMs: Number(process.env.PER_GAME_COOLDOWN_MS || 2 * 60 * 1000),
 
   // Lottery
   lottery: {

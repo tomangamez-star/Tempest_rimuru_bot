@@ -66,14 +66,77 @@ function clamp(n, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-/** Escape HTML for Telegram parse_mode=HTML. */
-function esc(s) {
-  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-}
-
 /** Ensure a directory exists. */
 function ensureDir(dir) {
   fs.mkdirSync(dir, { recursive: true });
+}
+
+/* ------------------------------------------------------------------ *
+ *  RIMURU THEME — vibrant blue/cyan + gold, notebook-note style.      *
+ *  Every bot message is wrapped as a "note" with a vertical red       *
+ *  margin line on the LEFT edge (like a notebook page).               *
+ * ------------------------------------------------------------------ */
+
+const THEME = {
+  // Vibrant Rimuru blues/cyans (HTML hex, pop on dark themes)
+  blue: '#4FC3F7',
+  deepBlue: '#29B6F6',
+  cyan: '#00E5FF',
+  gold: '#FFD54F',
+  goldDeep: '#FFC107',
+  red: '#FF5252',
+  // Emoji accents sprinkled through messages
+  acc: {
+    slime: '🐉',     // Rimuru's draconic aura
+    note: '📝',      // notebook marker
+    coin: '💰',
+    wallet: '👛',
+    bank: '🏦',
+    crown: '👑',
+    star: '✨',
+    win: '🎉',
+    lose: '💀',
+    game: '🎮',
+    money: '💵',
+    flame: '🔥',
+  },
+};
+
+/**
+ * Escape HTML for Telegram parse_mode=HTML.
+ * @param {*} s
+ * @param {boolean} [keepBr] keep \n as <br> inside the note body (default true)
+ */
+function esc(s, keepBr = true) {
+  let out = String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  if (keepBr) out = out.replace(/\n/g, '<br>');
+  return out;
+}
+
+/**
+ * Wrap text as a notebook note: a vertical red margin line on the LEFT,
+ * blue-tinted note background, bold colored title, emoji accents.
+ * Always returns a full HTML block (safe with parse_mode: 'HTML').
+ *
+ * @param {string} title  short bold title (emoji allowed), e.g. '💰 BALANCE'
+ * @param {string} body   note body — *bold* and `code` markdown get converted
+ * @param {object} [opts] { color, icon, replyTo } — color = THEME color for title
+ * @returns {string} styled HTML string
+ */
+function note(title, body, opts = {}) {
+  const color = opts.color || THEME.blue;
+  const icon = opts.icon || THEME.acc.note;
+  const t = esc(title, false);
+  const b = esc(body || '').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  return (
+    `<blockquote><b><span style="color:${color}">${icon} ${t}</span></b><br>` +
+    `${b}</blockquote>`
+  );
+}
+
+/** Default Rimuru note header used across the bot. */
+function noteHeader(title, opts = {}) {
+  return note(title, '', { ...opts, icon: opts.icon || THEME.acc.note });
 }
 
 module.exports = {
@@ -87,4 +150,7 @@ module.exports = {
   clamp,
   esc,
   ensureDir,
+  THEME,
+  note,
+  noteHeader,
 };

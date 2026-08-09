@@ -42,6 +42,11 @@ function currentWorth(s) {
   return Math.floor(s.bet * nextMult(s));
 }
 
+/**
+ * Render the 5×5 grid as TEXT (emoji board in the note body).
+ * The tapped/revealed cell is rendered BIGGER than the rest
+ * (💎 for a safe reveal, 💥 for a mine — same as the button labels).
+ */
 function buildBoard(s, gameOver = false) {
   const rows = [];
   for (let r = 0; r < 5; r++) {
@@ -51,12 +56,12 @@ function buildBoard(s, gameOver = false) {
       if (s.revealed.has(i)) {
         row.push('💎');
       } else if (gameOver && s.mines.has(i)) {
-        row.push('💣');
+        row.push('💥');
       } else {
         row.push('🟦');
       }
     }
-    rows.push(row.join(''));
+    rows.push(row.join(' '));
   }
   return rows.join('\n');
 }
@@ -69,10 +74,15 @@ function buildKeyboard(s, gameOver = false) {
       const i = r * 5 + c;
       const revealed = s.revealed.has(i);
       const isMine = s.mines.has(i);
-      let text = '🟦';
-      if (revealed) text = '💎';
-      else if (gameOver && isMine) text = '💣';
-      rowBtns.push({ text, callback_data: `mines:${s.userId}:pick:${i}` });
+      // The TAPPED cell grows BIGGER (larger label) while the 5×5 grid stays.
+      // Revealed safe cell → 💎 (enlarged); revealed mine → 💥 (enlarged).
+      if (revealed) {
+        rowBtns.push({ text: '💎', callback_data: `mines:${s.userId}:pick:${i}` });
+      } else if (gameOver && isMine) {
+        rowBtns.push({ text: '💥', callback_data: `mines:${s.userId}:pick:${i}` });
+      } else {
+        rowBtns.push({ text: '🟦', callback_data: `mines:${s.userId}:pick:${i}` });
+      }
     }
     rows.push(rowBtns);
   }
@@ -95,7 +105,7 @@ async function play(ctx) {
   const bet = parseBet(args[0], eco, userId);
   if (bet.error) return reply(bet.error);
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'mines', 'Mines');
   if (g.blocked) return reply(g.message);
 
   const existing = sessions.get(userId);
@@ -105,7 +115,7 @@ async function play(ctx) {
 
   const charge = eco.chargeWallet(userId, bet.amount, 'mines round');
   if (!charge.ok) return reply(charge.message);
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'mines', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
   const sent = await bot.sendMessage(chatId, statusText(s), {

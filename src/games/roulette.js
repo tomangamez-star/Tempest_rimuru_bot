@@ -141,12 +141,12 @@ async function play(ctx) {
     return reply(`🎩 Add an amount! e.g. \`/roulette ${p.join(' ')} 5000\``);
   }
 
-  const g = cd.guard(userId, 'game', 'Gambling');
+  const g = cd.guardGame(userId, 'roulette', 'Roulette');
   if (g.blocked) return reply(g.message);
 
   const charge = eco.chargeWallet(userId, parsed.amount, 'roulette bet');
   if (!charge.ok) return reply(charge.message);
-  cd.start(userId, 'game', config.cooldowns.game);
+  cd.startGame(userId, 'roulette', config.perGameCooldownMs);
 
   const r = spin(parsed.amount, type, value);
   let net = -parsed.amount;
