@@ -128,24 +128,40 @@ async function editGame(bot, chatId, messageId, text, opts = {}) {
 }
 
 /**
- * Gate an inline keyboard behind SHOW_INLINE_BUTTONS.
- * Returns the reply_markup if inline buttons are enabled, else undefined.
+ * Gate an INLINE keyboard behind SHOW_INLINE_BUTTONS.
+ * Returns the inline reply_markup if buttons are enabled, else undefined.
  * (Inline menu code stays intact — just hidden by default. Toggle in
  * config, no rebuild needed.)
+ *
+ * NATIVE REPLY keyboards (ReplyKeyboardMarkup — the grid above the phone
+ * keyboard) are NEVER gated: they carry a `keyboard` array and are the
+ * primary navigation system, so they always pass through.
  */
 function inlineMarkup(markup) {
+  if (!markup) return undefined;
+  // ReplyKeyboardMarkup / ReplyKeyboardRemove / ForceReply pass through.
+  if (markup.keyboard || markup.remove_keyboard || markup.force_reply) return markup;
+  // InlineKeyboardMarkup is gated.
   if (config.showInlineButtons !== true) return undefined;
   return markup;
 }
 
 /**
- * Strip reply_markup unless SHOW_INLINE_BUTTONS=true. Used by every send
- * path so NO inline keyboard reaches Telegram when the flag is off
- * (games, menus, economy buttons — everything).
+ * Strip reply_markup unless it is (a) a native reply keyboard, or
+ * (b) an inline keyboard AND SHOW_INLINE_BUTTONS=true, or
+ * (c) marked alwaysShowMarkup (gameplay grids like mines/race must ALWAYS
+ *     show — they are unplayable without their buttons).
  */
 function gatedOpts(opts) {
   const o = { ...opts };
-  if (o.reply_markup) o.reply_markup = inlineMarkup(o.reply_markup);
+  if (o.reply_markup) {
+    if (o.alwaysShowMarkup === true) {
+      // Gameplay-critical grid (mines 5×5, race colors, ...) — keep.
+      delete o.alwaysShowMarkup;
+    } else {
+      o.reply_markup = inlineMarkup(o.reply_markup);
+    }
+  }
   return o;
 }
 

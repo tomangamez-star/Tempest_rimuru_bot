@@ -40,6 +40,10 @@ const config = {
   // the code stays intact, just gated behind this flag (no rebuild needed).
   showInlineButtons: String(process.env.SHOW_INLINE_BUTTONS || 'false').toLowerCase() === 'true',
 
+  // Native reply keyboard (ReplyKeyboardMarkup) — shows after /start by
+  // default. Set SHOW_REPLY_KEYBOARD=false to disable it entirely.
+  showReplyKeyboard: String(process.env.SHOW_REPLY_KEYBOARD || 'true').toLowerCase() === 'true',
+
   // Owner smart reactions (emoji reacts on the owner's messages)
   reactions: {
     die: '☠️',
@@ -145,6 +149,12 @@ const config = {
   blackjack: {
     blackjackPayout: 2.5, // 3:2 → 2.5x of bet returned
     doubleAllowed: true,
+  },
+
+  // Race — bet on a car color; 1st = 3x, 2nd = 1.5x, 3rd/4th = 0
+  race: {
+    positionMult: [3.0, 1.5, 0, 0], // index 0 = 1st place
+    cars: ['red', 'blue', 'green', 'yellow'],
   },
 
   // Passive income ranges [min, max]

@@ -118,7 +118,9 @@ async function play(ctx) {
   cd.startGame(userId, 'mines', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
-  const sent = await reply(statusText(s), { html: true, reply_markup: buildKeyboard(s) });
+  // alwaysShowMarkup: the 5×5 grid is GAMEPLAY — it must render even when
+  // SHOW_INLINE_BUTTONS=false (fixes the "mines grid missing" regression).
+  const sent = await reply(statusText(s), { html: true, reply_markup: buildKeyboard(s), alwaysShowMarkup: true });
   return { sent, session: s };
 }
 
@@ -137,7 +139,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
   if (s.mines.has(idx)) {
     // 💥 BOOM — lose everything (initial bet already charged)
     s.alive = false;
-    await editMsg(statusText(s, true), { parse_mode: 'HTML' });
+    await editMsg(statusText(s, true), { parse_mode: 'HTML', alwaysShowMarkup: true });
     await answerCb('💥 BOOM! You hit a mine.');
     await reply(`💥 <b>BOOM!</b> You hit a mine and lost everything — including your ${fmt(s.bet)} bet.\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { html: true });
     sessions.delete(userId);
@@ -149,13 +151,14 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
     s.alive = false;
     const winnings = currentWorth(s);
     eco.creditWallet(userId, winnings);
-    await editMsg(statusText(s, true), { parse_mode: 'HTML' });
+    await editMsg(statusText(s, true), { parse_mode: 'HTML', alwaysShowMarkup: true });
     await answerCb(`💎 All safe cells! +${fmt(winnings)}`);
     await reply(`🏆 <b>PERFECT CLEAR!</b> You found all 22 safe cells.\n💰 Won ${fmt(winnings)} (net +${fmt(winnings - s.bet)})\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { html: true });
     sessions.delete(userId);
     return;
   }
-  await editMsg(statusText(s), { parse_mode: 'HTML', reply_markup: buildKeyboard(s) });
+  // alwaysShowMarkup: keep the clickable grid on every board update
+  await editMsg(statusText(s), { parse_mode: 'HTML', reply_markup: buildKeyboard(s), alwaysShowMarkup: true });
   await answerCb(`💎 Safe! Multiplier now ${nextMult(s).toFixed(2)}x`);
 }
 
@@ -169,7 +172,7 @@ async function onCash(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
   const winnings = currentWorth(s);
   s.alive = false;
   eco.creditWallet(userId, winnings);
-  await editMsg(`${statusText(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'HTML' });
+  await editMsg(`${statusText(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'HTML', alwaysShowMarkup: true });
   await answerCb(`💰 Cashed out ${fmt(winnings)}`);
   sessions.delete(userId);
 }

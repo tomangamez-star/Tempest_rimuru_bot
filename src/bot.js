@@ -37,8 +37,10 @@ const blackjack = require('./games/blackjack');
 const roulette = require('./games/roulette');
 const higherlower = require('./games/higherlower');
 const lottery = require('./games/lottery');
+const race = require('./games/race');
 const robbery = require('./crimes/robbery');
 const heist = require('./crimes/heist');
+const keyboards = require('./keyboards');
 
 // In-memory heist timers (leaderId -> timeout)
 const heistTimers = new Map();
@@ -131,6 +133,11 @@ function createBot() {
       cd,
       config,
       db,
+      keyboards,
+      // Native reply-keyboard builder for the current page
+      // ('main' | 'casino' | 'games' | 'economy') — attach to a response
+      // via reply_markup so the grid persists above the phone keyboard.
+      keyboardFor: (page) => keyboards.keyboardFor(page),
       reply: (t, o) => reply(msg.chat.id, t, { ...(msg._replyTarget ? { _replyTarget: msg._replyTarget } : {}), ...o }),
       editMsg: (chatId, messageId, t, o) => editMsg(chatId, messageId, t, o),
       answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
@@ -356,27 +363,44 @@ function createBot() {
       await ctx.reply(
         `Welcome, ${u.first_name || 'mortal'}. The house always wins — but I'll let you play.\n` +
         `You start with <b>${fmt(config.startBalance)}</b> coins. 💰\n\n` +
-        `🎮 Games: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /lottery\n` +
+        `🎮 Games: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /lottery · /race\n` +
         `💼 Economy: /balance · /dep · /wd · /donate · /transfer\n` +
         `🦹 Crime: /rob · /heist\n` +
         `💵 Income: /beg · /work · /fish · /dig · /daily · /bonus\n` +
         `🏆 /lb — rich list · 📜 /menu — interactive menu\n\n` +
-        `☰ <i>Tip: open the menu button next to the text box for quick commands.</i>\n` +
+        `⌨️ <i>Tap a button below (above your keyboard) or type a command.</i>\n` +
+        `☰ <i>The menu button next to the text box also lists all commands.</i>\n` +
         `💬 <i>Reply to me or say "Rimuru" to talk directly.</i>`,
-        { title: '🐉 RIMURU TEMPEST CASINO', color: THEME.blue, html: true }
+        {
+          title: '🐉 RIMURU TEMPEST CASINO',
+          color: THEME.blue,
+          html: true,
+          // Native reply keyboard appears automatically after /start —
+          // the grid above the phone keyboard (toggleable, not persistent).
+          reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('main') : undefined,
+        }
       );
     },
 
     menu: async (ctx) => sendMenu(ctx.chatId),
 
     casino: async (ctx) => {
-      await ctx.reply(MENU.casino().text, { title: '🎰 CASINO', color: THEME.cyan, html: true, reply_markup: send.inlineMarkup(MENU.casino().markup) });
+      await ctx.reply(MENU.casino().text, {
+        title: '🎰 CASINO', color: THEME.cyan, html: true,
+        reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('casino') : send.inlineMarkup(MENU.casino().markup),
+      });
     },
     games: async (ctx) => {
-      await ctx.reply(MENU.games().text, { title: '🎮 GAMES', color: THEME.cyan, html: true, reply_markup: send.inlineMarkup(MENU.games().markup) });
+      await ctx.reply(MENU.games().text, {
+        title: '🎮 GAMES', color: THEME.cyan, html: true,
+        reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('games') : send.inlineMarkup(MENU.games().markup),
+      });
     },
     economy: async (ctx) => {
-      await ctx.reply(MENU.economy().text, { title: '💼 ECONOMY', color: THEME.cyan, html: true, reply_markup: send.inlineMarkup(MENU.economy().markup) });
+      await ctx.reply(MENU.economy().text, {
+        title: '💼 ECONOMY', color: THEME.cyan, html: true,
+        reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('economy') : send.inlineMarkup(MENU.economy().markup),
+      });
     },
 
     help: async (ctx) => {
@@ -421,6 +445,30 @@ function createBot() {
       );
     },
 
+    // 💼 Economy sub-keyboard actions (reply-keyboard button taps)
+    bank: async (ctx) => {
+      const u = eco.ensure(ctx.userId, metaOf(ctx.msg));
+      await ctx.reply(
+        `🏦 <b>BANK</b>\n\n` +
+        `💼 Saved: <b>${fmt(u.bank)}</b>\n` +
+        `👛 Wallet: <b>${fmt(u.wallet)}</b>\n\n` +
+        `Use <code>/dep [amount|all]</code> to deposit or <code>/wd [amount|all]</code> to withdraw.`,
+        { title: '🏦 BANK', color: THEME.cyan, html: true }
+      );
+    },
+    income: async (ctx) => {
+      await ctx.reply(
+        `<b>💵 INCOME</b>\n\n` +
+        `• /beg — quick coins\n` +
+        `• /work — steady pay\n` +
+        `• /fish — lucky catch\n` +
+        `• /dig — treasure hunt\n` +
+        `• /daily — 24h reward\n` +
+        `• /bonus — weekly reward`,
+        { title: '💵 INCOME', color: THEME.gold, html: true }
+      );
+    },
+
     dep: async (ctx) => {
       const r = eco.deposit(ctx.userId, ctx.args[0]);
       await ctx.reply(r.message, { title: '🏦 DEPOSIT', color: THEME.cyan });
@@ -462,6 +510,7 @@ function createBot() {
     roulette: async (ctx) => roulette.play(ctx),
     hl: async (ctx) => higherlower.play(ctx),
     higherlower: async (ctx) => higherlower.play(ctx),
+    race: async (ctx) => race.play(ctx),
 
     lottery: async (ctx) => {
       const sub = (ctx.args[0] || 'status').toLowerCase();
@@ -586,6 +635,53 @@ function createBot() {
       if (!target) return ctx.reply('Reply to someone with <code>/unmute</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const r = admin.liftPenalty(target.id);
       await ctx.reply(r.message, { title: '👑 ADMIN — UNMUTE', color: THEME.cyan });
+    },
+
+    // ----- owner reset: clear ALL active state -----
+    restart: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      const cleared = [];
+
+      // 1) In-memory game sessions
+      for (const [userId, s] of mines.sessions) { s.alive = false; cleared.push(`mines:${userId}`); }
+      mines.sessions.clear();
+      for (const [userId, s] of blackjack.sessions) { s.done = true; cleared.push(`blackjack:${userId}`); }
+      blackjack.sessions.clear();
+      for (const [userId, s] of higherlower.sessions) { s.alive = false; cleared.push(`higherlower:${userId}`); }
+      higherlower.sessions.clear();
+      for (const userId of race.sessions.keys()) { cleared.push(`race:${userId}`); }
+      race.sessions.clear();
+
+      // 2) Open heists (DB) + their timers
+      const openHeists = db.db.prepare("SELECT leader_id FROM heists WHERE status = 'open'").all();
+      for (const row of openHeists) {
+        const timer = heistTimers.get(row.leader_id);
+        if (timer) clearTimeout(timer);
+        heistTimers.delete(row.leader_id);
+        db.deleteHeist(row.leader_id);
+        cleared.push(`heist:${row.leader_id}`);
+      }
+
+      // 3) All cooldowns
+      const cdRows = db.db.prepare('SELECT user_id, action FROM cooldowns').all();
+      const delCd = db.db.prepare('DELETE FROM cooldowns');
+      for (const row of cdRows) cleared.push(`cd:${row.user_id}:${row.action}`);
+      delCd.run();
+
+      // 4) Reset lottery state
+      db.saveLottery(config.lottery.baseJackpot, 0, []);
+      cleared.push('lottery');
+
+      await ctx.reply(
+        `🔄 <b>RESTART COMPLETE</b>\n\n` +
+        `Cleared <b>${cleared.length}</b> active state entries:\n` +
+        `• Active games: mines, blackjack, higher/lower, race\n` +
+        `• Open heists & timers\n` +
+        `• All cooldowns\n` +
+        `• Lottery pot reset to ${fmt(config.lottery.baseJackpot)}\n\n` +
+        `The house is clean. Everything starts fresh. ✨`,
+        { title: '👑 ADMIN — RESTART', color: THEME.gold, html: true }
+      );
     },
   };
 
@@ -720,6 +816,10 @@ function createBot() {
         await higherlower.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
         return;
       }
+      if (data.startsWith('race:')) {
+        await race.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
+        return;
+      }
       await answerCb('Unknown button.');
     } catch (e) {
       console.error('[callback] error:', e.message);
@@ -765,6 +865,49 @@ function createBot() {
         } catch (e) {
           console.error(`[cmd /${cmd}] error:`, e.message, e.stack);
           await reply(chatId, `⚠️ Something went wrong with /${cmd}. Try again.`, { title: '💥 ERROR', color: THEME.red });
+        }
+        return;
+      }
+    }
+
+    // NATIVE REPLY-KEYBOARD BUTTON TAPS — Telegram sends the button label
+    // as a normal message; map it to the matching command/sub-keyboard.
+    // (Must run BEFORE the Rimuru AI trigger so "🎰 Casino" opens the
+    // casino sub-keyboard instead of triggering an AI reply.)
+    const kbRoute = keyboards.routeButton(text);
+    if (kbRoute) {
+      ctx.msg._replyTarget = msg.message_id;
+      if (kbRoute.back) {
+        // 🔙 Back → main keyboard (and a hint message)
+        await reply(chatId, `⌨️ <b>Main menu</b> — pick a category.`, {
+          title: '🐉 RIMURU CASINO', color: THEME.cyan, html: true,
+          reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('main') : undefined,
+        });
+        return;
+      }
+      if (kbRoute.page) {
+        // Category button → show the sub-keyboard (same space, replaces main)
+        const pageTexts = {
+          casino: MENU.casino().text,
+          games: MENU.games().text,
+          economy: MENU.economy().text,
+        };
+        await reply(chatId, pageTexts[kbRoute.page] || '', {
+          title: kbRoute.page === 'casino' ? '🎰 CASINO' : kbRoute.page === 'games' ? '🎮 GAMES' : '💼 ECONOMY',
+          color: THEME.cyan, html: true,
+          reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor(kbRoute.page) : undefined,
+        });
+        return;
+      }
+      // Game/economy command button → run the matching handler
+      const handler = handlers[kbRoute.cmd];
+      if (handler) {
+        ctx.args = [];
+        try {
+          await handler(ctx);
+        } catch (e) {
+          console.error(`[kb /${kbRoute.cmd}] error:`, e.message, e.stack);
+          await reply(chatId, `⚠️ Something went wrong with that button. Try again.`, { title: '💥 ERROR', color: THEME.red });
         }
         return;
       }
