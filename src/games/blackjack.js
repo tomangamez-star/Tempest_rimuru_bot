@@ -108,12 +108,12 @@ async function play(ctx) {
     const payout = Math.floor(bet.amount * config.blackjack.blackjackPayout);
     eco.creditWallet(userId, payout);
     s.payout = payout;
-    await bot.sendMessage(chatId, `${render(s)}\n\n♣ <b>BLACKJACK!</b> 3:2 — you get ${fmt(payout)} (net +${fmt(payout - bet.amount)})`, { parse_mode: 'HTML' });
+    await reply(`${render(s)}\n\n♣ <b>BLACKJACK!</b> 3:2 — you get ${fmt(payout)} (net +${fmt(payout - bet.amount)})`, { html: true });
     sessions.delete(userId);
     return;
   }
 
-  const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'HTML', reply_markup: keyboard(s) });
+  const sent = await reply(render(s), { html: true, reply_markup: keyboard(s) });
   return { sent, session: s };
 }
 

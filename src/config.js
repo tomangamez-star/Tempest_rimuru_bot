@@ -34,6 +34,12 @@ const config = {
   // If unset or invalid, the bot skips stickers gracefully (never crashes).
   stickerPack: process.env.STICKER_PACK || 'Tensei_Shitara_Slime_Datta_Ken2',
 
+  // Inline buttons on messages — HIDDEN by default (persistent ☰ command
+  // menu in the input bar is the primary navigation). Set
+  // SHOW_INLINE_BUTTONS=true to bring the old inline keyboards back —
+  // the code stays intact, just gated behind this flag (no rebuild needed).
+  showInlineButtons: String(process.env.SHOW_INLINE_BUTTONS || 'false').toLowerCase() === 'true',
+
   // Owner smart reactions (emoji reacts on the owner's messages)
   reactions: {
     die: '☠️',

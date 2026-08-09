@@ -6,8 +6,15 @@
  * conversations, owner emoji reactions, sticker sending, the persistent
  * command menu (setMyCommands) and the multi-level inline menu system.
  *
- * UI: every message is a "notebook note" — vibrant Rimuru blue/cyan + gold
- * with a vertical red margin line on the LEFT edge (HTML blockquote).
+ * UI: EVERY message is a "notebook note" — vibrant Rimuru blue/cyan + gold
+ * with a vertical margin bar on the LEFT edge (HTML <blockquote>). All
+ * sending goes through src/send.js so the bar renders on casino, games,
+ * economy, leaderboard, balance, help — every single message.
+ *
+ * Navigation: the persistent ☰ command menu under the text input
+ * (setMyCommands + setChatMenuButton) is the PRIMARY navigation. Inline
+ * keyboards on messages are HIDDEN by default (SHOW_INLINE_BUTTONS=false)
+ * but the inline menu code stays intact and toggleable.
  */
 const TelegramBot = require('node-telegram-bot-api');
 
@@ -19,7 +26,8 @@ const admin = require('./admin');
 const leaderboard = require('./leaderboard');
 const rimuru = require('./rimuru');
 const income = require('./income');
-const { fmt, humanDuration, note, THEME, sanitizeHtml } = require('./utils');
+const { fmt, humanDuration, note, THEME } = require('./utils');
+const send = require('./send');
 
 const slots = require('./games/slots');
 const dice = require('./games/dice');
@@ -37,6 +45,18 @@ const heistTimers = new Map();
 
 // Owner emoji reaction keywords (config.reactions)
 const REACT_KEYS = Object.keys(config.reactions).filter((k) => k !== 'fallback');
+
+// Persistent command menu — the "☰" button next to the text input.
+// This is the PRIMARY navigation (Telegram renders it as a dropdown under
+// the input bar, the same area as the sticker/attachment menu).
+const MENU_COMMANDS = [
+  { command: 'leaderboard', description: '🏆 Leaderboard' },
+  { command: 'balance', description: '💰 Balance' },
+  { command: 'casino', description: '🎰 Casino' },
+  { command: 'games', description: '🎮 Games' },
+  { command: 'economy', description: '💼 Economy' },
+  { command: 'help', description: '❓ Help' },
+];
 
 function createBot() {
   const bot = new TelegramBot(config.telegramToken, {
@@ -57,76 +77,43 @@ function createBot() {
   }
 
   /**
-   * Reply wrapper — auto-wraps in notebook-note style (HTML) unless `raw`.
-   * opts: { title, color, icon, raw, html, parse_mode, reply_markup, ... }
-   * NOTE: game modules pass raw HTML with { parse_mode: 'HTML' } — that is
-   * treated as trusted HTML (opts.html === true OR parse_mode === 'HTML'),
-   * so it must NOT be escaped a second time.
+   * Reply wrapper — EVERY message is a blockquote notebook note (HTML).
+   * opts: { title, color, icon, raw, html, parse_mode, reply_markup,
+   *         reply_to_message_id, ... }
+   *  - opts.html === true OR opts.parse_mode === 'HTML' → body is TRUSTED
+   *    HTML (never re-escaped — this kills the double-escape bug).
+   *  - opts.raw === true → send the body verbatim (no note wrapper);
+   *    still forced through parse_mode HTML + sanitizer as a safety net.
+   *  - Inline keyboards are gated behind config.showInlineButtons.
    */
   async function reply(chatId, text, opts = {}) {
-    let out = text;
-    let parseMode = opts.parse_mode;
     const trustedHtml = opts.html === true || opts.parse_mode === 'HTML';
-    if (!opts.raw) {
-      out = note(opts.title || 'RIMURU', text, {
-        color: opts.color,
-        icon: opts.icon,
-        html: trustedHtml,
-      });
-      parseMode = 'HTML';
-    } else if (parseMode === 'HTML') {
-      // Raw HTML still gets the safety net — strip unsupported tags.
-      out = sanitizeHtml(out);
+    // Reply-to-message: quote the triggering message ("replying to @user"
+    // bubble) when the sender is replying to the bot, or for bot commands /
+    // Rimuru triggers (the router tags ctx.msg._replyTarget).
+    if (!opts.reply_to_message_id && opts._replyTarget) {
+      opts = { ...opts, reply_to_message_id: opts._replyTarget };
+      delete opts._replyTarget;
     }
-    try {
-      return await bot.sendMessage(chatId, out, { ...opts, parse_mode: parseMode });
-    } catch (e) {
-      console.warn('[reply] fallback (plain):', e.message);
-      try {
-        // Strip ALL tags + markdown so plain text can never fail to parse.
-        const plain = String(text).replace(/<[^>]*>/g, '').replace(/[*_`\[\]]/g, '');
-        return await bot.sendMessage(chatId, plain, { ...opts, parse_mode: undefined });
-      } catch (e2) {
-        console.error('[reply] failed:', e2.message);
-        return null;
-      }
+    if (opts.raw) {
+      // Raw HTML — sanitize, no note wrapper. parse_mode stays HTML.
+      const safe = send.sanitizeHtml(text);
+      return send.sendText(bot, chatId, safe, { ...opts, html: true, raw: true });
     }
+    return send.sendText(bot, chatId, text, { ...opts, html: trustedHtml });
   }
 
   /** Edit wrapper — same note-style rules as reply(). */
   async function editMsg(chatId, messageId, text, opts = {}) {
-    let out = text;
-    let parseMode = opts.parse_mode;
     const trustedHtml = opts.html === true || opts.parse_mode === 'HTML';
-    if (!opts.raw) {
-      out = note(opts.title || 'RIMURU', text, {
-        color: opts.color,
-        icon: opts.icon,
-        html: trustedHtml,
-      });
-      parseMode = 'HTML';
-    } else if (parseMode === 'HTML') {
-      out = sanitizeHtml(out);
+    if (opts.raw) {
+      const safe = send.sanitizeHtml(text);
+      return send.editText(bot, chatId, messageId, safe, { ...opts, html: true, raw: true });
     }
-    try {
-      return await bot.editMessageText(out, { chat_id: chatId, message_id: messageId, ...opts, parse_mode: parseMode });
-    } catch (e) {
-      console.warn('[edit] failed:', e.message);
-      // Parse-error rescue: retry once with plain text (no parse_mode).
-      if (/can't parse entities|parse entities/i.test(e.message)) {
-        try {
-          const plain = String(text).replace(/<[^>]*>/g, '').replace(/[*_`\[\]]/g, '');
-          return await bot.editMessageText(plain, { chat_id: chatId, message_id: messageId, ...opts, parse_mode: undefined });
-        } catch (e2) {
-          console.error('[edit] retry failed:', e2.message);
-          return null;
-        }
-      }
-      return null;
-    }
+    return send.editText(bot, chatId, messageId, text, { ...opts, html: trustedHtml });
   }
 
-  /** Threaded reply (replies to a specific message — used by the menu). */
+  /** Threaded reply (replies to a specific message — "replying to @user"). */
   async function replyThreaded(chatId, messageId, text, opts = {}) {
     return reply(chatId, text, { ...opts, reply_to_message_id: messageId });
   }
@@ -144,7 +131,7 @@ function createBot() {
       cd,
       config,
       db,
-      reply: (t, o) => reply(msg.chat.id, t, o),
+      reply: (t, o) => reply(msg.chat.id, t, { ...(msg._replyTarget ? { _replyTarget: msg._replyTarget } : {}), ...o }),
       editMsg: (chatId, messageId, t, o) => editMsg(chatId, messageId, t, o),
       answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
     };
@@ -172,14 +159,14 @@ function createBot() {
     return admin.checkInteract(userId, { gambling });
   }
 
-  /* ---------- stickers (Rimuru vibe) ---------- */
+  /* ---------- stickers (Rimuru vibe) — ALWAYS AFTER the text ---------- */
 
   let stickerCache = null;
   let stickerDisabled = false;
 
-  /** Send a random sticker from the configured pack. Graceful if unset/fails. */
-  async function maybeSendSticker(chatId) {
-    if (!config.stickerPack || stickerDisabled) return;
+  /** Get a random sticker file_id from the configured pack (graceful). */
+  async function nextSticker() {
+    if (!config.stickerPack || stickerDisabled) return null;
     try {
       if (!stickerCache) {
         const set = await bot.getStickerSet(config.stickerPack);
@@ -187,13 +174,30 @@ function createBot() {
       }
       if (!stickerCache.length) {
         stickerDisabled = true;
-        return;
+        return null;
       }
-      const fileId = stickerCache[Math.floor(Math.random() * stickerCache.length)];
-      await bot.sendSticker(chatId, fileId);
+      return stickerCache[Math.floor(Math.random() * stickerCache.length)];
     } catch (e) {
       console.warn(`[sticker] pack "${config.stickerPack}" unavailable — stickers disabled:`, e.message);
       stickerDisabled = true;
+      return null;
+    }
+  }
+
+  /** Send the sticker AFTER the text message resolves (never before). */
+  async function stickerAfterText(chatId, textPromise) {
+    const fileId = await nextSticker();
+    if (!fileId) return null;
+    try {
+      await textPromise; // text FIRST
+    } catch (e) {
+      /* text failed — still try the sticker */
+    }
+    try {
+      return await bot.sendSticker(chatId, fileId);
+    } catch (e) {
+      console.warn('[sticker] send failed:', e.message);
+      return null;
     }
   }
 
@@ -221,7 +225,7 @@ function createBot() {
     }
   }
 
-  /* ---------- inline menu system ---------- */
+  /* ---------- inline menu system (kept intact, gated by SHOW_INLINE_BUTTONS) ---------- */
 
   const MENU = {
     main: () => ({
@@ -277,7 +281,7 @@ function createBot() {
         `🪙 <b>Coin Flip</b> — /cf [heads|tails] [amount] · 2×\n` +
         `💎 <b>Mines</b> — /mines [amount] · 5×5, multiplier climbs\n` +
         `🎲 <b>Dice</b> — /dice [1-6] [amount] · 6× if you hit\n` +
-        `🃏 <b>Higher or Lower</b> — /hl [amount] · streak multiplier\n\n` +
+        `📏 <b>Higher or Lower</b> — /hl [amount] · streak multiplier\n\n` +
         `👇 <i>Tap a game for details, or just type the command.</i>`,
       markup: {
         inline_keyboard: [
@@ -287,7 +291,7 @@ function createBot() {
           ],
           [
             { text: '🎲 Dice', callback_data: 'menu:g:dice' },
-            { text: '🃏 Higher/Lower', callback_data: 'menu:g:hl' },
+            { text: '📏 Higher/Lower', callback_data: 'menu:g:hl' },
           ],
           [{ text: '⬅️ Back', callback_data: 'menu:main' }],
         ],
@@ -324,21 +328,21 @@ function createBot() {
     cf: '🪙 <b>Coin Flip</b>\n<code>/cf [heads|tails] [amount]</code>\nWin = double. 🍀',
     mines: '💎 <b>Mines</b>\n<code>/mines [amount]</code>\n5×5 grid, 3 mines. Safe pick = multiplier climbs. Cash out anytime. 💣',
     dice: '🎲 <b>Dice</b>\n<code>/dice [1-6] [amount]</code>\nAnimated dice — hit your number = 6×. Rare, but sweet. 😎',
-    hl: '🃏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
+    hl: '📏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
   };
 
   /** Build a menu message (text + markup) and send it. */
   async function sendMenu(chatId, page = 'main', opts = {}) {
     const m = MENU[page]();
     const text = note('📜 RIMURU MENU', m.text, { color: THEME.gold, icon: '📜', html: true });
-    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: m.markup, ...opts });
+    return bot.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup: send.inlineMarkup(m.markup), ...opts });
   }
 
   /** Edit an existing menu message to a different page. */
   async function editMenu(chatId, messageId, page = 'main') {
     const m = MENU[page]();
     const text = note('📜 RIMURU MENU', m.text, { color: THEME.gold, icon: '📜', html: true });
-    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: m.markup }).catch((e) => {
+    return bot.editMessageText(text, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML', reply_markup: send.inlineMarkup(m.markup) }).catch((e) => {
       console.warn('[menu] edit failed:', e.message);
       return null;
     });
@@ -356,22 +360,23 @@ function createBot() {
         `💼 Economy: /balance · /dep · /wd · /donate · /transfer\n` +
         `🦹 Crime: /rob · /heist\n` +
         `💵 Income: /beg · /work · /fish · /dig · /daily · /bonus\n` +
-        `🏆 /lb — rich list · 📜 /menu — command menu\n\n` +
-        `🗨️ <i>Reply to me or say "Rimuru" to talk directly.</i>`,
-        { title: '🐉 RIMURU TEMPEST CASINO', color: THEME.blue }
+        `🏆 /lb — rich list · 📜 /menu — interactive menu\n\n` +
+        `☰ <i>Tip: open the menu button next to the text box for quick commands.</i>\n` +
+        `💬 <i>Reply to me or say "Rimuru" to talk directly.</i>`,
+        { title: '🐉 RIMURU TEMPEST CASINO', color: THEME.blue, html: true }
       );
     },
 
     menu: async (ctx) => sendMenu(ctx.chatId),
 
     casino: async (ctx) => {
-      await ctx.reply(MENU.casino().text, { title: '🎰 CASINO', color: THEME.cyan, html: true, reply_markup: MENU.casino().markup });
+      await ctx.reply(MENU.casino().text, { title: '🎰 CASINO', color: THEME.cyan, html: true, reply_markup: send.inlineMarkup(MENU.casino().markup) });
     },
     games: async (ctx) => {
-      await ctx.reply(MENU.games().text, { title: '🎮 GAMES', color: THEME.cyan, html: true, reply_markup: MENU.games().markup });
+      await ctx.reply(MENU.games().text, { title: '🎮 GAMES', color: THEME.cyan, html: true, reply_markup: send.inlineMarkup(MENU.games().markup) });
     },
     economy: async (ctx) => {
-      await ctx.reply(MENU.economy().text, { title: '💼 ECONOMY', color: THEME.cyan, html: true, reply_markup: MENU.economy().markup });
+      await ctx.reply(MENU.economy().text, { title: '💼 ECONOMY', color: THEME.cyan, html: true, reply_markup: send.inlineMarkup(MENU.economy().markup) });
     },
 
     help: async (ctx) => {
@@ -400,8 +405,9 @@ function createBot() {
         `• /daily — 24h · /bonus — weekly\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
-        `🗨️ <i>Reply to me or say "Rimuru" to talk.</i>`,
-        { title: '❓ RIMURU HELP', color: THEME.gold }
+        `☰ <i>The menu button next to the text box has all commands.</i>\n` +
+        `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
+        { title: '❓ RIMURU HELP', color: THEME.gold, html: true }
       );
     },
 
@@ -411,7 +417,7 @@ function createBot() {
         `👛 Wallet (rob-able): <b>${fmt(u.wallet)}</b>\n` +
         `🏦 Bank (safe): <b>${fmt(u.bank)}</b>\n` +
         `💎 Net worth: <b>${fmt(u.wallet + u.bank)}</b>`,
-        { title: `💰 ${u.first_name || 'YOUR'} BALANCE`, color: THEME.gold }
+        { title: `💰 ${u.first_name || 'YOUR'} BALANCE`, color: THEME.gold, html: true }
       );
     },
 
@@ -434,13 +440,13 @@ function createBot() {
 
     donate: async (ctx) => {
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/donate [amount]</code>. 🎯', { title: '💝 DONATE', color: THEME.cyan });
+      if (!target) return ctx.reply('Reply to someone with <code>/donate [amount]</code>. 🎯', { title: '💝 DONATE', color: THEME.cyan, html: true });
       const r = eco.donate(ctx.userId, target.id, ctx.args[0]);
       await ctx.reply(r.message, { title: '💝 DONATE', color: THEME.cyan, html: true });
     },
     transfer: async (ctx) => {
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/transfer [amount]</code>. 🎯', { title: '🏦 TRANSFER', color: THEME.cyan });
+      if (!target) return ctx.reply('Reply to someone with <code>/transfer [amount]</code>. 🎯', { title: '🏦 TRANSFER', color: THEME.cyan, html: true });
       const r = eco.transfer(ctx.userId, target.id, ctx.args[0]);
       await ctx.reply(r.message, { title: '🏦 TRANSFER', color: THEME.cyan, html: true });
     },
@@ -481,7 +487,7 @@ function createBot() {
     // ----- crimes -----
     rob: async (ctx) => {
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/rob</code>. 🎯', { title: '🦹 ROBBERY', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/rob</code>. 🎯', { title: '🦹 ROBBERY', color: THEME.red, html: true });
       const g = cd.guard(ctx.userId, 'rob', 'Robbery');
       if (g.blocked) return ctx.reply(g.message, { title: '🦹 ROBBERY', color: THEME.red });
       const r = robbery.attempt(ctx.userId, target.id, metaOf(ctx.msg));
@@ -491,7 +497,7 @@ function createBot() {
 
     heist: async (ctx) => {
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/heist</code>. 🎯', { title: '🏦 HEIST', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/heist</code>. 🎯', { title: '🏦 HEIST', color: THEME.red, html: true });
       const g = cd.guard(ctx.userId, 'heist', 'Heist');
       if (g.blocked) return ctx.reply(g.message, { title: '🏦 HEIST', color: THEME.red });
       const r = heist.start(ctx.userId, target.id, metaOf(ctx.msg));
@@ -539,7 +545,7 @@ function createBot() {
     ban: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/ban [reason]</code>. 🎯', { title: '👑 ADMIN', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/ban [reason]</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const { dur, reason } = splitDurReason(ctx.args);
       const r = admin.applyPenalty(target.id, admin.STATUS.BANNED, reason, dur);
       await ctx.reply(r.message, { title: '👑 ADMIN — BAN', color: THEME.red });
@@ -547,7 +553,7 @@ function createBot() {
     sus: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/sus [reason]</code>. 🎯', { title: '👑 ADMIN', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/sus [reason]</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const { dur, reason } = splitDurReason(ctx.args);
       const r = admin.applyPenalty(target.id, admin.STATUS.SUSPECTED, reason, dur);
       await ctx.reply(r.message, { title: '👑 ADMIN — SUSPEND', color: THEME.red });
@@ -555,7 +561,7 @@ function createBot() {
     mute: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/mute [reason]</code>. 🎯', { title: '👑 ADMIN', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/mute [reason]</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const { dur, reason } = splitDurReason(ctx.args);
       const r = admin.applyPenalty(target.id, admin.STATUS.MUTED, reason, dur);
       await ctx.reply(r.message, { title: '👑 ADMIN — MUTE', color: THEME.red });
@@ -563,21 +569,21 @@ function createBot() {
     unban: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/unban</code>. 🎯', { title: '👑 ADMIN', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/unban</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const r = admin.liftPenalty(target.id);
       await ctx.reply(r.message, { title: '👑 ADMIN — UNBAN', color: THEME.cyan });
     },
     unsus: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/unsus</code>. 🎯', { title: '👑 ADMIN', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/unsus</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const r = admin.liftPenalty(target.id);
       await ctx.reply(r.message, { title: '👑 ADMIN — UNSUSPEND', color: THEME.cyan });
     },
     unmute: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
       const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/unmute</code>. 🎯', { title: '👑 ADMIN', color: THEME.red });
+      if (!target) return ctx.reply('Reply to someone with <code>/unmute</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const r = admin.liftPenalty(target.id);
       await ctx.reply(r.message, { title: '👑 ADMIN — UNMUTE', color: THEME.cyan });
     },
@@ -666,7 +672,7 @@ function createBot() {
             `<b>🦹 Crime</b>: /rob · /heist · /join\n` +
             `<b>💵 Income</b>: /beg · /work · /fish · /dig · /daily · /bonus\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu\n` +
-            `🗨️ <i>Reply to me or say "Rimuru" to talk.</i>`,
+            `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
           await answerCb('');
           return;
@@ -702,16 +708,16 @@ function createBot() {
       if (data.startsWith('mines:')) {
         const parts = data.split(':');
         const action = parts[2];
-        if (action === 'pick') await mines.onPick({ data }, { bot, chatId, userId, reply: (t) => reply(chatId, t), editMsg: editMsgCb, answerCb, eco });
-        if (action === 'cash') await mines.onCash({ data }, { bot, chatId, userId, reply: (t) => reply(chatId, t), editMsg: editMsgCb, answerCb, eco });
+        if (action === 'pick') await mines.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
+        if (action === 'cash') await mines.onCash({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
         return;
       }
       if (data.startsWith('bj:')) {
-        await blackjack.onAction({ data }, { bot, chatId, userId, reply: (t) => reply(chatId, t), editMsg: editMsgCb, answerCb, eco });
+        await blackjack.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
         return;
       }
       if (data.startsWith('hl:')) {
-        await higherlower.onAction({ data }, { bot, chatId, userId, reply: (t) => reply(chatId, t), editMsg: editMsgCb, answerCb, eco });
+        await higherlower.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
         return;
       }
       await answerCb('Unknown button.');
@@ -751,6 +757,9 @@ function createBot() {
       const handler = handlers[cmd];
       if (handler) {
         ctx.args = args;
+        // Reply-to-message: bot commands quote the triggering message so
+        // the response shows "replying to @user" above it.
+        ctx.msg._replyTarget = msg.message_id;
         try {
           await handler(ctx);
         } catch (e) {
@@ -772,12 +781,13 @@ function createBot() {
       const owner = isOwner(userId);
       const name = from.first_name || from.username || 'mortal';
       try {
-        await maybeSendSticker(chatId);
+        // Text FIRST, sticker AFTER — never the other way around.
         const ans = await rimuru.reply(text, { id: userId, first_name: name, username: from.username, isOwner: owner });
-        await reply(chatId, ans, { title: '🐉 RIMURU', color: THEME.gold });
+        const textPromise = reply(chatId, ans, { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
+        await stickerAfterText(chatId, textPromise);
       } catch (e) {
         console.error('[rimuru] reply error:', e.message);
-        await reply(chatId, 'Hmph. The void ate my words. Try again, mortal.', { title: '🐉 RIMURU', color: THEME.gold });
+        await reply(chatId, 'Hmph. The void ate my words. Try again, mortal.', { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
       }
       return;
     }
@@ -785,25 +795,17 @@ function createBot() {
 
   /* ---------- boot: persistent command menu + bot identity ---------- */
 
-  const MENU_COMMANDS = [
-    { command: 'leaderboard', description: '🏆 Leaderboard' },
-    { command: 'balance', description: '💰 Balance' },
-    { command: 'casino', description: '🎰 Casino' },
-    { command: 'games', description: '🎮 Games' },
-    { command: 'economy', description: '💼 Economy' },
-    { command: 'help', description: '❓ Help' },
-  ];
-
   let botMeId = null;
   bot.getMe().then((me) => {
     botMeId = me.id;
     // Persistent command menu — the "☰ Menu" button next to the text input
-    // (Telegram shows these commands in the input-bar dropdown).
+    // (Telegram shows these commands in the input-bar dropdown, the same
+    // area as the sticker/attachment menu).
     return bot.setMyCommands(MENU_COMMANDS)
       .then(() => bot.setChatMenuButton({ menu_button: { type: 'commands' } }))
       .then(() => bot.getMyCommands());
   }).then((cmds) => {
-    console.log(`📜 Persistent command menu registered (setMyCommands): ${cmds.map((c) => `/${c.command}`).join(' ')}`);
+    console.log(`☰ Persistent command menu registered (setMyCommands): ${cmds.map((c) => `/${c.command}`).join(' ')}`);
   }).catch((e) => {
     console.warn('[boot] getMe/setMyCommands failed:', e.message);
   });
@@ -826,4 +828,4 @@ function createBot() {
   return bot;
 }
 
-module.exports = { createBot };
+module.exports = { createBot, MENU_COMMANDS };

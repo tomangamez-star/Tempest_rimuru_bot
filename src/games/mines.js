@@ -118,10 +118,7 @@ async function play(ctx) {
   cd.startGame(userId, 'mines', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
-  const sent = await bot.sendMessage(chatId, statusText(s), {
-    parse_mode: 'HTML',
-    reply_markup: buildKeyboard(s),
-  });
+  const sent = await reply(statusText(s), { html: true, reply_markup: buildKeyboard(s) });
   return { sent, session: s };
 }
 
@@ -142,7 +139,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
     s.alive = false;
     await editMsg(statusText(s, true), { parse_mode: 'HTML' });
     await answerCb('💥 BOOM! You hit a mine.');
-    await bot.sendMessage(chatId, `💥 <b>BOOM!</b> You hit a mine and lost everything — including your ${fmt(s.bet)} bet.\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { parse_mode: 'HTML' });
+    await reply(`💥 <b>BOOM!</b> You hit a mine and lost everything — including your ${fmt(s.bet)} bet.\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { html: true });
     sessions.delete(userId);
     return;
   }
@@ -154,7 +151,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
     eco.creditWallet(userId, winnings);
     await editMsg(statusText(s, true), { parse_mode: 'HTML' });
     await answerCb(`💎 All safe cells! +${fmt(winnings)}`);
-    await bot.sendMessage(chatId, `🏆 <b>PERFECT CLEAR!</b> You found all 22 safe cells.\n💰 Won ${fmt(winnings)} (net +${fmt(winnings - s.bet)})\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { parse_mode: 'HTML' });
+    await reply(`🏆 <b>PERFECT CLEAR!</b> You found all 22 safe cells.\n💰 Won ${fmt(winnings)} (net +${fmt(winnings - s.bet)})\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { html: true });
     sessions.delete(userId);
     return;
   }

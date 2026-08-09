@@ -79,7 +79,7 @@ async function play(ctx) {
   cd.startGame(userId, 'higherlower', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
-  const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'HTML', reply_markup: keyboard(s) });
+  const sent = await reply(render(s), { html: true, reply_markup: keyboard(s) });
   return { sent, session: s };
 }
 
