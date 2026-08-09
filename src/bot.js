@@ -41,6 +41,8 @@ const race = require('./games/race');
 const robbery = require('./crimes/robbery');
 const heist = require('./crimes/heist');
 const keyboards = require('./keyboards');
+const missions = require('./missions');
+const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
 const heistTimers = new Map();
@@ -538,17 +540,59 @@ function createBot() {
     },
 
     // ----- games -----
-    slots: async (ctx) => slots.play(ctx),
-    dice: async (ctx) => dice.play(ctx),
-    cf: async (ctx) => coinflip.play(ctx),
-    coinflip: async (ctx) => coinflip.play(ctx),
+    slots: async (ctx) => {
+      const r = await slots.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'slots', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    dice: async (ctx) => {
+      const r = await dice.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'dice', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    cf: async (ctx) => {
+      const r = await coinflip.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'coinflip', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    coinflip: async (ctx) => {
+      const r = await coinflip.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'coinflip', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
     mines: async (ctx) => mines.play(ctx),
     bj: async (ctx) => blackjack.play(ctx),
     blackjack: async (ctx) => blackjack.play(ctx),
-    roulette: async (ctx) => roulette.play(ctx),
+    roulette: async (ctx) => {
+      const r = await roulette.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'roulette', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
     hl: async (ctx) => higherlower.play(ctx),
     higherlower: async (ctx) => higherlower.play(ctx),
-    race: async (ctx) => race.play(ctx),
+    race: async (ctx) => {
+      const r = await race.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'race', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+
+    // ----- events & missions (created from the admin dashboard) -----
+    missions: async (ctx) => {
+      await ctx.reply(missions.listMissions(), { title: '📜 MISSIONS', color: THEME.gold, html: true });
+    },
+    mission: async (ctx) => {
+      const id = ctx.args[0] ? Number(ctx.args[0]) : null;
+      const r = missions.attemptMission(ctx.userId, metaOf(ctx.msg), id);
+      await ctx.reply(r.message, { title: r.win ? '✅ MISSION' : '📜 MISSION', color: r.win ? THEME.gold : THEME.red, html: true });
+    },
+    heistrimuru: async (ctx) => {
+      const g = cd.guard(ctx.userId, 'mission', 'Heist Rimuru');
+      if (g.blocked) return ctx.reply(g.message, { title: '🎭 EVENT', color: THEME.red });
+      const r = missions.heistRimuru(ctx.userId, metaOf(ctx.msg));
+      cd.start(ctx.userId, 'mission', missions.MISSION_COOLDOWN_MS);
+      await ctx.reply(r.message, { title: '🎭 EVENT', color: r.win ? THEME.gold : THEME.red, html: true });
+    },
+    fightrimuru: async (ctx) => {
+      const g = cd.guard(ctx.userId, 'mission', 'Fight Rimuru');
+      if (g.blocked) return ctx.reply(g.message, { title: '⚔️ EVENT', color: THEME.red });
+      const r = missions.fightRimuru(ctx.userId, metaOf(ctx.msg));
+      cd.start(ctx.userId, 'mission', missions.MISSION_COOLDOWN_MS);
+      await ctx.reply(r.message, { title: '⚔️ EVENT', color: r.win ? THEME.gold : THEME.red, html: true });
+    },
 
     lottery: async (ctx) => {
       const sub = (ctx.args[0] || 'status').toLowerCase();
@@ -865,6 +909,21 @@ function createBot() {
     }
   }
 
+  /* ---------- dashboard: chat + game logging (best-effort) ---------- */
+
+  function logGame(userId, meta, game, bet, result, amount) {
+    try {
+      db.logGameHistory({
+        user_id: userId,
+        username: meta.username || '',
+        game,
+        bet: bet || 0,
+        result: result || '',
+        amount: amount || 0,
+      });
+    } catch (e) { /* non-fatal */ }
+  }
+
   /* ---------- message routing ---------- */
 
   async function onMessage(msg) {
@@ -873,6 +932,8 @@ function createBot() {
     const text = String(msg.text || msg.caption || '');
     const userId = msg.from.id;
     const chatId = msg.chat.id;
+    // Dashboard: log every user message (chat log for moderation).
+    try { db.logChat(msg); } catch (e) { /* non-fatal */ }
     // Quote the triggering message on EVERY response from this handler —
     // commands, reply-keyboard taps, Rimuru replies, even penalty/error
     // messages show the "replying to @user" bubble above the reply.
@@ -991,6 +1052,43 @@ function createBot() {
   }).catch((e) => {
     console.warn('[boot] getMe/setMyCommands failed:', e.message);
   });
+
+  // Dashboard: give the broadcast queue the live bot (fan-out) and drain it.
+  try {
+    dashboard.setActiveBot(bot);
+  } catch (e) { /* non-fatal */ }
+  setInterval(() => {
+    try {
+      const sent = dashboard.drainBroadcastQueue((item, done) => {
+        // Fan out: users with known chats are best-effort (bot tracks chats
+        // only in-memory; groups are any negative chat we have seen).
+        let count = 0;
+        const target = item.target || 'all';
+        // Gather unique chat ids the bot has seen this session.
+        const chats = new Set();
+        try {
+          const seen = db.db.prepare('SELECT DISTINCT chat_id FROM chat_logs WHERE chat_id IS NOT NULL').all();
+          for (const row of seen) chats.add(row.chat_id);
+        } catch (e) { /* non-fatal */ }
+        let list = [];
+        if (target === 'groups') list = [...chats].filter((c) => c < 0);
+        else if (target === 'users') list = [...chats].filter((c) => c > 0);
+        else list = [...chats];
+        (async () => {
+          for (const cid of list.slice(0, 500)) {
+            try {
+              await bot.sendMessage(cid, item.message, { parse_mode: 'HTML' });
+              count++;
+            } catch (e) { /* skip unreachable chats */ }
+          }
+          done(count);
+        })().catch(() => done(count));
+      });
+      if (sent) console.log(`[dashboard] broadcast #${sent.id} drained`);
+    } catch (e) {
+      console.error('[dashboard] drain error:', e.message);
+    }
+  }, 10000);
 
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);

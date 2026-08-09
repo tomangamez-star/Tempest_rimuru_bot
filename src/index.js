@@ -19,6 +19,7 @@ const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('./config');
 const { createBot } = require('./bot');
+const { createDashboard, ensureOwnerPassword } = require('./dashboard/server');
 
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || '';
 const PRIMARY_ID = process.env.RENDER_PRIMARY_INSTANCE_ID || '';
@@ -51,16 +52,34 @@ if (!isPrimaryInstance()) {
 async function main() {
   console.log(`🐉 Rimuru Tempest Casino — starting (env=${config.env})${INSTANCE_ID ? ` instance=${INSTANCE_ID}` : ''}`);
 
-  // Health server for Render (keeps the service "live" and checkable)
+  // ── Dashboard password (owner login) ─────────────────────────────────
+  ensureOwnerPassword();
+
+  // ── Health server for Render ─────────────────────────────────────────
+  // We attach the Express dashboard app + Socket.IO to the SAME server, so
+  // there is exactly ONE HTTP listener on :PORT (health + dashboard + API).
+  let dashboard = null;
   const server = http.createServer((req, res) => {
+    // Health route always answers first; everything else goes to Express.
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ ok: true, service: 'rimuru-casino', time: Date.now() }));
       return;
     }
+    // Dashboard mounted? Route to Express. Otherwise 404.
+    if (dashboard && typeof dashboard.app === 'function') {
+      dashboard.app(req, res);
+      return;
+    }
     res.writeHead(404, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ ok: false }));
   });
+
+  // Create the dashboard (Express app + Socket.IO bound to this server).
+  if (config.dashboard.enabled) {
+    dashboard = createDashboard(server, null);
+    console.log(`🖥️  Admin dashboard mounted (login: owner Telegram ID ${config.ownerId})`);
+  }
 
   server.listen(config.port, '0.0.0.0', () => {
     console.log(`🩺 Health server listening on :${config.port} (GET /health)`);

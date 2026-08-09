@@ -37,6 +37,15 @@ services:
         value: "messages,callback_query"
       - key: PUBLIC_URL
         value: "" # optional: set to your Render URL if you enable webhooks
+      # Admin dashboard (served on the same :PORT as /health):
+      #   https://<your-service>.onrender.com/  → dashboard login
+      # Login: Telegram user ID 8781690556 (owner) + this password.
+      # Set a strong password here — if unset, the bot generates a random
+      # one and prints it once to the Render logs on boot.
+      - key: DASHBOARD_PASSWORD
+        sync: false # set this manually in Render dashboard
+      - key: DASHBOARD_ENABLED
+        value: "true"
     # 💡 PERSISTENT DISK (paid tiers only — Starter $7/mo and up).
     # Free tier does NOT support disks, so this block is commented out.
     # If you upgrade, uncomment it and change the env vars above to:

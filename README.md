@@ -173,6 +173,50 @@ rimuru-casino/
 | `DATA_DIR` | `/tmp/rimuru-data` | Misc data dir |
 | `NODE_ENV` | `production` | Runtime mode |
 | `ALLOWED_UPDATES` | `messages,callback_query` | Telegram polling updates |
+| `DASHBOARD_PASSWORD` | auto-generated | Admin dashboard login password (owner + mods) |
+| `DASHBOARD_ENABLED` | `true` | Set `false` to disable the web dashboard |
+
+---
+
+## 🖥️ Admin Dashboard
+
+A full web admin panel is served by the bot itself on the same port as
+`/health` — no extra service, no extra cost.
+
+**Access:** `https://<your-service>.onrender.com/` (or `http://localhost:10000/`
+in dev). The `/health` endpoint still works for Render health checks.
+
+**Login:** your Telegram user ID (`8781690556`) + `DASHBOARD_PASSWORD`
+(set it in Render's env vars; if unset the bot prints a generated password
+once to the logs on boot).
+
+**Features**
+- **Overview** — total users, active users, groups, coins in circulation,
+  games played, messages logged, bans, lottery pot + top-10 leaderboard.
+- **Users** — search, per-user detail (balance history, game history, chat
+  logs, cooldowns) and one-click moderation: give / deduct / set / fine /
+  jail / suspend / mute / ban / unban. Actions hit the live SQLite DB and
+  take effect in Telegram immediately (the bot's penalty gate checks the
+  same DB).
+- **Chat logs** — every user message the bot has seen (live capture).
+- **Game history** — every game / crime / mission result with win/loss and
+  coin deltas.
+- **Events & Missions** — create missions from the dashboard; they go LIVE
+  in the bot: players see them with `/missions` and attempt them with
+  `/mission [id]`, `/heistrimuru` or `/fightrimuru` (cooldown 5 min).
+- **Broadcast** — send a note-styled message to every chat the bot has seen
+  (users / groups / all). Delivered with the blockquote margin bar.
+- **Activity feed** — live stream of logins, moderation, broadcasts, events.
+- **Moderators** — the owner can add/remove moderators (each gets a login).
+- **Mod chat room** — real-time Socket.IO room for owner + mods.
+- **Rimuru mini-assistant** — chat with the Groq-powered Rimuru AI from the
+  dashboard (bottom-right 🐉 button).
+
+**Storage:** all dashboard data lives in the same SQLite DB as the bot.
+On Render's FREE tier the filesystem is ephemeral — data persists within a
+running instance and resets on redeploy/restart. True cross-redeploy
+persistence needs an external DB (Postgres/Supabase) or a paid persistent
+disk (see "Storage notes" below).
 
 ---
 

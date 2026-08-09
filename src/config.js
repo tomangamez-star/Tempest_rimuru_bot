@@ -62,6 +62,20 @@ const config = {
     fallback: ['🐉', '🔥', '😎'],
   },
 
+  // ===================== DASHBOARD =====================
+  // Admin web dashboard (served by the same HTTP server on :PORT).
+  //  - DASHBOARD_PASSWORD: login password for the owner + moderators.
+  //    If unset, the dashboard generates a random password on boot and
+  //    prints it to the logs ONCE (owner can then set it permanently).
+  //  - DASHBOARD_ENABLED: set to 'false' to disable the dashboard entirely.
+  dashboard: {
+    enabled: String(process.env.DASHBOARD_ENABLED || 'true').toLowerCase() !== 'false',
+    password: process.env.DASHBOARD_PASSWORD || '',
+    sessionTtlMs: 7 * 24 * 3600 * 1000, // 7-day session cookie
+    // Max chat-log lines kept per message for the feed
+    feedLimit: 100,
+  },
+
   // Economy
   startBalance: 500000,
   houseEdge: 0.55, // house wins 55% of the time on skill-less games
