@@ -1,0 +1,34 @@
+# Render blueprint for Rimuru Tempest Casino Bot
+# Usage: push repo to GitHub → Render → New → Blueprint → select repo
+# (or create a Web Service manually with these settings)
+services:
+  - type: web
+    name: rimuru-casino
+    runtime: node
+    plan: free # or starter ($7/mo) for persistent disk + better uptime
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /health
+    envVars:
+      - key: TELEGRAM_TOKEN
+        sync: false # set this manually in Render dashboard — never commit it
+      - key: OWNER_ID
+        value: "8781690556"
+      - key: GROQ_API_KEY
+        sync: false # set this manually in Render dashboard
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: "10000"
+      - key: DB_PATH
+        value: /tmp/rimuru.db
+      - key: DATA_DIR
+        value: /tmp/rimuru-data
+      - key: ALLOWED_UPDATES
+        value: "messages,callback_query"
+      - key: PUBLIC_URL
+        value: "" # optional: set to your Render URL if you enable webhooks
+    disk:
+      name: rimuru-data
+      mountPath: /data
+      sizeGB: 1

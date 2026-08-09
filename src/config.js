@@ -1,0 +1,130 @@
+'use strict';
+/**
+ * Rimuru Tempest Casino — central configuration.
+ * Reads from process.env (dotenv) with sensible defaults for local dev.
+ */
+require('dotenv').config();
+
+const config = {
+  // Telegram
+  telegramToken: process.env.TELEGRAM_TOKEN || '',
+  ownerId: String(process.env.OWNER_ID || '8781690556'),
+  allowedUpdates: (process.env.ALLOWED_UPDATES || 'messages,callback_query').split(','),
+
+  // Groq (Rimuru AI)
+  groqApiKey: process.env.GROQ_API_KEY || '',
+  groqModel: process.env.GROQ_MODEL || 'llama-3.3-70b-versatile',
+  groqMaxTokens: Number(process.env.GROQ_MAX_TOKENS || 150),
+  groqTemperature: Number(process.env.GROQ_TEMPERATURE || 0.9),
+
+  // Runtime
+  port: Number(process.env.PORT || 10000),
+  env: process.env.NODE_ENV || 'development',
+  isProd: (process.env.NODE_ENV || 'development') === 'production',
+
+  // Storage
+  dbPath: process.env.DB_PATH || '/tmp/rimuru.db',
+  dataDir: process.env.DATA_DIR || '/tmp/rimuru-data',
+
+  // Economy
+  startBalance: 500000,
+  houseEdge: 0.55, // house wins 55% of the time on skill-less games
+
+  // Cooldowns (ms)
+  cooldowns: {
+    game: 2 * 60 * 1000,      // games
+    rob: 10 * 60 * 1000,      // robbery
+    heist: 20 * 60 * 1000,    // heist
+    daily: 24 * 60 * 60 * 1000,
+    bonus: 7 * 24 * 60 * 60 * 1000,
+    work: 60 * 1000,
+    beg: 60 * 1000,
+    fish: 2 * 60 * 1000,
+    dig: 3 * 60 * 1000,
+  },
+
+  // Lottery
+  lottery: {
+    ticketPrice: 10000,
+    minBuyers: 5,
+    baseJackpot: 5000000,
+  },
+
+  // Heist
+  heist: {
+    openWindowMs: 60 * 1000,     // 1 minute to /join
+    maxMembers: 5,               // leader counts as 1
+    leaderBaseRisk: 0.65,        // leader starts at 65% risk
+    minNetworthShare: 0.30,      // need 30% of target's networth to attempt
+    winShare: 0.50,              // up to half of target's bank split equally
+    failPenalty: 0.10,           // lose 10% of own networth on failure
+  },
+
+  // Robbery
+  rob: {
+    minTargetWallet: 10000,      // can't rob broke users
+    successRate: 0.60,
+    maxTakePct: 0.15,            // take up to 15% of target's wallet
+    finePct: 0.05,               // fine = 5% of robber's wallet on fail
+  },
+
+  // Mines
+  mines: {
+    grid: 5,
+    mineCount: 3,
+    multipliers: [1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 14.0, 16.0, 20.0, 25.0],
+    // index = number of safe picks BEFORE this pick → multiplier for next pick
+  },
+
+  // Slots
+  slots: {
+    items: ['🍒', '🍋', '🍇', '💎', '⭐', '7️⃣', '🎰', '💰'],
+    twoMatchMult: 2,
+    threeMatchMult: 4,
+  },
+
+  // Dice — /dice uses Telegram's animated dice (1-6). Pick a number, hit = x6.
+  dice: {
+    mult: 6,
+  },
+
+  // Coin flip — win = double (bet + winnings)
+  coinflip: {
+    mult: 2,
+  },
+
+  // Roulette payouts (multiplier on bet)
+  roulette: {
+    colorMult: 2,
+    parityMult: 2,
+    halfMult: 2,
+    dozenMult: 3,
+    columnMult: 3,
+    straightMult: 36,
+    splitMult: 18,
+  },
+
+  // Blackjack
+  blackjack: {
+    blackjackPayout: 2.5, // 3:2 → 2.5x of bet returned
+    doubleAllowed: true,
+  },
+
+  // Passive income ranges [min, max]
+  income: {
+    beg: [500, 5000],
+    work: [2000, 15000],
+    fish: [1000, 8000],
+    dig: [3000, 20000],
+    daily: [25000, 50000],
+    bonus: [100000, 250000],
+  },
+};
+
+// Guard: critical config missing
+if (!config.telegramToken && config.env === 'production') {
+  console.error('[config] FATAL: TELEGRAM_TOKEN is not set.');
+  process.exit(1);
+}
+
+module.exports = config;
