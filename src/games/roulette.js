@@ -159,7 +159,7 @@ async function play(ctx) {
     text = `🎡 The ball lands on **${r.number} ${r.color}**.\n\n❌ Lost ${fmt(parsed.amount)}.`;
   }
   const wallet = eco.balance(userId).wallet;
-  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`, { parse_mode: 'Markdown' });
+  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`);
   return { won: r.win, net };
 }
 

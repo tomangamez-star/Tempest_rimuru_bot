@@ -5,7 +5,7 @@
  * Shiny bright gold numbers (not pale) for ranks 1-10.
  */
 const db = require('./db');
-const { fmt } = require('./utils');
+const { fmt, esc } = require('./utils');
 
 const MEDALS = ['🥇', '🥈', '🥉', '4️⃣', '5️⃣', '6️⃣', '7️⃣', '8️⃣', '9️⃣', '🔟'];
 
@@ -15,7 +15,7 @@ function render() {
   if (!top.length) return '🏆 No players yet. Be the first!';
 
   const lines = top.map((u, i) => {
-    const name = u.first_name || u.username || `User${u.user_id}`;
+    const name = esc(u.first_name || u.username || `User${u.user_id}`, false);
     const rank = MEDALS[i] || `${i + 1}.`;
     // Shiny bright gold numbers — pop on dark themes
     return `${rank} <b>${name}</b> — 💎 <b><span style="color:#FFD54F">${fmt(u.networth)}</span></b>`;

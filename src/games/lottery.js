@@ -7,7 +7,7 @@
  */
 const config = require('../config');
 const db = require('../db');
-const { fmt } = require('../utils');
+const { fmt, esc } = require('../utils');
 
 /**
  * Buy tickets.
@@ -77,9 +77,9 @@ function draw() {
     winner,
     pot,
     message:
-      `🎉 **LOTTERY DRAW!**\n\n` +
-      `🏆 Winner: <a href="tg://user?id=${winner.user_id}">${winner.name}</a>\n` +
-      `💰 Prize: **${fmt(pot)}**\n\n` +
+      `🎉 <b>LOTTERY DRAW!</b>\n\n` +
+      `🏆 Winner: <a href="tg://user?id=${winner.user_id}">${esc(winner.name, false)}</a>\n` +
+      `💰 Prize: <b>${fmt(pot)}</b>\n\n` +
       `The jackpot resets to ${fmt(config.lottery.baseJackpot)} for the next round. 🎟️ /lottery`,
   };
 }

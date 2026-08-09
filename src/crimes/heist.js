@@ -14,7 +14,7 @@
  */
 const config = require('../config');
 const db = require('../db');
-const { fmt, chance } = require('../utils');
+const { fmt, chance, esc } = require('../utils');
 
 /** Risk for a heist with n members (leader base 65%, -12.5% per extra member). */
 function riskFor(n) {
@@ -145,7 +145,7 @@ function execute(leaderId) {
     for (const m of members) {
       db.addWallet(m.user_id, share);
     }
-    const names = members.map((m) => `<a href="tg://user?id=${m.user_id}">${m.name}</a>`).join(', ');
+    const names = members.map((m) => `<a href="tg://user?id=${m.user_id}">${esc(m.name, false)}</a>`).join(', ');
     db.deleteHeist(leaderId);
     return {
       ok: true,

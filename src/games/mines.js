@@ -93,10 +93,10 @@ function buildKeyboard(s, gameOver = false) {
 function statusText(s, gameOver = false) {
   const mult = nextMult(s);
   return (
-    `💣 **MINES** — bet ${fmt(s.bet)}\n\n` +
+    `💣 <b>MINES</b> — bet ${fmt(s.bet)}\n\n` +
     buildBoard(s, gameOver) +
-    `\n\n💎 Safe picks: ${s.revealed.size}/22 | Next pick: **${mult.toFixed(2)}x**\n` +
-    `💵 Cash out now: **${fmt(currentWorth(s))}**`
+    `\n\n💎 Safe picks: ${s.revealed.size}/22 | Next pick: <b>${mult.toFixed(2)}x</b>\n` +
+    `💰 Cash out now: <b>${fmt(currentWorth(s))}</b>`
   );
 }
 
@@ -119,7 +119,7 @@ async function play(ctx) {
 
   const s = createSession(userId, bet.amount);
   const sent = await bot.sendMessage(chatId, statusText(s), {
-    parse_mode: 'Markdown',
+    parse_mode: 'HTML',
     reply_markup: buildKeyboard(s),
   });
   return { sent, session: s };
@@ -140,9 +140,9 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
   if (s.mines.has(idx)) {
     // 💥 BOOM — lose everything (initial bet already charged)
     s.alive = false;
-    await editMsg(statusText(s, true), { parse_mode: 'Markdown' });
+    await editMsg(statusText(s, true), { parse_mode: 'HTML' });
     await answerCb('💥 BOOM! You hit a mine.');
-    await bot.sendMessage(chatId, `💥 **BOOM!** You hit a mine and lost everything — including your ${fmt(s.bet)} bet.\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `💥 <b>BOOM!</b> You hit a mine and lost everything — including your ${fmt(s.bet)} bet.\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { parse_mode: 'HTML' });
     sessions.delete(userId);
     return;
   }
@@ -152,13 +152,13 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
     s.alive = false;
     const winnings = currentWorth(s);
     eco.creditWallet(userId, winnings);
-    await editMsg(statusText(s, true), { parse_mode: 'Markdown' });
+    await editMsg(statusText(s, true), { parse_mode: 'HTML' });
     await answerCb(`💎 All safe cells! +${fmt(winnings)}`);
-    await bot.sendMessage(chatId, `🏆 **PERFECT CLEAR!** You found all 22 safe cells.\n💰 Won ${fmt(winnings)} (net +${fmt(winnings - s.bet)})\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `🏆 <b>PERFECT CLEAR!</b> You found all 22 safe cells.\n💰 Won ${fmt(winnings)} (net +${fmt(winnings - s.bet)})\n👛 Wallet: ${fmt(eco.balance(userId).wallet)}`, { parse_mode: 'HTML' });
     sessions.delete(userId);
     return;
   }
-  await editMsg(statusText(s), { parse_mode: 'Markdown', reply_markup: buildKeyboard(s) });
+  await editMsg(statusText(s), { parse_mode: 'HTML', reply_markup: buildKeyboard(s) });
   await answerCb(`💎 Safe! Multiplier now ${nextMult(s).toFixed(2)}x`);
 }
 
@@ -172,7 +172,7 @@ async function onCash(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
   const winnings = currentWorth(s);
   s.alive = false;
   eco.creditWallet(userId, winnings);
-  await editMsg(`${statusText(s)}\n\n✅ **CASHED OUT** ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'Markdown' });
+  await editMsg(`${statusText(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'HTML' });
   await answerCb(`💰 Cashed out ${fmt(winnings)}`);
   sessions.delete(userId);
 }

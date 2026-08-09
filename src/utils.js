@@ -127,7 +127,20 @@ function note(title, body, opts = {}) {
   const color = opts.color || THEME.blue;
   const icon = opts.icon || THEME.acc.note;
   const t = esc(title, false);
-  const b = esc(body || '').replace(/\*\*(.+?)\*\*/g, '<b>$1</b>').replace(/`([^`]+)`/g, '<code>$1</code>');
+  let b;
+  if (opts.html === true) {
+    // Trusted HTML body: keep <b>/<code>/<a> tags intact, still convert
+    // markdown **bold** / `code`, and newlines to <br>.
+    b = String(body == null ? '' : body)
+      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>')
+      .replace(/\n/g, '<br>');
+  } else {
+    // Plain/markdown body: escape everything, then convert markdown to HTML.
+    b = esc(body || '')
+      .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
+  }
   return (
     `<blockquote><b><span style="color:${color}">${icon} ${t}</span></b><br>` +
     `${b}</blockquote>`

@@ -54,7 +54,7 @@ async function play(ctx) {
     text = `🎲 You picked **${picked}**… the dice shows **${actual}**.\n\n❌ Missed. Lost ${fmt(bet.amount)}.`;
   }
   const wallet = eco.balance(userId).wallet;
-  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`, { parse_mode: 'Markdown' });
+  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`);
   return { won: win, net };
 }
 

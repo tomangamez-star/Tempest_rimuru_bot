@@ -1,13 +1,13 @@
 'use strict';
 /**
- * Rimuru Tempest Casino — Blackjack 🂡
+ * Rimuru Tempest Casino — Blackjack ♣
  * Standard casino rules: dealer stands on 17+, blackjack pays 3:2,
  * double down allowed on first two cards (bet doubled).
  *
  * Callback payload: bj:<userId>:<action>  (hit | stand | double)
  */
 const config = require('../config');
-const { fmt, shuffle, randInt } = require('../utils');
+const { fmt, shuffle, randInt, esc } = require('../utils');
 
 const sessions = new Map(); // userId -> {bet, deck, player[], dealer[], doubled, done}
 
@@ -62,13 +62,13 @@ function render(s) {
   const pv = handValue(s.player);
   const dv = handValue(s.dealer);
   let lines = [
-    `🂡 **BLACKJACK** — bet ${fmt(s.bet)}${s.doubled ? ' (doubled)' : ''}`,
+    `♣ <b>BLACKJACK</b> — bet ${fmt(s.bet)}${s.doubled ? ' (doubled)' : ''}`,
     '',
-    `Dealer: ${handStr(s.dealer, true)} (${dv === 21 && s.dealer.length === 2 ? 'BJ?' : '?'})`,
-    `You: ${handStr(s.player)} — **${pv}**`,
+    `Dealer: ${esc(handStr(s.dealer, true))} (${dv === 21 && s.dealer.length === 2 ? 'BJ?' : '?'})`,
+    `You: ${esc(handStr(s.player))} — <b>${pv}</b>`,
   ];
   if (s.done) {
-    lines[1] = `Dealer: ${handStr(s.dealer)} — **${dv}**`;
+    lines[1] = `Dealer: ${esc(handStr(s.dealer))} — <b>${dv}</b>`;
   }
   return lines.join('\n');
 }
@@ -108,12 +108,12 @@ async function play(ctx) {
     const payout = Math.floor(bet.amount * config.blackjack.blackjackPayout);
     eco.creditWallet(userId, payout);
     s.payout = payout;
-    await bot.sendMessage(chatId, `${render(s)}\n\n🃏 **BLACKJACK!** 3:2 — you get ${fmt(payout)} (net +${fmt(payout - bet.amount)})`, { parse_mode: 'Markdown' });
+    await bot.sendMessage(chatId, `${render(s)}\n\n♣ <b>BLACKJACK!</b> 3:2 — you get ${fmt(payout)} (net +${fmt(payout - bet.amount)})`, { parse_mode: 'HTML' });
     sessions.delete(userId);
     return;
   }
 
-  const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'Markdown', reply_markup: keyboard(s) });
+  const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'HTML', reply_markup: keyboard(s) });
   return { sent, session: s };
 }
 
@@ -150,8 +150,8 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
 
   if (outcome === 'bust') {
     s.done = true;
-    const text = `${render(s)}\n\n💥 **BUST!** You lost ${fmt(s.bet)}.`;
-    await editMsg(text, { parse_mode: 'Markdown' });
+    const text = `${render(s)}\n\n💥 <b>BUST!</b> You lost ${fmt(s.bet)}.`;
+    await editMsg(text, { parse_mode: 'HTML' });
     await answerCb('💥 Bust!');
     sessions.delete(userId);
     return;
@@ -176,17 +176,17 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     }
     if (payout > 0) eco.creditWallet(userId, payout);
     s.payout = payout;
-    const emoji = result === 'win' ? '✅ **YOU WIN!**' : result === 'push' ? '🤝 **PUSH**' : '❌ **DEALER WINS**';
+    const emoji = result === 'win' ? '✅ <b>YOU WIN!</b>' : result === 'push' ? '🤝 <b>PUSH</b>' : '❌ <b>DEALER WINS</b>';
     const net = result === 'win' ? `+${fmt(payout - s.bet)}` : result === 'push' ? '0' : `-${fmt(s.bet)}`;
     const text = `${render(s)}\n\n${emoji} (${net})`;
-    await editMsg(text, { parse_mode: 'Markdown' });
+    await editMsg(text, { parse_mode: 'HTML' });
     await answerCb(result === 'win' ? '✅ Win!' : result === 'push' ? '🤝 Push' : '❌ Lost');
     sessions.delete(userId);
     return;
   }
 
   // Still playing — update board
-  await editMsg(render(s), { parse_mode: 'Markdown', reply_markup: keyboard(s) });
+  await editMsg(render(s), { parse_mode: 'HTML', reply_markup: keyboard(s) });
   await answerCb('🎯 Dealt.');
 }
 

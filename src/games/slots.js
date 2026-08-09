@@ -48,7 +48,7 @@ async function play(ctx) {
     text = `🎰 ${r.reels.join(' | ')}\n\n❌ No luck, mortal. You lost ${fmt(bet.amount)}.`;
   }
   const wallet = eco.balance(userId).wallet;
-  ctx.reply(`${text}\n👛 Wallet: ${fmt(wallet)}`, { parse_mode: 'Markdown' });
+  ctx.reply(`${text}\n👛 Wallet: ${fmt(wallet)}`);
   return { won: r.win, net };
 }
 

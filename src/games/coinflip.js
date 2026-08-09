@@ -41,7 +41,7 @@ async function play(ctx) {
     text = `🪙 The coin lands **${r.flip.toUpperCase()}**.\n\n❌ You picked ${norm}. Lost ${fmt(bet.amount)}.`;
   }
   const wallet = eco.balance(userId).wallet;
-  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`, { parse_mode: 'Markdown' });
+  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`);
   return { won: r.win, net };
 }
 

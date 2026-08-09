@@ -1,6 +1,6 @@
 'use strict';
 /**
- * Rimuru Tempest Casino — Higher or Lower 🃏
+ * Rimuru Tempest Casino — Higher or Lower ♠
  * Guess if the next card is higher or lower (buttons).
  * Streak multiplier climbs with each correct guess; cash out anytime.
  * Wrong guess = bust (lose initial bet + accumulated winnings).
@@ -8,7 +8,7 @@
  * Callback: hl:<userId>:<action>  (high | low | cash)
  */
 const config = require('../config');
-const { fmt, shuffle } = require('../utils');
+const { fmt, shuffle, esc } = require('../utils');
 
 const sessions = new Map();
 
@@ -46,9 +46,9 @@ function currentPayout(s) {
 
 function render(s) {
   return (
-    `🃏 **HIGHER OR LOWER** — bet ${fmt(s.bet)}\n\n` +
-    `Current card: **${cardStr(s.current)}**\n` +
-    `Streak: **${s.streak}** | Payout now: **${fmt(currentPayout(s))}**`
+    `♠ <b>HIGHER OR LOWER</b> — bet ${fmt(s.bet)}\n\n` +
+    `Current card: <b>${esc(cardStr(s.current))}</b>\n` +
+    `Streak: <b>${s.streak}</b> | Payout now: <b>${fmt(currentPayout(s))}</b>`
   );
 }
 
@@ -79,7 +79,7 @@ async function play(ctx) {
   cd.startGame(userId, 'higherlower', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
-  const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'Markdown', reply_markup: keyboard(s) });
+  const sent = await bot.sendMessage(chatId, render(s), { parse_mode: 'HTML', reply_markup: keyboard(s) });
   return { sent, session: s };
 }
 
@@ -95,7 +95,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     const winnings = currentPayout(s);
     s.alive = false;
     eco.creditWallet(userId, winnings);
-    await editMsg(`${render(s)}\n\n✅ **CASHED OUT** ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'Markdown' });
+    await editMsg(`${render(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'HTML' });
     await answerCb(`💰 Cashed out ${fmt(winnings)}`);
     sessions.delete(userId);
     return;
@@ -116,14 +116,14 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
   if (correct) {
     s.streak++;
     s.current = next;
-    const text = `${render(s)}\n\n✅ Correct! Next card was **${cardStr(next)}**.`;
-    await editMsg(text, { parse_mode: 'Markdown', reply_markup: keyboard(s) });
+    const text = `${render(s)}\n\n✅ Correct! Next card was <b>${esc(cardStr(next))}</b>.`;
+    await editMsg(text, { parse_mode: 'HTML', reply_markup: keyboard(s) });
     await answerCb(`✅ Streak ${s.streak}`);
   } else {
     // Bust — lose initial bet + accumulated
     s.alive = false;
-    const text = `${render(s)}\n\n❌ **BUST!** Next card was **${cardStr(next)}**. You lost ${fmt(s.bet)}.`;
-    await editMsg(text, { parse_mode: 'Markdown' });
+    const text = `${render(s)}\n\n❌ <b>BUST!</b> Next card was <b>${esc(cardStr(next))}</b>. You lost ${fmt(s.bet)}.`;
+    await editMsg(text, { parse_mode: 'HTML' });
     await answerCb('❌ Wrong guess!');
     sessions.delete(userId);
   }
