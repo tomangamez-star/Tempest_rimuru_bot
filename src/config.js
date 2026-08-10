@@ -29,6 +29,18 @@ const config = {
   dbPath: process.env.DB_PATH || './data/rimuru.db',
   dataDir: process.env.DATA_DIR || './data',
 
+  // ===================== EXTERNAL POSTGRES (SUPABASE) =====================
+  // Durable cross-redeploy persistence. Set DATABASE_URL (a Postgres
+  // connection string, e.g. a Supabase pooler URL) on Render. The local
+  // SQLite file stays as the hot synchronous cache; every write is mirrored
+  // to Postgres and on boot the cache is rehydrated from Postgres, so
+  // balances/leaderboard/mods survive every redeploy.
+  //   - REQUIRED: DATABASE_URL (or SUPABASE_URL) — a postgres://… string.
+  //   - Optional: DB_SYNC_INTERVAL_MS (default 1500ms) — mirror flush cadence.
+  //   - No env var → bot runs SQLite-only (ephemeral) with a clear warning.
+  databaseUrl: process.env.DATABASE_URL || process.env.SUPABASE_URL || '',
+  dbSyncIntervalMs: Number(process.env.DB_SYNC_INTERVAL_MS || 1500),
+
   // Rimuru sticker pack — sends a random sticker with Rimuru's replies.
   // Set STICKER_PACK to any public pack name (e.g. Tensei_Shitara_Slime_Datta_Ken2).
   // If unset or invalid, the bot skips stickers gracefully (never crashes).

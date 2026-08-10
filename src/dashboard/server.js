@@ -254,13 +254,9 @@ function createDashboard(server, bot) {
     const offset = Math.max(Number(req.query.offset) || 0, 0);
     let rows;
     if (q) {
-      rows = db.db.prepare(`
-        SELECT * FROM users
-        WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(username) LIKE ? OR LOWER(first_name) LIKE ?
-        ORDER BY (wallet + bank) DESC LIMIT ? OFFSET ?
-      `).all(`%${q}%`, `%${q}%`, `%${q}%`, limit, offset);
+      rows = db.searchUsers(q, limit, offset);
     } else {
-      rows = db.db.prepare('SELECT * FROM users ORDER BY (wallet + bank) DESC LIMIT ? OFFSET ?').all(limit, offset);
+      rows = db.listUsersByNetWorth(limit, offset);
     }
     res.json({ ok: true, users: rows.map(userView) });
   });
@@ -274,7 +270,7 @@ function createDashboard(server, bot) {
     }
     const games = db.getGameHistory(30, uid);
     const logs = db.getChatLogs(30, uid);
-    const cooldowns = db.db.prepare('SELECT action, until FROM cooldowns WHERE user_id = ?').all(uid);
+    const cooldowns = db.getUserCooldowns(uid);
     res.json({ ok: true, user: userView(u), games, logs, cooldowns });
   });
 

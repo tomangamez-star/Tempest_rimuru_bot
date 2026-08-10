@@ -1,13 +1,25 @@
 'use strict';
 /**
- * Rimuru Tempest Casino — SQLite data layer (better-sqlite3).
- * Stores: users (balance/wallet/bank/status), cooldowns, lottery state, heists.
- * All operations are synchronous & atomic (better-sqlite3).
+ * Rimuru Tempest Casino — hybrid data layer.
+ *
+ * SQLite (better-sqlite3) stays the hot synchronous cache — every game,
+ * economy and dashboard module calls these functions synchronously, so we
+ * keep that exact API. When DATABASE_URL (Supabase/Postgres) is configured,
+ * every mutation is ALSO mirrored to Postgres (async, batched), and on boot
+ * the SQLite cache is rehydrated from Postgres — so balances, leaderboard,
+ * moderators and the economy SURVIVE every redeploy/restart on Render.
+ *
+ * Tables (same schema in SQLite and Postgres): users, cooldowns, lottery,
+ * heists, chat_logs, game_history, admin_users, bot_events, broadcasts,
+ * activity_feed, audit_log.
  */
 const fs = require('fs');
 const path = require('path');
+const { Pool } = require('pg');
 const config = require('./config');
 const { ensureDir } = require('./utils');
+
+/* ================= SQLite (hot cache) ================= */
 
 ensureDir(path.dirname(config.dbPath));
 
@@ -61,7 +73,6 @@ CREATE TABLE IF NOT EXISTS heists (
 );
 
 -- ===================== DASHBOARD TABLES =====================
--- Chat logs: every user message the bot sees (for moderation).
 CREATE TABLE IF NOT EXISTS chat_logs (
   id         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id    INTEGER NOT NULL,
@@ -74,7 +85,6 @@ CREATE TABLE IF NOT EXISTS chat_logs (
   created_at INTEGER NOT NULL
 );
 
--- Game history: every game/crime/income result (wins, losses, balances).
 CREATE TABLE IF NOT EXISTS game_history (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id     INTEGER NOT NULL,
@@ -87,7 +97,6 @@ CREATE TABLE IF NOT EXISTS game_history (
   created_at  INTEGER NOT NULL
 );
 
--- Moderators / dashboard accounts.
 CREATE TABLE IF NOT EXISTS admin_users (
   user_id     INTEGER PRIMARY KEY,  -- Telegram user ID
   username    TEXT DEFAULT '',
@@ -97,7 +106,6 @@ CREATE TABLE IF NOT EXISTS admin_users (
   last_login  INTEGER DEFAULT 0
 );
 
--- Events / missions (created from the dashboard, live in the bot).
 CREATE TABLE IF NOT EXISTS bot_events (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   title       TEXT NOT NULL,
@@ -109,10 +117,9 @@ CREATE TABLE IF NOT EXISTS bot_events (
   active      INTEGER DEFAULT 1,
   created_by  INTEGER DEFAULT 0,
   created_at  INTEGER NOT NULL,
-  completions INTEGER DEFAULT 0        -- how many users completed it
+  completions INTEGER DEFAULT 0
 );
 
--- Broadcast history.
 CREATE TABLE IF NOT EXISTS broadcasts (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   message     TEXT NOT NULL,
@@ -122,7 +129,6 @@ CREATE TABLE IF NOT EXISTS broadcasts (
   created_at  INTEGER NOT NULL
 );
 
--- Activity feed (dashboard live feed).
 CREATE TABLE IF NOT EXISTS activity_feed (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   type        TEXT DEFAULT 'event',  -- event | user | game | mod | broadcast
@@ -131,7 +137,6 @@ CREATE TABLE IF NOT EXISTS activity_feed (
   created_at  INTEGER NOT NULL
 );
 
--- Audit log (moderation actions).
 CREATE TABLE IF NOT EXISTS audit_log (
   id          INTEGER PRIMARY KEY AUTOINCREMENT,
   actor_id    INTEGER NOT NULL,
@@ -143,24 +148,269 @@ CREATE TABLE IF NOT EXISTS audit_log (
 );
 `);
 
+/* ================= Postgres (durable store) ================= */
+
+const DATABASE_URL = (config.databaseUrl || '').trim();
+const pgEnabled = DATABASE_URL.length > 0;
+let pool = null;
+
+if (pgEnabled) {
+  try {
+    pool = new Pool({
+      connectionString: DATABASE_URL,
+      max: 5,
+      connectionTimeoutMillis: 8000,
+      idleTimeoutMillis: 30000,
+    });
+  } catch (e) {
+    console.error('[db] Invalid DATABASE_URL — falling back to SQLite-only:', e.message);
+    pool = null;
+  }
+}
+
+if (!pgEnabled) {
+  console.warn(
+    '[db] ⚠ DATABASE_URL not set — running SQLite-only (ephemeral). ' +
+    'Balances will RESET on redeploy. Set DATABASE_URL (Supabase/Postgres) for durable persistence.'
+  );
+} else {
+  console.log('[db] Postgres mirror ENABLED (DATABASE_URL set).');
+}
+
+const PG_SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  user_id       BIGINT PRIMARY KEY,
+  username      TEXT DEFAULT '',
+  first_name    TEXT DEFAULT '',
+  wallet        BIGINT NOT NULL DEFAULT 0,
+  bank          BIGINT NOT NULL DEFAULT 0,
+  status        TEXT DEFAULT 'active',
+  status_reason TEXT DEFAULT '',
+  status_until  BIGINT DEFAULT 0,
+  created_at    BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cooldowns (
+  user_id BIGINT NOT NULL,
+  action  TEXT NOT NULL,
+  until   BIGINT NOT NULL,
+  PRIMARY KEY (user_id, action)
+);
+CREATE TABLE IF NOT EXISTS lottery (
+  id           SMALLINT PRIMARY KEY CHECK (id = 1),
+  pot          BIGINT NOT NULL DEFAULT 0,
+  ticket_count BIGINT NOT NULL DEFAULT 0,
+  tickets      TEXT NOT NULL DEFAULT '[]'
+);
+CREATE TABLE IF NOT EXISTS heists (
+  leader_id   BIGINT PRIMARY KEY,
+  leader_name TEXT DEFAULT '',
+  target_id   BIGINT NOT NULL,
+  target_name TEXT DEFAULT '',
+  members     TEXT NOT NULL DEFAULT '[]',
+  started_at  BIGINT NOT NULL,
+  status      TEXT DEFAULT 'open'
+);
+CREATE TABLE IF NOT EXISTS chat_logs (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    BIGINT NOT NULL,
+  username   TEXT DEFAULT '',
+  first_name TEXT DEFAULT '',
+  chat_id    BIGINT NOT NULL,
+  chat_title TEXT DEFAULT '',
+  text       TEXT DEFAULT '',
+  is_command SMALLINT DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS game_history (
+  id         BIGSERIAL PRIMARY KEY,
+  user_id    BIGINT NOT NULL,
+  username   TEXT DEFAULT '',
+  game       TEXT NOT NULL,
+  bet        BIGINT DEFAULT 0,
+  result     TEXT DEFAULT '',
+  amount     BIGINT DEFAULT 0,
+  meta       TEXT DEFAULT '{}',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS admin_users (
+  user_id    BIGINT PRIMARY KEY,
+  username   TEXT DEFAULT '',
+  role       TEXT DEFAULT 'mod',
+  password   TEXT DEFAULT '',
+  created_at BIGINT NOT NULL,
+  last_login BIGINT DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS bot_events (
+  id          BIGSERIAL PRIMARY KEY,
+  title       TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  type        TEXT DEFAULT 'mission',
+  reward      BIGINT DEFAULT 0,
+  starts_at   BIGINT DEFAULT 0,
+  ends_at     BIGINT DEFAULT 0,
+  active      SMALLINT DEFAULT 1,
+  created_by  BIGINT DEFAULT 0,
+  created_at  BIGINT NOT NULL,
+  completions BIGINT DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id         BIGSERIAL PRIMARY KEY,
+  message    TEXT NOT NULL,
+  target     TEXT DEFAULT 'all',
+  sent_count BIGINT DEFAULT 0,
+  created_by BIGINT DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS activity_feed (
+  id         BIGSERIAL PRIMARY KEY,
+  type       TEXT DEFAULT 'event',
+  text       TEXT NOT NULL,
+  meta       TEXT DEFAULT '{}',
+  created_at BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS audit_log (
+  id         BIGSERIAL PRIMARY KEY,
+  actor_id   BIGINT NOT NULL,
+  actor_name TEXT DEFAULT '',
+  action     TEXT NOT NULL,
+  target_id  BIGINT DEFAULT 0,
+  detail     TEXT DEFAULT '',
+  created_at BIGINT NOT NULL
+);
+`;
+
+/** Create Postgres tables (idempotent). Returns true on success. */
+async function initPg() {
+  if (!pool) return false;
+  try {
+    await pool.query(PG_SCHEMA);
+    return true;
+  } catch (e) {
+    console.error('[db] Postgres schema init failed (continuing SQLite-only):', e.message);
+    return false;
+  }
+}
+
+/** Simple async queue so a single slow pg query never blocks the process. */
+let pgReady = false;
+let pgQueue = Promise.resolve();
+let pgInitPromise = null;
+
+function queuePg(task) {
+  pgQueue = pgQueue.then(task).catch((err) => {
+    console.error('[db] pg mirror error:', err.message);
+  });
+}
+
+/**
+ * Run one raw SQL on Postgres (fire-and-forget, queued). If the pool is not
+ * initialized yet (init still in flight) the query is simply skipped — the
+ * periodic full-sync re-mirrors everything shortly after boot.
+ */
+function pgRun(sql, params = []) {
+  if (!pool || !pgReady) return;
+  queuePg(() => pool.query(sql, params));
+}
+
+/* ================= Table mirror helpers ================= */
+
+const TABLE_COLS = {
+  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, created_at',
+  cooldowns: 'user_id, action, until',
+  lottery: 'id, pot, ticket_count, tickets',
+  heists: 'leader_id, leader_name, target_id, target_name, members, started_at, status',
+  admin_users: 'user_id, username, role, password, created_at, last_login',
+  bot_events: 'id, title, description, type, reward, starts_at, ends_at, active, created_by, created_at, completions',
+  broadcasts: 'id, message, target, sent_count, created_by, created_at',
+  activity_feed: 'id, type, text, meta, created_at',
+  audit_log: 'id, actor_id, actor_name, action, target_id, detail, created_at',
+  chat_logs: 'id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at',
+  game_history: 'id, user_id, username, game, bet, result, amount, meta, created_at',
+};
+
+function sqliteRows(table) {
+  try {
+    return db.prepare(`SELECT ${TABLE_COLS[table]} FROM ${table}`).all();
+  } catch (e) {
+    return [];
+  }
+}
+
+/** Replace Postgres table contents with the SQLite cache (upsert-all). */
+function mirrorTable(table) {
+  if (!pool || !pgReady) return;
+  const rows = sqliteRows(table);
+  if (!rows.length) return;
+  queuePg(async () => {
+    const cols = TABLE_COLS[table].split(', ');
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const row of rows) {
+        const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
+        const conflict = cols[0]; // primary key column
+        const updateCols = cols.slice(1).map((c) => `${c} = EXCLUDED.${c}`).join(', ');
+        await client.query(
+          `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
+           ON CONFLICT (${conflict}) DO UPDATE SET ${updateCols}`,
+          cols.map((c) => row[c])
+        );
+      }
+      await client.query('COMMIT');
+    } catch (e) {
+      await client.query('ROLLBACK').catch(() => {});
+      throw e;
+    } finally {
+      client.release();
+    }
+  });
+}
+
+/** Full mirror: push every SQLite table to Postgres (called on boot + periodically). */
+function mirrorAll() {
+  if (!pool || !pgReady) return;
+  for (const table of Object.keys(TABLE_COLS)) mirrorTable(table);
+}
+
+/* ================= User row helpers ================= */
+
+function mapUser(row) {
+  if (!row) return row;
+  return {
+    user_id: Number(row.user_id),
+    username: row.username || '',
+    first_name: row.first_name || '',
+    wallet: Number(row.wallet) || 0,
+    bank: Number(row.bank) || 0,
+    status: row.status || 'active',
+    status_reason: row.status_reason || '',
+    status_until: Number(row.status_until) || 0,
+    created_at: Number(row.created_at) || 0,
+  };
+}
+
 /* ---------------- Users ---------------- */
 
 function getOrCreateUser(userId, meta = {}) {
-  const row = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+  let row = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
   if (row) {
     if (meta.username || meta.first_name) {
       db.prepare('UPDATE users SET username = ?, first_name = ? WHERE user_id = ?')
         .run(meta.username || row.username, meta.first_name || row.first_name, userId);
+      const updated = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+      mirrorTable('users');
+      return mapUser(updated);
     }
-    return db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+    return mapUser(row);
   }
   db.prepare('INSERT INTO users (user_id, username, first_name, wallet, bank, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(userId, meta.username || '', meta.first_name || '', config.startBalance, 0, 'active', Date.now());
-  return db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+  mirrorTable('users');
+  return mapUser(db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId));
 }
 
 function getUser(userId) {
-  return db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+  return mapUser(db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId));
 }
 
 function getNetWorth(userId) {
@@ -171,31 +421,37 @@ function getNetWorth(userId) {
 
 function setWallet(userId, amount) {
   db.prepare('UPDATE users SET wallet = ? WHERE user_id = ?').run(amount, userId);
+  mirrorTable('users');
 }
 
 function setBank(userId, amount) {
   db.prepare('UPDATE users SET bank = ? WHERE user_id = ?').run(amount, userId);
+  mirrorTable('users');
 }
 
 /** Atomically add to wallet (positive or negative). Returns new wallet. */
 function addWallet(userId, delta) {
   db.prepare('UPDATE users SET wallet = wallet + ? WHERE user_id = ?').run(delta, userId);
+  mirrorTable('users');
   return getUser(userId).wallet;
 }
 
 /** Atomically add to bank. Returns new bank. */
 function addBank(userId, delta) {
   db.prepare('UPDATE users SET bank = bank + ? WHERE user_id = ?').run(delta, userId);
+  mirrorTable('users');
   return getUser(userId).bank;
 }
 
 function setStatus(userId, status, reason, until = 0) {
   db.prepare('UPDATE users SET status = ?, status_reason = ?, status_until = ? WHERE user_id = ?')
     .run(status, reason || '', until, userId);
+  mirrorTable('users');
 }
 
 function clearStatus(userId) {
   db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0 WHERE user_id = ?").run(userId);
+  mirrorTable('users');
 }
 
 /** Top 10 by net worth (wallet + bank). */
@@ -205,7 +461,7 @@ function leaderboard(limit = 10) {
     FROM users
     ORDER BY networth DESC
     LIMIT ?
-  `).all(limit);
+  `).all(limit).map((r) => ({ ...r, user_id: Number(r.user_id), wallet: Number(r.wallet), bank: Number(r.bank), networth: Number(r.networth) }));
 }
 
 /* ---------------- Cooldowns ---------------- */
@@ -220,10 +476,82 @@ function setCooldown(userId, action, until) {
     INSERT INTO cooldowns (user_id, action, until) VALUES (?, ?, ?)
     ON CONFLICT(user_id, action) DO UPDATE SET until = excluded.until
   `).run(userId, action, until);
+  pgRun(
+    `INSERT INTO cooldowns (user_id, action, until) VALUES ($1, $2, $3)
+     ON CONFLICT (user_id, action) DO UPDATE SET until = EXCLUDED.until`,
+    [userId, action, until]
+  );
 }
 
 function clearCooldown(userId, action) {
   db.prepare('DELETE FROM cooldowns WHERE user_id = ? AND action = ?').run(userId, action);
+  pgRun('DELETE FROM cooldowns WHERE user_id = $1 AND action = $2', [userId, action]);
+}
+
+/** Delete ALL cooldowns (used by /restart). */
+function clearAllCooldowns() {
+  db.prepare('DELETE FROM cooldowns').run();
+  pgRun('DELETE FROM cooldowns');
+}
+
+/* ---------------- Raw-ish query helpers (formerly db.db.prepare call sites) ---------------- */
+
+function mapHeistRow(row) {
+  if (!row) return row;
+  return {
+    leader_id: Number(row.leader_id),
+    leader_name: row.leader_name || '',
+    target_id: Number(row.target_id),
+    target_name: row.target_name || '',
+    members: typeof row.members === 'string' ? JSON.parse(row.members || '[]') : row.members,
+    started_at: Number(row.started_at) || 0,
+    status: row.status || 'open',
+  };
+}
+
+/** All open heists (any user's). */
+function getOpenHeists() {
+  return db.prepare("SELECT * FROM heists WHERE status = 'open'").all().map(mapHeistRow);
+}
+
+/** All distinct chat_ids the bot has seen (for broadcasts). */
+function getSeenChatIds() {
+  return db.prepare('SELECT DISTINCT chat_id FROM chat_logs WHERE chat_id IS NOT NULL').all()
+    .map((r) => Number(r.chat_id));
+}
+
+/** Look up a user by exact lowercased username. */
+function findUserByUsername(username) {
+  const row = db.prepare('SELECT user_id FROM users WHERE LOWER(username) = ? LIMIT 1').get(String(username || '').toLowerCase());
+  return row ? { user_id: Number(row.user_id) } : null;
+}
+
+/** Count of active cooldown rows. */
+function getCooldownCount() {
+  return db.prepare('SELECT COUNT(*) AS c FROM cooldowns').get().c;
+}
+
+/** Dashboard users list (ordered by net worth, paginated). */
+function listUsersByNetWorth(limit = 50, offset = 0) {
+  return db.prepare('SELECT * FROM users ORDER BY (wallet + bank) DESC LIMIT ? OFFSET ?').all(limit, offset)
+    .map((r) => ({ ...r, user_id: Number(r.user_id), wallet: Number(r.wallet), bank: Number(r.bank) }));
+}
+
+/** Dashboard users search (id/username/first_name, ordered by net worth). */
+function searchUsers(q, limit = 50, offset = 0) {
+  const like = `%${q}%`;
+  return db.prepare(`
+    SELECT * FROM users
+    WHERE CAST(user_id AS TEXT) LIKE ? OR LOWER(username) LIKE ? OR LOWER(first_name) LIKE ?
+    ORDER BY (wallet + bank) DESC LIMIT ? OFFSET ?
+  `).all(like, like, like, limit, offset)
+    .map((r) => ({ ...r, user_id: Number(r.user_id), wallet: Number(r.wallet), bank: Number(r.bank) }));
+}
+
+/** A user's cooldown rows. */
+function getUserCooldowns(userId) {
+  return db.prepare('SELECT action, until FROM cooldowns WHERE user_id = ?').all(userId)
+    .map((r) => ({ ...r, until: Number(r.until) }));
 }
 
 /* ---------------- Lottery ---------------- */
@@ -235,13 +563,20 @@ function getLottery() {
       .run(config.lottery.baseJackpot, '[]');
     row = db.prepare('SELECT * FROM lottery WHERE id = 1').get();
   }
-  row.tickets = JSON.parse(row.tickets);
+  row.tickets = JSON.parse(row.tickets || '[]');
+  row.pot = Number(row.pot) || 0;
+  row.ticket_count = Number(row.ticket_count) || 0;
   return row;
 }
 
 function saveLottery(pot, ticketCount, tickets) {
   db.prepare('UPDATE lottery SET pot = ?, ticket_count = ?, tickets = ? WHERE id = 1')
     .run(pot, ticketCount, JSON.stringify(tickets));
+  pgRun(
+    `INSERT INTO lottery (id, pot, ticket_count, tickets) VALUES (1, $1, $2, $3)
+     ON CONFLICT (id) DO UPDATE SET pot = EXCLUDED.pot, ticket_count = EXCLUDED.ticket_count, tickets = EXCLUDED.tickets`,
+    [pot, ticketCount, JSON.stringify(tickets)]
+  );
 }
 
 /* ---------------- Heists ---------------- */
@@ -249,25 +584,35 @@ function saveLottery(pot, ticketCount, tickets) {
 function getHeist(leaderId) {
   const row = db.prepare('SELECT * FROM heists WHERE leader_id = ?').get(leaderId);
   if (!row) return null;
-  row.members = JSON.parse(row.members);
+  row.members = JSON.parse(row.members || '[]');
   return row;
 }
 
 function createHeist(heist) {
   db.prepare('INSERT INTO heists (leader_id, leader_name, target_id, target_name, members, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(heist.leader_id, heist.leader_name, heist.target_id, heist.target_name, JSON.stringify(heist.members), heist.started_at, heist.status);
+  pgRun(
+    `INSERT INTO heists (leader_id, leader_name, target_id, target_name, members, started_at, status)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (leader_id) DO UPDATE SET leader_name = EXCLUDED.leader_name, target_id = EXCLUDED.target_id,
+       target_name = EXCLUDED.target_name, members = EXCLUDED.members, started_at = EXCLUDED.started_at, status = EXCLUDED.status`,
+    [heist.leader_id, heist.leader_name, heist.target_id, heist.target_name, JSON.stringify(heist.members), heist.started_at, heist.status]
+  );
 }
 
 function updateHeistMembers(leaderId, members) {
   db.prepare('UPDATE heists SET members = ? WHERE leader_id = ?').run(JSON.stringify(members), leaderId);
+  pgRun('UPDATE heists SET members = $1 WHERE leader_id = $2', [JSON.stringify(members), leaderId]);
 }
 
 function updateHeistStatus(leaderId, status) {
   db.prepare('UPDATE heists SET status = ? WHERE leader_id = ?').run(status, leaderId);
+  pgRun('UPDATE heists SET status = $1 WHERE leader_id = $2', [status, leaderId]);
 }
 
 function deleteHeist(leaderId) {
   db.prepare('DELETE FROM heists WHERE leader_id = ?').run(leaderId);
+  pgRun('DELETE FROM heists WHERE leader_id = $1', [leaderId]);
 }
 
 /* ---------------- Dashboard: chat logs ---------------- */
@@ -288,13 +633,25 @@ function logChat(msg) {
       text.startsWith('/') ? 1 : 0,
       Date.now()
     );
+  // Mirror only the newest row (the id is bigserial — newest row is max id).
+  queuePg(() => {
+    if (!pool || !pgReady) return Promise.resolve();
+    const row = db.prepare('SELECT * FROM chat_logs ORDER BY id DESC LIMIT 1').get();
+    if (!row) return Promise.resolve();
+    return pool.query(
+      `INSERT INTO chat_logs (id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (id) DO NOTHING`,
+      [row.id, row.user_id, row.username, row.first_name, row.chat_id, row.chat_title, row.text, row.is_command, row.created_at]
+    );
+  });
 }
 
 function getChatLogs(limit = 100, userId = null) {
-  if (userId) {
-    return db.prepare('SELECT * FROM chat_logs WHERE user_id = ? ORDER BY id DESC LIMIT ?').all(userId, limit);
-  }
-  return db.prepare('SELECT * FROM chat_logs ORDER BY id DESC LIMIT ?').all(limit);
+  const rows = userId
+    ? db.prepare('SELECT * FROM chat_logs WHERE user_id = ? ORDER BY id DESC LIMIT ?').all(userId, limit)
+    : db.prepare('SELECT * FROM chat_logs ORDER BY id DESC LIMIT ?').all(limit);
+  return rows.map((r) => ({ ...r, id: Number(r.id), user_id: Number(r.user_id), chat_id: Number(r.chat_id) }));
 }
 
 /* ---------------- Dashboard: game history ---------------- */
@@ -312,19 +669,42 @@ function logGameHistory(entry) {
       JSON.stringify(entry.meta || {}),
       Date.now()
     );
+  queuePg(() => {
+    if (!pool || !pgReady) return Promise.resolve();
+    const row = db.prepare('SELECT * FROM game_history ORDER BY id DESC LIMIT 1').get();
+    if (!row) return Promise.resolve();
+    return pool.query(
+      `INSERT INTO game_history (id, user_id, username, game, bet, result, amount, meta, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (id) DO NOTHING`,
+      [row.id, row.user_id, row.username, row.game, row.bet, row.result, row.amount, row.meta, row.created_at]
+    );
+  });
 }
 
 function getGameHistory(limit = 100, userId = null) {
-  if (userId) {
-    return db.prepare('SELECT * FROM game_history WHERE user_id = ? ORDER BY id DESC LIMIT ?').all(userId, limit);
-  }
-  return db.prepare('SELECT * FROM game_history ORDER BY id DESC LIMIT ?').all(limit);
+  const rows = userId
+    ? db.prepare('SELECT * FROM game_history WHERE user_id = ? ORDER BY id DESC LIMIT ?').all(userId, limit)
+    : db.prepare('SELECT * FROM game_history ORDER BY id DESC LIMIT ?').all(limit);
+  return rows.map((r) => ({ ...r, id: Number(r.id), user_id: Number(r.user_id) }));
 }
 
 /* ---------------- Dashboard: moderators ---------------- */
 
+function mapAdminUser(row) {
+  if (!row) return row;
+  return {
+    user_id: Number(row.user_id),
+    username: row.username || '',
+    role: row.role || 'mod',
+    password: row.password || '',
+    created_at: Number(row.created_at) || 0,
+    last_login: Number(row.last_login) || 0,
+  };
+}
+
 function getAdminUser(userId) {
-  return db.prepare('SELECT * FROM admin_users WHERE user_id = ?').get(userId);
+  return mapAdminUser(db.prepare('SELECT * FROM admin_users WHERE user_id = ?').get(userId));
 }
 
 function addAdminUser(userId, username, role, password) {
@@ -332,27 +712,53 @@ function addAdminUser(userId, username, role, password) {
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, role = excluded.role, password = excluded.password`)
     .run(userId, username || '', role || 'mod', password || '', Date.now());
+  pgRun(
+    `INSERT INTO admin_users (user_id, username, role, password, created_at)
+     VALUES ($1, $2, $3, $4, $5)
+     ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, role = EXCLUDED.role, password = EXCLUDED.password, created_at = EXCLUDED.created_at`,
+    [userId, username || '', role || 'mod', password || '', Date.now()]
+  );
 }
 
 function removeAdminUser(userId) {
   db.prepare('DELETE FROM admin_users WHERE user_id = ?').run(userId);
+  pgRun('DELETE FROM admin_users WHERE user_id = $1', [userId]);
 }
 
 function listAdminUsers() {
-  return db.prepare('SELECT user_id, username, role, created_at, last_login FROM admin_users ORDER BY role DESC, user_id').all();
+  return db.prepare('SELECT user_id, username, role, created_at, last_login FROM admin_users ORDER BY role DESC, user_id')
+    .all().map(mapAdminUser);
 }
 
 function setAdminLastLogin(userId) {
   db.prepare('UPDATE admin_users SET last_login = ? WHERE user_id = ?').run(Date.now(), userId);
+  pgRun('UPDATE admin_users SET last_login = $1 WHERE user_id = $2', [Date.now(), userId]);
 }
 
 /* ---------------- Dashboard: events / missions ---------------- */
 
+function mapEvent(row) {
+  if (!row) return row;
+  return {
+    id: Number(row.id),
+    title: row.title,
+    description: row.description || '',
+    type: row.type || 'mission',
+    reward: Number(row.reward) || 0,
+    starts_at: Number(row.starts_at) || 0,
+    ends_at: Number(row.ends_at) || 0,
+    active: Number(row.active) || 0,
+    created_by: Number(row.created_by) || 0,
+    created_at: Number(row.created_at) || 0,
+    completions: Number(row.completions) || 0,
+  };
+}
+
 function listEvents(activeOnly = false) {
-  const sql = activeOnly
-    ? 'SELECT * FROM bot_events WHERE active = 1 ORDER BY id DESC'
-    : 'SELECT * FROM bot_events ORDER BY id DESC';
-  return db.prepare(sql).all();
+  const rows = activeOnly
+    ? db.prepare('SELECT * FROM bot_events WHERE active = 1 ORDER BY id DESC').all()
+    : db.prepare('SELECT * FROM bot_events ORDER BY id DESC').all();
+  return rows.map(mapEvent);
 }
 
 function createEvent(ev) {
@@ -361,7 +767,9 @@ function createEvent(ev) {
     .run(ev.title, ev.description || '', ev.type || 'mission', ev.reward || 0,
       ev.starts_at || 0, ev.ends_at || 0, ev.active === false ? 0 : 1,
       ev.created_by || 0, Date.now());
-  return db.prepare('SELECT * FROM bot_events ORDER BY id DESC LIMIT 1').get();
+  const created = db.prepare('SELECT * FROM bot_events ORDER BY id DESC LIMIT 1').get();
+  mirrorTable('bot_events');
+  return mapEvent(created);
 }
 
 function updateEvent(id, fields) {
@@ -378,38 +786,64 @@ function updateEvent(id, fields) {
       fields.ends_at !== undefined ? fields.ends_at : ev.ends_at,
       id
     );
-  return db.prepare('SELECT * FROM bot_events WHERE id = ?').get(id);
+  mirrorTable('bot_events');
+  return mapEvent(db.prepare('SELECT * FROM bot_events WHERE id = ?').get(id));
 }
 
 function deleteEvent(id) {
   db.prepare('DELETE FROM bot_events WHERE id = ?').run(id);
+  pgRun('DELETE FROM bot_events WHERE id = $1', [id]);
 }
 
 function incrementEventCompletions(id) {
   db.prepare('UPDATE bot_events SET completions = completions + 1 WHERE id = ?').run(id);
+  pgRun('UPDATE bot_events SET completions = completions + 1 WHERE id = $1', [id]);
 }
 
 /** Get the currently active event/mission for the bot to announce. */
 function activeEvents() {
   const now = Date.now();
-  return db.prepare(`SELECT * FROM bot_events WHERE active = 1 AND (starts_at = 0 OR starts_at <= ?) AND (ends_at = 0 OR ends_at > ?) ORDER BY id DESC`).all(now, now);
+  return db.prepare(`SELECT * FROM bot_events WHERE active = 1 AND (starts_at = 0 OR starts_at <= ?) AND (ends_at = 0 OR ends_at > ?) ORDER BY id DESC`)
+    .all(now, now).map(mapEvent);
 }
 
 /* ---------------- Dashboard: broadcasts ---------------- */
+
+function mapBroadcast(row) {
+  if (!row) return row;
+  return {
+    id: Number(row.id),
+    message: row.message,
+    target: row.target || 'all',
+    sent_count: Number(row.sent_count) || 0,
+    created_by: Number(row.created_by) || 0,
+    created_at: Number(row.created_at) || 0,
+  };
+}
 
 function createBroadcast(message, target, createdBy) {
   db.prepare(`INSERT INTO broadcasts (message, target, sent_count, created_by, created_at)
              VALUES (?, ?, ?, ?, ?)`)
     .run(message, target || 'all', 0, createdBy || 0, Date.now());
-  return db.prepare('SELECT * FROM broadcasts ORDER BY id DESC LIMIT 1').get();
+  const created = db.prepare('SELECT * FROM broadcasts ORDER BY id DESC LIMIT 1').get();
+  queuePg(() => {
+    if (!pool || !pgReady) return Promise.resolve();
+    return pool.query(
+      `INSERT INTO broadcasts (id, message, target, sent_count, created_by, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+      [created.id, created.message, created.target, created.sent_count, created.created_by, created.created_at]
+    );
+  });
+  return mapBroadcast(created);
 }
 
 function updateBroadcastCount(id, count) {
   db.prepare('UPDATE broadcasts SET sent_count = ? WHERE id = ?').run(count, id);
+  pgRun('UPDATE broadcasts SET sent_count = $1 WHERE id = $2', [count, id]);
 }
 
 function listBroadcasts(limit = 50) {
-  return db.prepare('SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?').all(limit);
+  return db.prepare('SELECT * FROM broadcasts ORDER BY id DESC LIMIT ?').all(limit).map(mapBroadcast);
 }
 
 /* ---------------- Dashboard: activity feed ---------------- */
@@ -419,10 +853,21 @@ function logActivity(type, text, meta = {}) {
     .run(type || 'event', text, JSON.stringify(meta), Date.now());
   // keep the feed lean (last 500 entries)
   db.prepare('DELETE FROM activity_feed WHERE id NOT IN (SELECT id FROM activity_feed ORDER BY id DESC LIMIT 500)').run();
+  queuePg(() => {
+    if (!pool || !pgReady) return Promise.resolve();
+    const row = db.prepare('SELECT * FROM activity_feed ORDER BY id DESC LIMIT 1').get();
+    if (!row) return Promise.resolve();
+    return pool.query(
+      `INSERT INTO activity_feed (id, type, text, meta, created_at)
+       VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
+      [row.id, row.type, row.text, row.meta, row.created_at]
+    );
+  });
 }
 
 function getActivity(limit = 100) {
-  return db.prepare('SELECT * FROM activity_feed ORDER BY id DESC LIMIT ?').all(limit);
+  return db.prepare('SELECT * FROM activity_feed ORDER BY id DESC LIMIT ?').all(limit)
+    .map((r) => ({ ...r, id: Number(r.id) }));
 }
 
 /* ---------------- Dashboard: audit log ---------------- */
@@ -431,10 +876,21 @@ function logAudit(actorId, actorName, action, targetId, detail) {
   db.prepare(`INSERT INTO audit_log (actor_id, actor_name, action, target_id, detail, created_at)
              VALUES (?, ?, ?, ?, ?, ?)`)
     .run(actorId, actorName || '', action, targetId || 0, detail || '', Date.now());
+  queuePg(() => {
+    if (!pool || !pgReady) return Promise.resolve();
+    const row = db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 1').get();
+    if (!row) return Promise.resolve();
+    return pool.query(
+      `INSERT INTO audit_log (id, actor_id, actor_name, action, target_id, detail, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
+      [row.id, row.actor_id, row.actor_name, row.action, row.target_id, row.detail, row.created_at]
+    );
+  });
 }
 
 function getAuditLog(limit = 100) {
-  return db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?').all(limit);
+  return db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?').all(limit)
+    .map((r) => ({ ...r, id: Number(r.id) }));
 }
 
 /* ---------------- Dashboard: stats ---------------- */
@@ -446,7 +902,7 @@ function dashboardStats() {
   const muted = db.prepare("SELECT COUNT(*) AS c FROM users WHERE status IN ('muted','suspected')").get().c;
   const groups = db.prepare('SELECT COUNT(DISTINCT chat_id) AS c FROM chat_logs WHERE chat_id < 0').get().c;
   const coins = db.prepare('SELECT COALESCE(SUM(wallet),0) AS w, COALESCE(SUM(bank),0) AS b FROM users').get();
-  const totalCoins = coins.w + coins.b;
+  const totalCoins = (Number(coins.w) || 0) + (Number(coins.b) || 0);
   const games = db.prepare('SELECT COUNT(*) AS c FROM game_history').get().c;
   const msgs = db.prepare('SELECT COUNT(*) AS c FROM chat_logs').get().c;
   const lottery = db.prepare('SELECT * FROM lottery WHERE id = 1').get();
@@ -458,8 +914,8 @@ function dashboardStats() {
     mutedUsers: muted,
     totalGroups: groups,
     coinsInCirculation: totalCoins,
-    coinsWallet: coins.w,
-    coinsBank: coins.b,
+    coinsWallet: Number(coins.w) || 0,
+    coinsBank: Number(coins.b) || 0,
     totalGames: games,
     totalMessages: msgs,
     lotteryPot: lot,
@@ -479,10 +935,100 @@ function expirePenalties() {
   for (const u of expired) {
     db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0 WHERE user_id = ?").run(u.user_id);
   }
-  return expired;
+  if (expired.length) mirrorTable('users');
+  return expired.map((u) => ({ ...u, user_id: Number(u.user_id) }));
+}
+
+/* ================= Postgres → SQLite rehydration ================= */
+
+/**
+ * Copy Postgres rows back into SQLite (used on boot so the cache starts from
+ * the durable store). Idempotent; skips rows already present.
+ */
+async function hydrateFromPg() {
+  if (!pool) return 0;
+  let restored = 0;
+  try {
+    const client = await pool.connect();
+    try {
+      for (const [table, colsStr] of Object.entries(TABLE_COLS)) {
+        const cols = colsStr.split(', ');
+        const pk = cols[0];
+        const { rows } = await client.query(`SELECT ${colsStr} FROM ${table}`);
+        if (!rows.length) continue;
+        const insert = db.prepare(
+          `INSERT OR IGNORE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+        );
+        for (const r of rows) {
+          const vals = cols.map((c) => r[c]);
+          if (table === 'users') {
+            // keep newest row on conflict for users (INSERT OR IGNORE keeps existing — fine)
+          }
+          insert.run(...vals);
+          restored++;
+        }
+      }
+    } finally {
+      client.release();
+    }
+  } catch (e) {
+    console.error('[db] hydrate failed (continuing with current cache):', e.message);
+  }
+  return restored;
+}
+
+/** Health info for /debug: persistence status + last mirror time. */
+function syncInfo() {
+  return {
+    postgres: pgEnabled && pool !== null,
+    ready: pgReady,
+    lastMirrorAt: lastMirrorAt || 0,
+    dbSyncIntervalMs: config.dbSyncIntervalMs,
+  };
+}
+
+/* ================= Boot / periodic mirror ================= */
+
+let lastMirrorAt = 0;
+let syncTimer = null;
+
+/**
+ * Init the Postgres mirror: create tables, hydrate SQLite from Postgres, then
+ * start the periodic full-sync loop. Call once from src/index.js before the
+ * bot starts. Resolves { enabled, hydrated }.
+ */
+async function initPersistence() {
+  if (!pgEnabled || !pool) {
+    return { enabled: false, hydrated: 0 };
+  }
+  if (pgInitPromise) return pgInitPromise;
+  pgInitPromise = (async () => {
+    try {
+      await initPg();
+      pgReady = true;
+      console.log('[db] Postgres ready — hydrating SQLite cache from Postgres…');
+      const hydrated = await hydrateFromPg();
+      console.log(`[db] Hydrated ${hydrated} rows from Postgres into SQLite.`);
+      // Push any local-only rows (new users created before pg connected) up.
+      mirrorAll();
+      // Periodic full mirror so big tables (chat_logs, game_history) converge.
+      syncTimer = setInterval(() => {
+        lastMirrorAt = Date.now();
+        mirrorAll();
+      }, Math.max(config.dbSyncIntervalMs, 500));
+      syncTimer.unref && syncTimer.unref();
+      return { enabled: true, hydrated };
+    } catch (e) {
+      console.error('[db] initPersistence failed:', e.message);
+      pgReady = false;
+      return { enabled: false, hydrated: 0 };
+    }
+  })();
+  return pgInitPromise;
 }
 
 function close() {
+  if (syncTimer) clearInterval(syncTimer);
   db.close();
 }
 
@@ -501,6 +1047,14 @@ module.exports = {
   getCooldown,
   setCooldown,
   clearCooldown,
+  clearAllCooldowns,
+  getOpenHeists,
+  getSeenChatIds,
+  findUserByUsername,
+  getCooldownCount,
+  listUsersByNetWorth,
+  searchUsers,
+  getUserCooldowns,
   getLottery,
   saveLottery,
   getHeist,
@@ -533,5 +1087,8 @@ module.exports = {
   logAudit,
   getAuditLog,
   dashboardStats,
+  // Persistence
+  initPersistence,
+  syncInfo,
   close,
 };

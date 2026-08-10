@@ -18,6 +18,7 @@
 const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('./config');
+const db = require('./db');
 const { createBot } = require('./bot');
 const { createDashboard, ensureOwnerPassword } = require('./dashboard/server');
 
@@ -52,6 +53,13 @@ if (!isPrimaryInstance()) {
 async function main() {
   console.log(`🐉 Rimuru Tempest Casino — starting (env=${config.env})${INSTANCE_ID ? ` instance=${INSTANCE_ID}` : ''}`);
 
+  // ── Durability: hydrate SQLite from Postgres (if DATABASE_URL set), then
+  // start the periodic mirror so every write survives redeploys.
+  const persisted = await db.initPersistence();
+  if (persisted.enabled) {
+    console.log(`✅ Postgres persistence ON — data survives redeploys (hydrated ${persisted.hydrated} rows).`);
+  }
+
   // ── Dashboard password (owner login) ─────────────────────────────────
   ensureOwnerPassword();
 
@@ -63,7 +71,7 @@ async function main() {
     // Health route always answers first; everything else goes to Express.
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, service: 'rimuru-casino', time: Date.now() }));
+      res.end(JSON.stringify({ ok: true, service: 'rimuru-casino', persistence: db.syncInfo(), time: Date.now() }));
       return;
     }
     // Dashboard mounted? Route to Express. Otherwise 404.

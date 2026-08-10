@@ -788,11 +788,11 @@ function createBot() {
     join: async (ctx) => {
       const r = heist.join(ctx.userId, metaOf(ctx.msg));
       if (r.ok && r.message) {
-        const open = db.db.prepare("SELECT * FROM heists WHERE status = 'open'").all();
-        const fullCrew = open.some((o) => JSON.parse(o.members).length >= config.heist.maxMembers);
+        const open = db.getOpenHeists();
+        const fullCrew = open.some((o) => o.members.length >= config.heist.maxMembers);
         await ctx.reply(r.message, { title: '🤝 JOIN HEIST', color: THEME.red });
         if (fullCrew) {
-          const full = open.find((o) => JSON.parse(o.members).length >= config.heist.maxMembers);
+          const full = open.find((o) => o.members.length >= config.heist.maxMembers);
           if (full) {
             const res = heist.execute(full.leader_id);
             const timer = heistTimers.get(full.leader_id);
@@ -884,7 +884,7 @@ function createBot() {
       race.sessions.clear();
 
       // 2) Open heists (DB) + their timers
-      const openHeists = db.db.prepare("SELECT leader_id FROM heists WHERE status = 'open'").all();
+      const openHeists = db.getOpenHeists();
       for (const row of openHeists) {
         const timer = heistTimers.get(row.leader_id);
         if (timer) clearTimeout(timer);
@@ -895,9 +895,8 @@ function createBot() {
 
       // 3) All cooldowns
       const cdRows = db.db.prepare('SELECT user_id, action FROM cooldowns').all();
-      const delCd = db.db.prepare('DELETE FROM cooldowns');
       for (const row of cdRows) cleared.push(`cd:${row.user_id}:${row.action}`);
-      delCd.run();
+      db.clearAllCooldowns();
 
       // 4) Reset lottery state
       db.saveLottery(config.lottery.baseJackpot, 0, []);
@@ -936,7 +935,7 @@ function createBot() {
       try {
         const pkg = require('../package.json');
         const stats = db.dashboardStats();
-        const cdCount = db.db.prepare('SELECT COUNT(*) AS c FROM cooldowns').get().c;
+        const cdCount = db.getCooldownCount();
         const mem = process.memoryUsage();
         const gid = await resolveRequiredGroup();
         const lines = [
@@ -1000,7 +999,7 @@ function createBot() {
       targetId = replied.id;
     } else if (mention) {
       const uname = String(mention).slice(1).toLowerCase();
-      const row = db.db.prepare('SELECT user_id FROM users WHERE LOWER(username) = ? LIMIT 1').get(uname);
+      const row = db.findUserByUsername(uname);
       if (!row) {
         return {
           title: '❓ UNKNOWN USER',
@@ -1365,7 +1364,7 @@ function createBot() {
         // Gather unique chat ids the bot has seen this session.
         const chats = new Set();
         try {
-          const seen = db.db.prepare('SELECT DISTINCT chat_id FROM chat_logs WHERE chat_id IS NOT NULL').all();
+          const seen = db.getSeenChatIds();
           for (const row of seen) chats.add(row.chat_id);
         } catch (e) { /* non-fatal */ }
         let list = [];

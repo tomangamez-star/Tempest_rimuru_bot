@@ -16,6 +16,14 @@ services:
         value: "8781690556"
       - key: GROQ_API_KEY
         sync: false # set this manually in Render dashboard
+      # ── EXTERNAL POSTGRES (Supabase) — DURABLE PERSISTENCE ──────────
+      # Balances/leaderboard/mods survive redeploys ONLY with an external DB.
+      # Set this in Render → Environment to your Supabase Postgres URL:
+      #   postgresql://postgres:YOUR_PASSWORD@db.XXXX.supabase.co:5432/postgres
+      # (use the "Session pooler" string; URL-encode special chars in the
+      # password, e.g. %20 for spaces). Leave unset → SQLite-only (ephemeral).
+      - key: DATABASE_URL
+        sync: false # set this manually in Render dashboard
       - key: NODE_ENV
         value: production
       - key: PORT

@@ -89,12 +89,12 @@ function start(leaderId, targetId, meta = {}) {
  * most recently started open one.
  */
 function join(userId, meta = {}) {
-  const open = db.db.prepare("SELECT * FROM heists WHERE status = 'open' ORDER BY started_at DESC").all();
+  const open = db.getOpenHeists().reverse(); // newest first (same as ORDER BY started_at DESC)
   if (!open.length) {
     return { ok: false, message: '🕳️ No open heists right now. Start one with `/heist` (reply to a target).' };
   }
   const heist = open[0];
-  const members = JSON.parse(heist.members); // raw row → members is a JSON string
+  const members = heist.members; // already parsed by db.getOpenHeists()
   if (members.some((m) => m.user_id === userId)) {
     return { ok: false, message: '🤨 You\'re already in this crew.' };
   }
