@@ -17,9 +17,9 @@
 const db = require('./db');
 const { fmt, esc } = require('./utils');
 
-// 1️⃣ … 9️⃣ keycaps, then 1️⃣ 0️⃣ for the 10th rank (matches reference style)
+// Top 3 = medals 🥇🥈🥉, 4th-10th = keycap numbers (4️⃣ … 9️⃣, 1️⃣ 0️⃣ for 10th)
 const RANKS = [
-  '1\ufe0f\u20e3', '2\ufe0f\u20e3', '3\ufe0f\u20e3', '4\ufe0f\u20e3', '5\ufe0f\u20e3',
+  '🥇', '🥈', '🥉', '4\ufe0f\u20e3', '5\ufe0f\u20e3',
   '6\ufe0f\u20e3', '7\ufe0f\u20e3', '8\ufe0f\u20e3', '9\ufe0f\u20e3', '1\ufe0f\u20e3 0\ufe0f\u20e3',
 ];
 

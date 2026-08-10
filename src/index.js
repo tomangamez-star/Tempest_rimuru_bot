@@ -58,6 +58,18 @@ async function main() {
   const persisted = await db.initPersistence();
   if (persisted.enabled) {
     console.log(`✅ Postgres persistence ON — data survives redeploys (hydrated ${persisted.hydrated} rows).`);
+  } else {
+    const info = db.syncInfo();
+    if (info.configured && !info.ready) {
+      // DATABASE_URL is set but Postgres is not connected yet — say it LOUDLY.
+      console.error(
+        '❌❌❌ POSTGRES PERSISTENCE IS DOWN ❌❌❌\n' +
+        'DATABASE_URL is set but the bot could NOT connect to Postgres.\n' +
+        'Balances will NOT survive redeploys until this is fixed.\n' +
+        `  host=${info.host} port=${info.port} failures=${info.failures} lastError=${info.lastPgError}\n` +
+        'Retrying in the background every 15s — check the Render env var value.'
+      );
+    }
   }
 
   // ── Dashboard password (owner login) ─────────────────────────────────

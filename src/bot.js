@@ -938,6 +938,10 @@ function createBot() {
         const cdCount = db.getCooldownCount();
         const mem = process.memoryUsage();
         const gid = await resolveRequiredGroup();
+        const pInfo = db.syncInfo();
+        const pgStatus = pInfo.configured
+          ? (pInfo.ready && pInfo.connected ? `✅ connected (${pInfo.host}:${pInfo.port})` : `❌ ${pInfo.host}:${pInfo.port} — ${pInfo.lastPgError || 'connecting…'}`)
+          : 'off (SQLite-only, ephemeral)';
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
@@ -946,6 +950,7 @@ function createBot() {
           `💰 <b>Coins in circulation</b>: ${fmt(stats.coinsInCirculation)}`,
           `⏳ <b>Active cooldowns</b>: ${fmt(cdCount)}`,
           `🔒 <b>Required group</b>: ${config.requiredGroup || 'off'} (chat ${gid || 'unresolved'})`,
+          `🗄 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'})` : ''}`,
           `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
           `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
         ];

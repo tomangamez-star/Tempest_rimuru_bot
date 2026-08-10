@@ -154,13 +154,35 @@ const DATABASE_URL = (config.databaseUrl || '').trim();
 const pgEnabled = DATABASE_URL.length > 0;
 let pool = null;
 
+// Derived connection info for health/logging (password always redacted).
+let pgHost = '';
+let pgPort = 0;
+try {
+  if (pgEnabled) {
+    const u = new URL(DATABASE_URL.replace(/^postgres:\/\//i, 'postgresql://'));
+    pgHost = u.hostname || '';
+    pgPort = Number(u.port) || 5432;
+  }
+} catch (e) {
+  console.error('[db] Could not parse DATABASE_URL:', e.message);
+}
+
 if (pgEnabled) {
   try {
     pool = new Pool({
       connectionString: DATABASE_URL,
       max: 5,
-      connectionTimeoutMillis: 8000,
+      connectionTimeoutMillis: 15000,
       idleTimeoutMillis: 30000,
+      // Supabase requires SSL for its Postgres (direct :5432 AND pooler :6543).
+      // Use sslmode=require (present in pooler URLs) when available, otherwise
+      // default to TLS with cert validation relaxed for supabase.co hosts.
+      ssl:
+        /\bsslmode=require\b/i.test(DATABASE_URL)
+          ? { rejectUnauthorized: false }
+          : /supabase\.co/i.test(DATABASE_URL)
+            ? { rejectUnauthorized: false }
+            : undefined,
     });
   } catch (e) {
     console.error('[db] Invalid DATABASE_URL — falling back to SQLite-only:', e.message);
@@ -174,7 +196,7 @@ if (!pgEnabled) {
     'Balances will RESET on redeploy. Set DATABASE_URL (Supabase/Postgres) for durable persistence.'
   );
 } else {
-  console.log('[db] Postgres mirror ENABLED (DATABASE_URL set).');
+  console.log(`[db] Postgres mirror CONFIGURED (${pgHost}:${pgPort}) — waiting for connection…`);
 }
 
 const PG_SCHEMA = `
@@ -291,14 +313,34 @@ async function initPg() {
   }
 }
 
-/** Simple async queue so a single slow pg query never blocks the process. */
+/**
+ * Simple async queue so a single slow pg query never blocks the process.
+ * Failures are counted so we can detect "configured but unreachable" and
+ * surface it loudly in logs + /health + /debug.
+ */
 let pgReady = false;
 let pgQueue = Promise.resolve();
 let pgInitPromise = null;
+let pgFailures = 0;
+let pgLastError = '';
+let pgLastErrorAt = 0;
+let pgConnectivity = 'unknown'; // unknown | connecting | connected | degraded
+const PG_CRITICAL_FAILURES = 3;
 
 function queuePg(task) {
   pgQueue = pgQueue.then(task).catch((err) => {
-    console.error('[db] pg mirror error:', err.message);
+    pgFailures++;
+    pgLastError = String((err && err.message) || err);
+    pgLastErrorAt = Date.now();
+    pgConnectivity = 'degraded';
+    if (pgFailures === PG_CRITICAL_FAILURES || pgFailures % 10 === 0) {
+      console.error(
+        `[db] ⚠ Postgres mirror failures: ${pgFailures} (last: ${pgLastError}). ` +
+        'Data is NOT persisting to Postgres right now — check DATABASE_URL and connectivity.'
+      );
+    } else {
+      console.error('[db] pg mirror error:', err.message);
+    }
   });
 }
 
@@ -337,6 +379,20 @@ function sqliteRows(table) {
 }
 
 /** Replace Postgres table contents with the SQLite cache (upsert-all). */
+const TABLE_PKS = {
+  users: ['user_id'],
+  cooldowns: ['user_id', 'action'], // composite primary key
+  lottery: ['id'],
+  heists: ['leader_id'],
+  admin_users: ['user_id'],
+  bot_events: ['id'],
+  broadcasts: ['id'],
+  activity_feed: ['id'],
+  audit_log: ['id'],
+  chat_logs: ['id'],
+  game_history: ['id'],
+};
+
 function mirrorTable(table) {
   if (!pool || !pgReady) return;
   const rows = sqliteRows(table);
@@ -348,11 +404,12 @@ function mirrorTable(table) {
       await client.query('BEGIN');
       for (const row of rows) {
         const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
-        const conflict = cols[0]; // primary key column
-        const updateCols = cols.slice(1).map((c) => `${c} = EXCLUDED.${c}`).join(', ');
+        const pkCols = TABLE_PKS[table] || [cols[0]];
+        const updateCols = cols.filter((c) => !pkCols.includes(c)).map((c) => `${c} = EXCLUDED.${c}`).join(', ');
+        if (!updateCols) continue; // nothing to update (all-PK row) — skip
         await client.query(
           `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
-           ON CONFLICT (${conflict}) DO UPDATE SET ${updateCols}`,
+           ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols}`,
           cols.map((c) => row[c])
         );
       }
@@ -977,11 +1034,19 @@ async function hydrateFromPg() {
   return restored;
 }
 
-/** Health info for /debug: persistence status + last mirror time. */
+/** Health info for /debug + /health: persistence status, connectivity, last error. */
 function syncInfo() {
   return {
     postgres: pgEnabled && pool !== null,
+    configured: pgEnabled,
     ready: pgReady,
+    connected: pgReady && pgConnectivity !== 'degraded',
+    connectivity: pgConnectivity,
+    host: pgHost,
+    port: pgPort,
+    failures: pgFailures,
+    lastPgError: pgLastError || null,
+    lastPgErrorAt: pgLastErrorAt || null,
     lastMirrorAt: lastMirrorAt || 0,
     dbSyncIntervalMs: config.dbSyncIntervalMs,
   };
@@ -991,21 +1056,39 @@ function syncInfo() {
 
 let lastMirrorAt = 0;
 let syncTimer = null;
+let reinitTimer = null;
+const PG_RETRY_MS = 15000; // background reconnect/hydrate retry when PG is configured but unreachable
 
 /**
  * Init the Postgres mirror: create tables, hydrate SQLite from Postgres, then
  * start the periodic full-sync loop. Call once from src/index.js before the
  * bot starts. Resolves { enabled, hydrated }.
+ *
+ * FAIL-LOUD: if DATABASE_URL is set but Postgres cannot be reached, this does
+ * NOT silently leave the bot on ephemeral SQLite — it logs a prominent
+ * warning and keeps retrying in the background until the connection works,
+ * then hydrates and resumes mirroring.
  */
 async function initPersistence() {
   if (!pgEnabled || !pool) {
+    if (pgEnabled && !pool) {
+      console.error('[db] ❌ DATABASE_URL is set but the pool could not be created — persistence DISABLED.');
+    }
     return { enabled: false, hydrated: 0 };
   }
   if (pgInitPromise) return pgInitPromise;
   pgInitPromise = (async () => {
     try {
-      await initPg();
+      const ok = await initPg();
+      if (!ok) {
+        // initPg() swallows the error internally — surface it here so the
+        // fail-loud path (below) triggers instead of pretending persistence is on.
+        throw new Error(pgLastError || 'Postgres schema init failed (unknown error)');
+      }
       pgReady = true;
+      pgConnectivity = 'connected';
+      pgFailures = 0;
+      pgLastError = '';
       console.log('[db] Postgres ready — hydrating SQLite cache from Postgres…');
       const hydrated = await hydrateFromPg();
       console.log(`[db] Hydrated ${hydrated} rows from Postgres into SQLite.`);
@@ -1019,16 +1102,62 @@ async function initPersistence() {
       syncTimer.unref && syncTimer.unref();
       return { enabled: true, hydrated };
     } catch (e) {
-      console.error('[db] initPersistence failed:', e.message);
+      console.error(
+        `[db] ❌ Postgres is configured (DATABASE_URL set) but UNREACHABLE: ${e.message}\n` +
+        'Data is NOT being persisted to Postgres — redeploys will RESET balances.\n' +
+        'Check the connection string (direct :5432 vs pooler :6543) and network access.\n' +
+        `Retrying every ${PG_RETRY_MS / 1000}s in the background…`
+      );
       pgReady = false;
+      pgConnectivity = 'degraded';
+      schedulePgRetry();
       return { enabled: false, hydrated: 0 };
     }
   })();
   return pgInitPromise;
 }
 
+/** Background retry: keep trying to init Postgres until it connects. */
+function schedulePgRetry() {
+  if (reinitTimer) return;
+  reinitTimer = setTimeout(async () => {
+    reinitTimer = null;
+    try {
+      const ok = await initPg();
+      if (ok) {
+        pgReady = true;
+        pgConnectivity = 'connected';
+        pgFailures = 0;
+        pgLastError = '';
+        console.log('[db] ✅ Postgres connection restored — hydrating SQLite from Postgres…');
+        const hydrated = await hydrateFromPg();
+        console.log(`[db] Re-hydrated ${hydrated} rows from Postgres.`);
+        pgInitPromise = null;
+        mirrorAll();
+        // Restart the periodic full-sync loop if it is not running.
+        if (!syncTimer) {
+          syncTimer = setInterval(() => {
+            lastMirrorAt = Date.now();
+            mirrorAll();
+          }, Math.max(config.dbSyncIntervalMs, 500));
+          syncTimer.unref && syncTimer.unref();
+        }
+      } else {
+        // initPg() failed — retry later (initPg already logged the reason).
+        pgConnectivity = 'degraded';
+        schedulePgRetry();
+      }
+    } catch (e) {
+      console.error(`[db] ❌ Postgres still unreachable: ${e.message} — retrying…`);
+      schedulePgRetry();
+    }
+  }, PG_RETRY_MS);
+  reinitTimer.unref && reinitTimer.unref();
+}
+
 function close() {
   if (syncTimer) clearInterval(syncTimer);
+  if (reinitTimer) clearTimeout(reinitTimer);
   db.close();
 }
 

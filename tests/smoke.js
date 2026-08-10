@@ -285,7 +285,11 @@ test('leaderboard: renders top 10 in the reference style', () => {
   const lb = leaderboard.render();
   assert.ok(lb.includes(leaderboard.HEADER), 'header box present');
   assert.ok(lb.includes(leaderboard.TAGLINE), 'decorative tagline present');
-  assert.ok(lb.includes('1\ufe0f\u20e3'), 'rank 1 keycap present');
+  assert.ok(lb.includes('🥇'), 'rank 1 medal present');
+  assert.ok(lb.includes('🥈'), 'rank 2 medal present');
+  assert.ok(lb.includes('🥉'), 'rank 3 medal present');
+  assert.ok(lb.includes('4\ufe0f\u20e3'), 'rank 4 keycap present');
+  assert.ok(!lb.includes('1\ufe0f\u20e3') || lb.includes('1\ufe0f\u20e3 0\ufe0f\u20e3'), 'no bare rank-1 keycap (medal instead)');
   assert.ok(lb.includes('\u2517\u2501\u2501 Net Worth:'), 'net worth line present');
   assert.ok(lb.includes(leaderboard.FOOTER), 'footer present');
   assert.ok(lb.includes('\n\n'), 'blank gap between entries');

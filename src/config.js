@@ -31,13 +31,23 @@ const config = {
 
   // ===================== EXTERNAL POSTGRES (SUPABASE) =====================
   // Durable cross-redeploy persistence. Set DATABASE_URL (a Postgres
-  // connection string, e.g. a Supabase pooler URL) on Render. The local
-  // SQLite file stays as the hot synchronous cache; every write is mirrored
-  // to Postgres and on boot the cache is rehydrated from Postgres, so
-  // balances/leaderboard/mods survive every redeploy.
+  // connection string) on Render. The local SQLite file stays as the hot
+  // synchronous cache; every write is mirrored to Postgres and on boot the
+  // cache is rehydrated from Postgres, so balances/leaderboard/mods survive
+  // every redeploy.
   //   - REQUIRED: DATABASE_URL (or SUPABASE_URL) — a postgres://… string.
+  //   - Supabase CONNECTION STRING TYPES:
+  //       • "Session pooler" (recommended) — host db.<ref>.supabase.co,
+  //         PORT 6543, usually has ?sslmode=require. Best for serverless
+  //         and long-lived connections.
+  //       • "Direct connection" — same host, PORT 5432. On Supabase FREE
+  //         tier direct IPv6 connections are often BLOCKED; use the pooler.
+  //     The code enables TLS automatically for supabase.co hosts.
   //   - Optional: DB_SYNC_INTERVAL_MS (default 1500ms) — mirror flush cadence.
   //   - No env var → bot runs SQLite-only (ephemeral) with a clear warning.
+  //   - If DATABASE_URL is set but Postgres is unreachable the bot FAILS
+  //     LOUDLY (logs + /health + /debug) and retries every 15s — it never
+  //     silently pretends persistence is on.
   databaseUrl: process.env.DATABASE_URL || process.env.SUPABASE_URL || '',
   dbSyncIntervalMs: Number(process.env.DB_SYNC_INTERVAL_MS || 1500),
 
