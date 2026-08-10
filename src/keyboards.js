@@ -21,29 +21,33 @@
  */
 const config = require('./config');
 
-/* ---- button labels (must EXACTLY match what users tap) ---- */
+/* ---- button labels (must EXACTLY match what users tap) ----
+ * Colored emoji prefixes fake color-coding (Telegram reply keyboards have
+ * no native colors): 🟡 games/caution, 🔴 risk, 🟢 safe, 🟣 special,
+ * ⚫ neutral, 🔵 navigation. */
 const B = {
-  casino: '🎰 Casino',
-  games: '🎮 Games',
-  balance: '💰 Balance',
-  economy: '💼 Economy',
-  leaderboard: '🏆 Leaderboard',
-  help: '❓ Help',
-  slots: '🎰 Slots',
-  blackjack: '🃏 Blackjack',
-  roulette: '🎡 Roulette',
-  race: '🏁 Race',
-  dice: '🎲 Dice',
-  coinflip: '🪙 Coin Flip',
-  mines: '💣 Mines',
-  higherlower: '📈 Higher/Lower',
-  lottery: '🎟️ Lottery',
-  bank: '🏦 Bank',
-  income: '💵 Income',
-  shop: '🛒 Shop',
-  crime: '🕵️ Crime',
-  fish: '🎣 Fish',
-  back: '🔙 Back',
+  casino: '\ud83d\udfe3 Casino',
+  games: '\ud83d\udfe3 Games',
+  balance: '\ud83d\udfe2 Balance',
+  economy: '\ud83d\udfe2 Economy',
+  leaderboard: '\ud83c\udfc6 Leaderboard',
+  help: '\ud83d\udd35 Help',
+  slots: '\ud83d\udfe1 Slots',
+  blackjack: '\ud83d\udfe1 Blackjack',
+  roulette: '\ud83d\udfe1 Roulette',
+  race: '\ud83d\udfe1 Race',
+  dice: '\ud83d\udfe1 Dice',
+  coinflip: '\ud83d\udfe1 Coin Flip',
+  mines: '\ud83d\udd34 Mines',
+  higherlower: '\ud83d\udfe1 Higher/Lower',
+  lottery: '\ud83d\udfe1 Lottery',
+  bank: '\ud83d\udfe2 Bank',
+  income: '\ud83d\udfe2 Income',
+  shop: '\ud83d\udfe3 Shop',
+  crime: '\ud83d\udd34 Crime',
+  fish: '\ud83d\udfe2 Fish',
+  profile: '\ud83d\udfe3 Profile',
+  back: '\u26ab Back',
 };
 
 /**
@@ -72,6 +76,7 @@ const BUTTON_COMMANDS = {
   [B.shop]: { cmd: 'shop' },
   [B.crime]: { cmd: 'crime' },
   [B.fish]: { cmd: 'fish' },
+  [B.profile]: { cmd: 'profile' },
   [B.back]: { back: true },
 };
 
@@ -97,14 +102,6 @@ const mainKeyboard = () =>
     [B.leaderboard, B.help],
   ]);
 
-/** 🎰 Casino sub-keyboard. */
-const casinoKeyboard = () =>
-  kb([
-    [B.slots, B.blackjack],
-    [B.roulette, B.race],
-    [B.back],
-  ]);
-
 /** 🎮 Games sub-keyboard. */
 const gamesKeyboard = () =>
   kb([
@@ -113,13 +110,21 @@ const gamesKeyboard = () =>
     [B.lottery, B.back],
   ]);
 
+/** 🎰 Casino sub-keyboard. */
+const casinoKeyboard = () =>
+  kb([
+    [B.slots, B.blackjack],
+    [B.roulette, B.race],
+    [B.back],
+  ]);
+
 /** 💼 Economy sub-keyboard. */
 const economyKeyboard = () =>
   kb([
     [B.balance, B.bank],
     [B.income, B.shop],
     [B.crime, B.leaderboard],
-    [B.back],
+    [B.profile, B.back],
   ]);
 
 /** All keyboard builders by page name. */

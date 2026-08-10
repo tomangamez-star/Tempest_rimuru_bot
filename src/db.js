@@ -1155,6 +1155,15 @@ function syncInfo() {
   };
 }
 
+/** DB round-trip latency in ms (local SQLite read — meaningful bot responsiveness). */
+function ping() {
+  const t0 = Date.now();
+  try {
+    db.prepare('SELECT 1').get();
+  } catch (e) { /* still report the elapsed time */ }
+  return Date.now() - t0;
+}
+
 /* ================= Boot / periodic mirror ================= */
 
 let lastMirrorAt = 0;
@@ -1331,5 +1340,6 @@ module.exports = {
   // Persistence
   initPersistence,
   syncInfo,
+  ping,
   close,
 };

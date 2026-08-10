@@ -72,10 +72,16 @@ function drainBroadcastQueue(sendFn) {
   const item = broadcastQueue.shift();
   if (!item || typeof sendFn !== 'function') return null;
   try {
-    sendFn(item, (count) => {
-      db.updateBroadcastCount(item.id, count);
-      db.logActivity('broadcast', `Broadcast delivered to ${count} chats`, { broadcast_id: item.id });
-    });
+    // Async delivery: sendFn fires its own (item, done) — we don't await it,
+    // so the next item in the queue is drained immediately.
+    const cb = (count) => {
+      try {
+        db.updateBroadcastCount(item.id, count);
+        db.logActivity('broadcast', `Broadcast delivered to ${count} chats`, { broadcast_id: item.id });
+      } catch (e) { /* non-fatal */ }
+    };
+    const ret = sendFn(item, cb);
+    if (ret && typeof ret.catch === 'function') ret.catch((e) => console.error('[dashboard] broadcast send failed:', e.message));
   } catch (e) {
     console.error('[dashboard] broadcast drain error:', e.message);
   }
@@ -403,16 +409,37 @@ function createDashboard(server, bot) {
   app.post('/api/events', requireAuth, (req, res) => {
     const { title, description, type, reward, ends_at } = req.body || {};
     if (!title) return res.status(400).json({ ok: false, error: 'title required' });
+    // Whitelist event types so a bad/unknown type can never 400 or poison the
+    // missions view. 'giveaway' = free entry (no cost) with a big reward.
+    const EVENT_TYPES = ['mission', 'event', 'giveaway', 'trivia', 'challenge'];
+    const t = EVENT_TYPES.includes(String(type || 'mission')) ? String(type) : 'mission';
+    const rewardN = Math.max(0, Math.floor(Number(reward) || 0));
     const ev = db.createEvent({
       title,
       description: description || '',
-      type: type || 'mission',
-      reward: Math.floor(Number(reward) || 0),
+      type: t,
+      reward: rewardN,
       ends_at: Number(ends_at) || 0,
       created_by: req.admin.userId,
     });
-    db.logActivity('event', `Event created: ${title}`, { event_id: ev.id });
+    db.logActivity('event', `Event created: ${title} (${t})`, { event_id: ev.id });
     audit(req.admin, 'create_event', 0, title);
+    res.json({ ok: true, event: ev });
+  });
+
+  /** Create a pre-built free-entry giveaway event (no cost, big reward). */
+  app.post('/api/events/giveaway', requireAuth, (req, res) => {
+    const { title, description, reward } = req.body || {};
+    const ev = db.createEvent({
+      title: title || '🎁 Free Giveaway',
+      description: description || 'Free entry — no coins needed. Huge reward on completion!',
+      type: 'giveaway',
+      reward: Math.max(0, Math.floor(Number(reward) || 500000)),
+      ends_at: Number(req.body.ends_at) || 0,
+      created_by: req.admin.userId,
+    });
+    db.logActivity('event', `Giveaway event created: ${ev.title}`, { event_id: ev.id });
+    audit(req.admin, 'create_giveaway', 0, ev.title);
     res.json({ ok: true, event: ev });
   });
 

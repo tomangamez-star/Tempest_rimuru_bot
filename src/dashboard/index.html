@@ -221,9 +221,10 @@ tr:hover td{background:rgba(79,195,247,.04)}
       <div class="desc">Create missions that go LIVE in the bot — players attempt them with <code>/mission [id]</code>, <code>/heistrimuru</code> or <code>/fightrimuru</code>.</div>
       <div class="panel">
         <h3>➕ New Event</h3>
-        <div class="form-row"><input id="ev-title" placeholder="Title — e.g. Heist Rimuru and survive" style="flex:2"><select id="ev-type"><option value="mission">⚔️ Mission</option><option value="event">🎉 Event</option><option value="giveaway">🎁 Giveaway</option><option value="trivia">🧠 Trivia</option></select><input id="ev-reward" type="number" placeholder="Reward coins" style="width:130px"></div>
+        <div class="form-row"><input id="ev-title" placeholder="Title — e.g. Heist Rimuru and survive" style="flex:2"><select id="ev-type"><option value="mission">⚔️ Mission</option><option value="event">🎉 Event</option><option value="giveaway">🎁 Giveaway</option><option value="trivia">🧠 Trivia</option><option value="challenge">🏆 Challenge</option></select><input id="ev-reward" type="number" placeholder="Reward coins" style="width:130px"></div>
         <div class="form-row"><textarea id="ev-desc" placeholder="Description — what must players do?"></textarea></div>
         <button class="btn small" onclick="createEvent()">Create Event</button>
+        <button class="btn small" onclick="createGiveaway()">🎁 Free Giveaway</button>
       </div>
       <div class="panel">
         <h3>📜 Active &amp; Past Events</h3>
@@ -460,6 +461,20 @@ async function createEvent(){
       description:document.getElementById('ev-desc').value.trim(),
     })});
     toast('Event created — it is LIVE in the bot (/missions)');
+    document.getElementById('ev-title').value='';document.getElementById('ev-desc').value='';
+    loadEvents();
+  }catch(e){ toast(e.message,false); }
+}
+
+/** One-click pre-built FREE giveaway (no entry cost, big reward). */
+async function createGiveaway(){
+  try{
+    const d = await api('/api/events/giveaway',{method:'POST',body:JSON.stringify({
+      title:document.getElementById('ev-title').value.trim()||'🎁 Free Giveaway',
+      description:document.getElementById('ev-desc').value.trim()||'Free entry — no coins needed. Huge reward on completion!',
+      reward:Number(document.getElementById('ev-reward').value)||500000,
+    })});
+    toast('🎁 Free giveaway created — reward '+fmt(d.event.reward));
     document.getElementById('ev-title').value='';document.getElementById('ev-desc').value='';
     loadEvents();
   }catch(e){ toast(e.message,false); }

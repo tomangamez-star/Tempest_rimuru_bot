@@ -39,6 +39,13 @@ const higherlower = require('./games/higherlower');
 const lottery = require('./games/lottery');
 const race = require('./games/race');
 const guess = require('./games/guess');
+const crash = require('./games/crash');
+const wheel = require('./games/wheel');
+const rps = require('./games/rps');
+const tictactoe = require('./games/tictactoe');
+const dicevs = require('./games/dicevs');
+const cfstreak = require('./games/cfstreak');
+const numroulette = require('./games/numroulette');
 const shop = require('./shop');
 const crime = require('./crimes/crime');
 const fishing = require('./fish');
@@ -47,6 +54,7 @@ const heist = require('./crimes/heist');
 const keyboards = require('./keyboards');
 const missions = require('./missions');
 const backup = require('./backup');
+const profile = require('./profile');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -77,6 +85,7 @@ const MENU_COMMANDS = [
   { command: 'economy', description: '💼 Economy' },
   { command: 'shop', description: '🛒 Shop' },
   { command: 'crime', description: '🕵️ Crime' },
+  { command: 'profile', description: '🪪 Profile / Badges' },
   { command: 'help', description: '❓ Help' },
   { command: 'health', description: '👌 Health' },
 ];
@@ -519,6 +528,13 @@ function createBot() {
     dice: '🎲 <b>Dice</b>\n<code>/dice [1-6] [amount]</code>\nAnimated dice — hit your number = 6×. Rare, but sweet. 😎',
     hl: '📏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
     guess: '🎯 <b>Guess the Number</b>\n<code>/guess [amount]</code>\nPick 1-10. 3 chances with higher/lower hints. 1st try = 5x, 2nd = 3x, 3rd = 2x. 🎲',
+    crash: '💥 <b>Crash</b>\n<code>/crash [amount]</code>\nThe multiplier rockets up — cash out before it crashes. Long rides pay big. 💥',
+    wheel: '🎡 <b>Wheel of Fortune</b>\n<code>/wheel [amount]</code>\nSpin a 12-segment wheel — 0.5x to 10x. Lady luck decides. 🎰',
+    rps: '✊ <b>Rock Paper Scissors</b>\n<code>/rps [rock|paper|scissors] [amount]</code>\nBeat the house. Tie = half back. ✋✌️',
+    ttt: '⭕ <b>Tic-Tac-Toe</b>\n<code>/ttt [amount]</code>\nBeat the house at tic-tac-toe. Win = 1.8x, draw = half back. ❌',
+    duel: '🎲 <b>Dice Duel</b>\n<code>/duel [amount]</code>\nYou vs the house — higher roll wins. Ties go to the house. ⚔️',
+    cfs: '🪙 <b>Coin Flip Streak</b>\n<code>/cfs [heads|tails] [amount]</code>\nEach correct flip doubles your payout. One miss = everything gone. 🔥',
+    num: '🎯 <b>Number Roulette</b>\n<code>/num [1-10] [amount]</code>\nPick 1-10. Rarer picks pay more — up to 9x. 🎡',
   };
 
   /** Build a menu message (text + markup) and send it. */
@@ -620,6 +636,14 @@ function createBot() {
         `• /hl [amt] — higher or lower, streak multiplier\n` +
         `• /guess [amt] — pick 1-10, 3 chances, up to 5x\n` +
         `• /lottery [buy|draw|status] [n] — tickets 10k, 5 buyers = draw\n\n` +
+        `<b>🔥 New games</b>\n` +
+        `• /crash [amt] — multiplier rocket, cash out before it crashes 💥\n` +
+        `• /wheel [amt] — wheel of fortune, 0.5x–10x 🎡\n` +
+        `• /rps [rock|paper|scissors] [amt] — vs the house ✊✋✌️\n` +
+        `• /ttt [amt] — tic-tac-toe vs the house ⭕❌\n` +
+        `• /duel [amt] — dice duel, higher roll wins 🎲\n` +
+        `• /cfs [heads|tails] [amt] — coin flip streak, doubles each win 🪙\n` +
+        `• /num [1-10] [amt] — number roulette, rare picks pay up to 9x 🎯\n\n` +
         `<b>💼 Economy</b>\n` +
         `• /balance — wallet + bank\n` +
         `• /dep [amt|all] — wallet → bank\n` +
@@ -640,8 +664,11 @@ function createBot() {
         `<b>🎣 Activities</b>\n` +
         `• /fish — needs a Fishing Hook from /shop\n` +
         `• /dig — treasure hunt\n\n` +
+        `<b>🪪 Profile</b>\n` +
+        `• /p — your profile card (rank, win rate, badges)\n` +
+        `• /badges — your earned badges\n` +
+        `• /id — your ID card\n\n` +
         `<b>🕹️ Other</b>\n` +
-        `• /guess [amt] — pick 1-10, 3 chances, up to 5x\n` +
         `• /race [amt] — race against the house\n` +
         `• /hide — 50M coins, vanish from robs &amp; heists for 60s\n` +
         `• /verify — re-check your group membership\n` +
@@ -749,6 +776,48 @@ function createBot() {
     race: async (ctx) => {
       const r = await race.play(ctx);
       if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'race', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+
+    // ----- new games -----
+    crash: async (ctx) => {
+      const r = await crash.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'crash', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    wheel: async (ctx) => {
+      const r = await wheel.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'wheel', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    rps: async (ctx) => {
+      const r = await rps.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'rps', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    ttt: async (ctx) => {
+      const r = await tictactoe.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'ttt', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    tictactoe: async (ctx) => {
+      const r = await tictactoe.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'ttt', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    duel: async (ctx) => {
+      const r = await dicevs.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'duel', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    cfs: async (ctx) => {
+      const r = await cfstreak.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'cfs', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    coinflipstreak: async (ctx) => {
+      const r = await cfstreak.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'cfs', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    num: async (ctx) => {
+      const r = await numroulette.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'num', ctx.args[0], r.won ? 'win' : 'lose', r.net);
+    },
+    numroulette: async (ctx) => {
+      const r = await numroulette.play(ctx);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'num', ctx.args[0], r.won ? 'win' : 'lose', r.net);
     },
 
     // ----- events & missions (created from the admin dashboard) -----
@@ -891,6 +960,12 @@ function createBot() {
     lb: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
     leaderboard: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
 
+    // ----- profile / badges / id -----
+    p: async (ctx) => { await ctx.reply(profile.profileText(ctx, ctx.userId), { title: '🪪 PROFILE', color: THEME.gold, html: true }); },
+    profile: async (ctx) => { await ctx.reply(profile.profileText(ctx, ctx.userId), { title: '🪪 PROFILE', color: THEME.gold, html: true }); },
+    badges: async (ctx) => { await ctx.reply(profile.badgesText(ctx, ctx.userId), { title: '🏅 BADGES', color: THEME.gold, html: true }); },
+    id: async (ctx) => { await ctx.reply(profile.idCardText(ctx, ctx.userId), { title: '🪪 ID CARD', color: THEME.cyan, html: true }); },
+
     // ----- admin (owner only) -----
     ban: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
@@ -1018,6 +1093,7 @@ function createBot() {
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
+          `🏓 <b>Ping</b>: ${db.ping()}ms`,
           `👥 <b>Users</b>: ${fmt(stats.totalUsers)} (${fmt(stats.activeUsers)} active)`,
           `👪 <b>Groups</b>: ${fmt(stats.totalGroups)}`,
           `💰 <b>Coins in circulation</b>: ${fmt(stats.coinsInCirculation)}`,
@@ -1049,6 +1125,7 @@ function createBot() {
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
+          `🏓 <b>Ping</b>: ${db.ping()}ms`,
           `👥 <b>Users</b>: ${fmt(stats.totalUsers)}`,
           `👪 <b>Groups</b>: ${fmt(stats.totalGroups)}`,
           `💰 <b>Coins in circulation</b>: ${fmt(stats.coinsInCirculation)}`,
@@ -1481,36 +1558,48 @@ function createBot() {
   } catch (e) { /* non-fatal */ }
   setInterval(() => {
     try {
-      const sent = dashboard.drainBroadcastQueue((item, done) => {
-        // Fan out: users with known chats are best-effort (bot tracks chats
-        // only in-memory; groups are any negative chat we have seen).
-        let count = 0;
-        const target = item.target || 'all';
-        // Gather unique chat ids the bot has seen this session.
-        const chats = new Set();
-        try {
-          const seen = db.getSeenChatIds();
-          for (const row of seen) chats.add(row.chat_id);
-        } catch (e) { /* non-fatal */ }
-        let list = [];
-        if (target === 'groups') list = [...chats].filter((c) => c < 0);
-        else if (target === 'users') list = [...chats].filter((c) => c > 0);
-        else list = [...chats];
-        (async () => {
-          for (const cid of list.slice(0, 500)) {
-            try {
-              await bot.sendMessage(cid, item.message, { parse_mode: 'HTML' });
-              count++;
-            } catch (e) { /* skip unreachable chats */ }
-          }
-          done(count);
-        })().catch(() => done(count));
-      });
-      if (sent) console.log(`[dashboard] broadcast #${sent.id} drained`);
+      // Drain the WHOLE queue each tick. Delivery is async (per item) so the
+      // next item starts immediately instead of waiting 10s for the first.
+      let drained = 0;
+      for (let item = dashboard.drainBroadcastQueue(makeBroadcastSender); item; item = dashboard.drainBroadcastQueue(makeBroadcastSender)) {
+        drained++;
+        if (drained >= 50) break; // safety cap per tick
+      }
+      if (drained) console.log(`[dashboard] drained ${drained} broadcast(s)`);
     } catch (e) {
       console.error('[dashboard] drain error:', e.message);
     }
   }, 10000);
+
+  /** Build the fan-out callback for one broadcast queue item.
+   *  Sends to BOTH private users AND group chats (never just one), sourced
+   *  from chat_logs (persistent, survives redeploys) plus live-known chats.
+   *  Delivery is async — the queue moves on immediately. */
+  function makeBroadcastSender() {
+    return (item, done) => {
+      let count = 0;
+      const target = item.target || 'all';
+      const chats = new Set();
+      try {
+        for (const row of db.getSeenChatIds()) chats.add(row.chat_id);
+      } catch (e) { /* non-fatal */ }
+      let list = [...chats];
+      if (target === 'groups') list = list.filter((c) => c < 0);
+      else if (target === 'users') list = list.filter((c) => c > 0);
+      // dedupe + cap (500 users + 500 groups max)
+      list = [...new Set(list)].slice(0, target === 'all' ? 1000 : 500);
+      (async () => {
+        for (const cid of list) {
+          try {
+            await bot.sendMessage(cid, item.message, { parse_mode: 'HTML' });
+            count++;
+          } catch (e) { /* skip unreachable chats */ }
+        }
+        done(count);
+        console.log(`[dashboard] broadcast #${item.id} (${target}) delivered to ${count}/${list.length} chats`);
+      })().catch(() => done(count));
+    };
+  }
 
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);

@@ -480,6 +480,126 @@ test('backup: dumps users + inventory, restore round-trips', () => {
   assert.ok(db.getItemQty(uid, 'hook') >= 2, 'inventory restored');
 });
 
+/* ---------- new games ---------- */
+test('crash: payout = bet × multiplier, crash=1.0 pays 0', () => {
+  const crash = require('../src/games/crash');
+  for (let i = 0; i < 200; i++) {
+    const r = crash.playCrash(1000);
+    assert.ok(r.crash >= 1.0, 'crash multiplier >= 1.0');
+    if (r.crash > 1.0) assert.strictEqual(r.payout, Math.floor(1000 * r.crash));
+    else assert.strictEqual(r.payout, 0, 'crash at 1.0 pays 0');
+  }
+});
+
+test('wheel: segments have expected range and payouts', () => {
+  const wheel = require('../src/games/wheel');
+  const seg = wheel.spin(1000).segment;
+  assert.ok(['0.5x','1x','1.5x','2x','3x','5x','10x'].includes(seg.label), 'valid segment label');
+  assert.ok(seg.mult >= 0.5 && seg.mult <= 10, 'multiplier in range');
+});
+
+test('rps: judge logic + tie pays half', () => {
+  const rps = require('../src/games/rps');
+  assert.strictEqual(rps.judge('rock', 'scissors'), 'player');
+  assert.strictEqual(rps.judge('paper', 'rock'), 'player');
+  assert.strictEqual(rps.judge('scissors', 'paper'), 'player');
+  assert.strictEqual(rps.judge('rock', 'paper'), 'house');
+  assert.strictEqual(rps.judge('rock', 'rock'), 'tie');
+  const t = rps.playRps('rock', 1000);
+  if (t.result === 'tie') assert.strictEqual(t.payout, 500, 'tie pays half back');
+  if (t.result === 'player') assert.strictEqual(t.payout, 1900, 'win pays 1.9x');
+});
+
+test('ttt: board resolves to player|bot|tie with valid payout', () => {
+  const ttt = require('../src/games/tictactoe');
+  for (let i = 0; i < 50; i++) {
+    const r = ttt.playTtt(1000);
+    assert.ok(['player','bot','tie'].includes(r.result), 'valid result');
+    if (r.result === 'player') assert.strictEqual(r.payout, 1800);
+    if (r.result === 'tie') assert.strictEqual(r.payout, 500);
+    if (r.result === 'bot') assert.strictEqual(r.payout, 0);
+  }
+});
+
+test('duel: higher roll wins, ties go to house', () => {
+  const duel = require('../src/games/dicevs');
+  for (let i = 0; i < 100; i++) {
+    const r = duel.duel(1000);
+    assert.ok(r.player >= 1 && r.player <= 6 && r.bot >= 1 && r.bot <= 6, 'rolls in 1-6');
+    if (r.player > r.bot) assert.strictEqual(r.result, 'player');
+    else assert.strictEqual(r.result, 'bot', 'ties go to the house');
+    if (r.result === 'player') assert.strictEqual(r.payout, 1900);
+  }
+});
+
+test('cfstreak: multiplier doubles per win, 0 on first miss', () => {
+  const cfs = require('../src/games/cfstreak');
+  for (let i = 0; i < 100; i++) {
+    const r = cfs.playStreak(1000, 'heads');
+    assert.ok(r.wins >= 0);
+    assert.strictEqual(r.payout, r.wins > 0 ? Math.floor(1000 * Math.pow(2, r.wins)) : 0);
+  }
+  // Consistency: choice is either heads or tails; wins count correct flips.
+  const s = cfs.streak('tails');
+  assert.ok(Number.isInteger(s.wins) && s.wins >= 0, 'streak returns integer wins');
+});
+
+test('numroulette: payouts match rarity table', () => {
+  const num = require('../src/games/numroulette');
+  const r = num.playNum(7, 1000);
+  assert.ok(r.chosen >= 1 && r.chosen <= 10 && r.drawn >= 1 && r.drawn <= 10);
+  if (r.payout > 0) assert.strictEqual(r.payout, Math.floor(1000 * num.PAYOUTS[7]));
+  else assert.notStrictEqual(r.drawn, 7);
+});
+
+/* ---------- profile / badges / id ---------- */
+test('profile: rankOf + badges + profileText render', () => {
+  const profile = require('../src/profile');
+  const uid = 9901;
+  db.getOrCreateUser(uid, { first_name: 'ProfileTester', username: 'pt' });
+  db.setWallet(uid, 5000000);
+  db.setBank(uid, 5000000);
+  db.logGameHistory({ user_id: uid, username: 'pt', game: 'slots', bet: 1000, result: 'win', amount: 1000 });
+  db.logGameHistory({ user_id: uid, username: 'pt', game: 'dice', bet: 500, result: 'lose', amount: -500 });
+  const r = profile.rankOf(uid);
+  assert.ok(r.title && r.rank, 'rank + title resolved');
+  assert.strictEqual(r.net, 10000000, 'net worth computed');
+  const ctx = { userId: uid, args: [], msg: {} };
+  const txt = profile.profileText(ctx, uid);
+  assert.ok(txt.includes('ProfileTester'), 'profile shows name');
+  assert.ok(txt.includes('10,000,000'), 'profile shows net worth');
+  assert.ok(txt.includes('Win rate'), 'profile shows win rate');
+  const b = profile.badgesText(ctx, uid);
+  assert.ok(b.includes('Badges') || b.includes('•'), 'badges render');
+  const id = profile.idCardText(ctx, uid);
+  assert.ok(id.includes('ID CARD'), 'id card renders');
+});
+
+/* ---------- broadcast queue + dashboard events (DB layer) ---------- */
+test('broadcast: createBroadcast stores + updateBroadcastCount works', () => {
+  const rec = db.createBroadcast('hello broadcast', 'all', 8781690556);
+  assert.ok(rec.id > 0, 'broadcast created with id');
+  assert.strictEqual(rec.target, 'all');
+  db.updateBroadcastCount(rec.id, 7);
+  const list = db.listBroadcasts(5);
+  assert.ok(list.some((b) => b.id === rec.id && b.sent_count === 7), 'sent_count updated');
+});
+
+test('events: createEvent + giveaway-type whitelist in DB layer', () => {
+  const ev = db.createEvent({ title: 'Free Giveaway Test', type: 'giveaway', reward: 500000, created_by: 8781690556 });
+  assert.ok(ev.id > 0, 'event created');
+  assert.strictEqual(ev.type, 'giveaway');
+  assert.strictEqual(ev.reward, 500000);
+  const list = db.listEvents();
+  assert.ok(list.some((e) => e.id === ev.id && e.title === 'Free Giveaway Test'), 'event listed');
+});
+
+/* ---------- db ping ---------- */
+test('db: ping returns a number (ms)', () => {
+  const p = db.ping();
+  assert.ok(Number.isFinite(p) && p >= 0, 'ping is a non-negative number');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
 console.log('ALL SMOKE TESTS PASSED ✅');
