@@ -25,6 +25,11 @@ function attempt(robberId, targetId, meta = {}) {
   const robber = db.getOrCreateUser(robberId, meta);
   const target = db.getOrCreateUser(targetId);
 
+  // Hidden targets can't be robbed — they've vanished into the shadows.
+  if (db.isHidden(targetId)) {
+    return { ok: false, message: `\ud83d\udc80 ${target.first_name || 'Your target'} has vanished into the shadows \u2014 you can't rob them while they're hidden.` };
+  }
+
   if (target.wallet < config.rob.minTargetWallet) {
     return { ok: false, message: `🕳️ ${target.first_name || 'They'} is too broke to rob (< ${fmt(config.rob.minTargetWallet)} in wallet).` };
   }

@@ -130,6 +130,13 @@ const config = {
     beg: 60 * 1000,
     fish: 2 * 60 * 1000,
     dig: 3 * 60 * 1000,
+    hide: 30 * 60 * 1000,     // /hide cooldown (30 min)
+  },
+
+  // /hide — vanish from robs & heists for 60s
+  hide: {
+    price: 50000000,          // 50,000,000 coins
+    durationMs: 60 * 1000,    // 1 minute hidden
   },
 
   // Per-game cooldown (ms) — applies to EACH game individually per user,

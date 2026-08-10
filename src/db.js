@@ -45,6 +45,7 @@ CREATE TABLE IF NOT EXISTS users (
   status     TEXT DEFAULT 'active',      -- active | muted | suspected | banned
   status_reason TEXT DEFAULT '',
   status_until INTEGER DEFAULT 0,         -- 0 = permanent
+  hidden_until INTEGER DEFAULT 0,         -- hide-in-shadows expiry (ms epoch)
   created_at INTEGER NOT NULL
 );
 
@@ -195,6 +196,9 @@ if (pgEnabled) {
   } catch (e) {
     console.error('[db] Invalid DATABASE_URL — falling back to SQLite-only:', e.message);
     pool = null;
+    pgLastError = `bad DATABASE_URL: ${(e.message || String(e)).slice(0, 300)}`;
+    pgLastErrorAt = Date.now();
+    pgConnectivity = 'degraded';
   }
 }
 
@@ -217,6 +221,7 @@ CREATE TABLE IF NOT EXISTS users (
   status        TEXT DEFAULT 'active',
   status_reason TEXT DEFAULT '',
   status_until  BIGINT DEFAULT 0,
+  hidden_until  BIGINT DEFAULT 0,
   created_at    BIGINT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS cooldowns (
@@ -323,7 +328,15 @@ async function initPg() {
     await pool.query(PG_SCHEMA);
     return true;
   } catch (e) {
-    console.error('[db] Postgres schema init failed (continuing SQLite-only):', e.message);
+    // Capture the EXACT reason (auth failed / timeout / blocked port / bad host)
+    // so /health, /debug and boot logs show why the connection is failing.
+    const code = e.code ? ` [${e.code}]` : '';
+    const detail = (e.message || String(e)).slice(0, 300);
+    pgLastError = `init failed${code}: ${detail}`;
+    pgLastErrorAt = Date.now();
+    pgConnectivity = 'degraded';
+    pgFailures++;
+    console.error('[db] Postgres schema init failed (continuing SQLite-only):', detail);
     return false;
   }
 }
@@ -345,7 +358,8 @@ const PG_CRITICAL_FAILURES = 3;
 function queuePg(task) {
   pgQueue = pgQueue.then(task).catch((err) => {
     pgFailures++;
-    pgLastError = String((err && err.message) || err);
+    const code = err && err.code ? ` [${err.code}]` : '';
+    pgLastError = String((err && err.message) || err) + code;
     pgLastErrorAt = Date.now();
     pgConnectivity = 'degraded';
     if (pgFailures === PG_CRITICAL_FAILURES || pgFailures % 10 === 0) {
@@ -459,6 +473,7 @@ function mapUser(row) {
     status: row.status || 'active',
     status_reason: row.status_reason || '',
     status_until: Number(row.status_until) || 0,
+    hidden_until: Number(row.hidden_until) || 0,
     created_at: Number(row.created_at) || 0,
   };
 }
@@ -521,6 +536,24 @@ function setStatus(userId, status, reason, until = 0) {
   db.prepare('UPDATE users SET status = ?, status_reason = ?, status_until = ? WHERE user_id = ?')
     .run(status, reason || '', until, userId);
   mirrorTable('users');
+}
+
+/** /hide — vanish from rob/heist targeting until `untilTs` (ms epoch). */
+function setHidden(userId, untilTs) {
+  db.prepare('UPDATE users SET hidden_until = ? WHERE user_id = ?').run(untilTs || 0, userId);
+  pgRun('UPDATE users SET hidden_until = $1 WHERE user_id = $2', [untilTs || 0, userId]);
+}
+
+/** True while the user's hide is still active. */
+function isHidden(userId) {
+  const u = getUser(userId);
+  if (!u) return false;
+  return u.hidden_until > Date.now();
+}
+
+/** All users (full rows) — used by the /backup command. */
+function getAllUsers() {
+  return db.prepare('SELECT * FROM users').all().map(mapUser);
 }
 
 function clearStatus(userId) {
@@ -1242,6 +1275,9 @@ module.exports = {
   addBank,
   setStatus,
   clearStatus,
+  setHidden,
+  isHidden,
+  getAllUsers,
   leaderboard,
   getCooldown,
   setCooldown,

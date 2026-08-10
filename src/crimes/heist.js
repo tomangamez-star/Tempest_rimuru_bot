@@ -42,6 +42,11 @@ function start(leaderId, targetId, meta = {}) {
   const leader = db.getOrCreateUser(leaderId, meta);
   const target = db.getOrCreateUser(targetId);
 
+  // Hidden targets can't be heisted — the shadows protect them.
+  if (db.isHidden(targetId)) {
+    return { ok: false, message: `\ud83d\udc80 ${target.first_name || 'Your target'} has vanished into the shadows \u2014 you can't heist them while they're hidden.` };
+  }
+
   if (target.bank <= 0) {
     return { ok: false, message: `🏦 ${target.first_name || 'Target'}\'s bank is empty — nothing to heist.` };
   }

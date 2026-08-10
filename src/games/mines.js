@@ -165,7 +165,7 @@ async function play(ctx) {
 }
 
 /** Handle mines:<uid>:pick:<i> callback */
-async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, answerCb }) {
+async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, answerCb, eco }) {
   const s = sessions.get(userId);
   if (!s || !s.alive) {
     await answerCb('No active mines game.');

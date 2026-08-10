@@ -36,6 +36,7 @@ const heist = require('../src/crimes/heist');
 const income = require('../src/income');
 const leaderboard = require('../src/leaderboard');
 const rimuru = require('../src/rimuru');
+const backup = require('../src/backup');
 
 let passed = 0;
 let failed = 0;
@@ -420,6 +421,63 @@ test('config: house edge and key numbers', () => {
   assert.strictEqual(config.mines.mineCount, 4);
   assert.strictEqual(config.mines.visibleMines, 3);
   assert.strictEqual(config.mines.multPerPick, 0.25);
+});
+
+/* ---------- hide ---------- */
+test('hide: setHidden/isHidden lifecycle', () => {
+  const uid = 8801;
+  db.getOrCreateUser(uid, { first_name: 'Shady', username: 'shady' });
+  db.setHidden(uid, Date.now() + 60000);
+  assert.ok(db.isHidden(uid), 'hidden while active');
+  db.setHidden(uid, Date.now() - 1000);
+  assert.ok(!db.isHidden(uid), 'not hidden after expiry');
+  db.setHidden(uid, 0);
+  assert.ok(!db.isHidden(uid), 'not hidden when cleared');
+});
+
+test('hide: robbery and heist refuse hidden targets', () => {
+  const victim = 8802;
+  const robber = 8803;
+  db.getOrCreateUser(victim, { first_name: 'Victim', username: 'victim' });
+  db.getOrCreateUser(robber, { first_name: 'Robber', username: 'robber' });
+  db.setWallet(victim, 1000000);
+  db.setBank(victim, 1000000);
+  db.setHidden(victim, Date.now() + 60000);
+  const r = robbery.attempt(robber, victim, { first_name: 'Robber' });
+  assert.ok(!r.ok && /hidden/.test(r.message), 'rob blocked on hidden target');
+  const h = heist.start(robber, victim, { first_name: 'Robber' });
+  assert.ok(!h.ok && /hidden/.test(h.message), 'heist blocked on hidden target');
+  db.setHidden(victim, 0);
+});
+
+/* ---------- health ---------- */
+test('config: hide price + duration present', () => {
+  assert.strictEqual(config.hide.price, 50000000);
+  assert.strictEqual(config.hide.durationMs, 60000);
+  assert.ok(config.cooldowns.hide > 0);
+});
+
+/* ---------- backup / restore ---------- */
+test('backup: dumps users + inventory, restore round-trips', () => {
+  const uid = 8804;
+  db.getOrCreateUser(uid, { first_name: 'Backup', username: 'backup' });
+  db.setWallet(uid, 1234567);
+  db.setBank(uid, 7654321);
+  db.addItem(uid, 'hook', 2);
+  const b = backup.backup();
+  assert.ok(b.ok, 'backup succeeded');
+  assert.ok(b.file && /backup-\d+\.json$/.test(b.file), 'backup file named backup-<ts>.json');
+  const fs = require('fs');
+  assert.ok(fs.existsSync(b.file), 'backup file exists on disk');
+  const data = JSON.parse(fs.readFileSync(b.file, 'utf8'));
+  assert.ok(Array.isArray(data.users), 'backup has users array');
+  assert.ok(data.users.some((u) => u.user_id === uid && u.wallet === 1234567 && u.bank === 7654321), 'backup contains balances');
+  const r = backup.restore();
+  assert.ok(r.ok, 'restore succeeded');
+  const u = db.getUser(uid);
+  assert.strictEqual(u.wallet, 1234567, 'wallet restored');
+  assert.strictEqual(u.bank, 7654321, 'bank restored');
+  assert.ok(db.getItemQty(uid, 'hook') >= 2, 'inventory restored');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -46,6 +46,7 @@ const robbery = require('./crimes/robbery');
 const heist = require('./crimes/heist');
 const keyboards = require('./keyboards');
 const missions = require('./missions');
+const backup = require('./backup');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -74,7 +75,10 @@ const MENU_COMMANDS = [
   { command: 'casino', description: '🎰 Casino' },
   { command: 'games', description: '🎮 Games' },
   { command: 'economy', description: '💼 Economy' },
+  { command: 'shop', description: '🛒 Shop' },
+  { command: 'crime', description: '🕵️ Crime' },
   { command: 'help', description: '❓ Help' },
+  { command: 'health', description: '👌 Health' },
 ];
 
 function createBot() {
@@ -639,7 +643,9 @@ function createBot() {
         `<b>🕹️ Other</b>\n` +
         `• /guess [amt] — pick 1-10, 3 chances, up to 5x\n` +
         `• /race [amt] — race against the house\n` +
-        `• /verify — re-check your group membership\n\n` +
+        `• /hide — 50M coins, vanish from robs &amp; heists for 60s\n` +
+        `• /verify — re-check your group membership\n` +
+        `• /health — bot health &amp; persistence status (anyone)\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -862,6 +868,25 @@ function createBot() {
       await ctx.reply(r.message, { title: r.ok ? (r.success ? '✅ CRIME' : '🚔 CRIME') : '🕵️ CRIME', color: r.ok ? (r.success ? THEME.gold : THEME.red) : THEME.red, html: true });
     },
 
+    // ----- hide: vanish from robs & heists for 60s -----
+    hide: async (ctx) => {
+      const g = cd.guard(ctx.userId, 'hide', 'Hiding');
+      if (g.blocked) return ctx.reply(g.message, { title: '\ud83d\udc80 HIDE', color: THEME.red });
+      const price = config.hide.price;
+      const charge = eco.chargeWallet(ctx.userId, price, 'hide');
+      if (!charge.ok) return ctx.reply(charge.message, { title: '\ud83d\udc80 HIDE', color: THEME.red });
+      db.setHidden(ctx.userId, Date.now() + config.hide.durationMs);
+      cd.start(ctx.userId, 'hide', config.cooldowns.hide);
+      db.logActivity('user', `\ud83d\udc80 /hide by ${metaOf(ctx.msg).username || ctx.userId}`, { target: ctx.userId, cost: price });
+      await ctx.reply(
+        `\ud83d\udc80 <b>YOU VANISHED</b>\n\n` +
+        `You paid <b>${fmt(price)}</b> to slip into the shadows.\n` +
+        `For <b>60 seconds</b> nobody can <code>/rob</code> or <code>/heist</code> you.\n` +
+        `\ud83d\udc5b Wallet: <b>${fmt(eco.balance(ctx.userId).wallet)}</b>`,
+        { title: '\ud83d\udc80 HIDE', color: THEME.cyan, html: true }
+      );
+    },
+
     // ----- leaderboard -----
     lb: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
     leaderboard: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
@@ -1009,6 +1034,46 @@ function createBot() {
       } catch (e) {
         await ctx.reply(`⚠️ Debug failed: ${e.message}`, { title: '🛠 DEBUG', color: THEME.red });
       }
+    },
+
+    // ----- health: everyone can check the bot is alive (no staff gate) -----
+    health: async (ctx) => {
+      try {
+        const pkg = require('../package.json');
+        const stats = db.dashboardStats();
+        const mem = process.memoryUsage();
+        const pInfo = db.syncInfo();
+        const pgStatus = pInfo.configured
+          ? (pInfo.ready && pInfo.connected ? `✅ connected (${pInfo.host}:${pInfo.port})` : `❌ ${pInfo.host}:${pInfo.port} — ${pInfo.lastPgError || 'connecting…'}`)
+          : 'off (SQLite-only, ephemeral)';
+        const lines = [
+          `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
+          `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
+          `👥 <b>Users</b>: ${fmt(stats.totalUsers)}`,
+          `👪 <b>Groups</b>: ${fmt(stats.totalGroups)}`,
+          `💰 <b>Coins in circulation</b>: ${fmt(stats.coinsInCirculation)}`,
+          `🗄 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'})` : ''}`,
+          `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
+          `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
+        ];
+        await ctx.reply(lines.join('\n'), { title: '👌 HEALTH', color: THEME.cyan, html: true });
+      } catch (e) {
+        await ctx.reply(`⚠️ Health check failed: ${e.message}`, { title: '👌 HEALTH', color: THEME.red });
+      }
+    },
+
+    // ----- owner-only backup / restore (safety net) -----
+    backup: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      const r = backup.backup();
+      db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'backup', 0, 'owner backup dump');
+      await ctx.reply(r.message, { title: r.ok ? '📦 BACKUP' : '❌ BACKUP', color: r.ok ? THEME.gold : THEME.red, html: true });
+    },
+    restore: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      const r = backup.restore();
+      db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'restore', 0, 'owner restore from backup');
+      await ctx.reply(r.message, { title: r.ok ? '♻️ RESTORE' : '❌ RESTORE', color: r.ok ? THEME.gold : THEME.red, html: true });
     },
   };
 
@@ -1172,7 +1237,8 @@ function createBot() {
             `<b>🛒 Shop</b>: /shop · /buy · /inv\n` +
             `<b>🎣 Activities</b>: /fish · /dig\n` +
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
-            `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify\n` +
+            `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
+            `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
           await answerCb('');
@@ -1293,7 +1359,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'restore'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
