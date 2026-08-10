@@ -38,6 +38,10 @@ const roulette = require('./games/roulette');
 const higherlower = require('./games/higherlower');
 const lottery = require('./games/lottery');
 const race = require('./games/race');
+const guess = require('./games/guess');
+const shop = require('./shop');
+const crime = require('./crimes/crime');
+const fishing = require('./fish');
 const robbery = require('./crimes/robbery');
 const heist = require('./crimes/heist');
 const keyboards = require('./keyboards');
@@ -470,6 +474,10 @@ function createBot() {
             { text: '🎲 Dice', callback_data: 'menu:g:dice' },
             { text: '📏 Higher/Lower', callback_data: 'menu:g:hl' },
           ],
+          [
+            { text: '🎯 Guess Number', callback_data: 'menu:g:guess' },
+            { text: '🎰 Lottery', callback_data: 'menu:g:lottery' },
+          ],
           [{ text: '⬅️ Back', callback_data: 'menu:main' }],
         ],
       },
@@ -506,6 +514,7 @@ function createBot() {
     mines: '💎 <b>Mines</b>\n<code>/mines [amount]</code>\n5×5 grid, 3 mines. Safe pick = multiplier climbs. Cash out anytime. 💣',
     dice: '🎲 <b>Dice</b>\n<code>/dice [1-6] [amount]</code>\nAnimated dice — hit your number = 6×. Rare, but sweet. 😎',
     hl: '📏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
+    guess: '🎯 <b>Guess the Number</b>\n<code>/guess [amount]</code>\nPick 1-10. 3 chances with higher/lower hints. 1st try = 5x, 2nd = 3x, 3rd = 2x. 🎲',
   };
 
   /** Build a menu message (text + markup) and send it. */
@@ -540,9 +549,10 @@ function createBot() {
       await ctx.reply(
         `Welcome, ${u.first_name || 'mortal'}. The house always wins — but I'll let you play.\n` +
         `You start with <b>${fmt(config.startBalance)}</b> coins. 💰\n\n` +
-        `🎮 Games: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /lottery · /race\n` +
+        `🎮 Games: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /guess · /lottery · /race\n` +
         `💼 Economy: /balance · /dep · /wd · /donate · /transfer\n` +
-        `🦹 Crime: /rob · /heist\n` +
+        `🦹 Crime: /rob · /crime · /heist\n` +
+        `🛒 Shop: /shop · /buy · /inv\n` +
         `💵 Income: /beg · /work · /fish · /dig · /daily · /bonus\n` +
         `🏆 /lb — rich list · 📜 /menu — interactive menu\n\n` +
         `⌨️ <i>Tap a button below (above your keyboard) or type a command.</i>\n` +
@@ -599,6 +609,7 @@ function createBot() {
         `• /bj [amt] — blackjack, 3:2 on blackjack\n` +
         `• /roulette [color|even|odd|low|high|dozen|column|straight|split] [amt]\n` +
         `• /hl [amt] — higher or lower, streak multiplier\n` +
+        `• /guess [amt] — pick 1-10, 3 chances, up to 5x\n` +
         `• /lottery [buy|draw|status] [n] — tickets 10k, 5 buyers = draw\n\n` +
         `<b>💼 Economy</b>\n` +
         `• /balance — wallet + bank\n` +
@@ -606,10 +617,14 @@ function createBot() {
         `• /wd [amt|all] — bank → wallet\n` +
         `• /donate [amt] (reply) — from wallet\n` +
         `• /transfer [amt] (reply) — from bank\n\n` +
-        `<b>🦹 Crime</b>\n` +
+        `<b>🕵️ Crime</b>\n` +
         `• /rob (reply) — 10 min cooldown, fail = fine\n` +
+        `• /crime [amt] — bet on a crime, up to 7x (needs shop items)\n` +
         `• /heist (reply) — 20 min, open 60s for /join, max 5 crew\n` +
         `• /join — join an open heist\n\n` +
+        `<b>🛒 Shop</b>\n` +
+        `• /shop — item list · /buy [id] [qty] — buy items\n` +
+        `• /inv — your inventory (crowbar/gun/mask → crime, hook → /fish)\n\n` +
         `<b>💵 Income</b>\n` +
         `• /beg · /work · /fish · /dig — quick coins\n` +
         `• /daily — 24h · /bonus — weekly\n\n` +
@@ -711,6 +726,8 @@ function createBot() {
     },
     hl: async (ctx) => higherlower.play(ctx),
     higherlower: async (ctx) => higherlower.play(ctx),
+    guess: async (ctx) => guess.play(ctx),
+    guessthenumber: async (ctx) => guess.play(ctx),
     race: async (ctx) => {
       const r = await race.play(ctx);
       if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'race', ctx.args[0], r.won ? 'win' : 'lose', r.net);
@@ -809,10 +826,29 @@ function createBot() {
     // ----- income -----
     beg: async (ctx) => { const r = income.earn(ctx.userId, 'beg', metaOf(ctx.msg)); await ctx.reply(r.message, { title: '🙏 BEG', color: THEME.cyan }); },
     work: async (ctx) => { const r = income.earn(ctx.userId, 'work', metaOf(ctx.msg)); await ctx.reply(r.message, { title: '💼 WORK', color: THEME.cyan }); },
-    fish: async (ctx) => { const r = income.earn(ctx.userId, 'fish', metaOf(ctx.msg)); await ctx.reply(r.message, { title: '🎣 FISH', color: THEME.cyan }); },
+    fish: async (ctx) => { const r = fishing.fish(ctx.userId, metaOf(ctx.msg)); await ctx.reply(r.message, { title: '🎣 FISH', color: THEME.cyan }); },
     dig: async (ctx) => { const r = income.earn(ctx.userId, 'dig', metaOf(ctx.msg)); await ctx.reply(r.message, { title: '⛏️ DIG', color: THEME.cyan }); },
     daily: async (ctx) => { const r = income.daily(ctx.userId, metaOf(ctx.msg)); await ctx.reply(r.message, { title: '📅 DAILY', color: THEME.gold }); },
     bonus: async (ctx) => { const r = income.bonus(ctx.userId, metaOf(ctx.msg)); await ctx.reply(r.message, { title: '🎁 BONUS', color: THEME.gold }); },
+
+    // ----- shop / crime -----
+    shop: async (ctx) => { await ctx.reply(shop.shopList(), { title: '🛒 RIMURU\'S SHOP', color: THEME.gold, html: true }); },
+    store: async (ctx) => { await ctx.reply(shop.shopList(), { title: '🛒 RIMURU\'S SHOP', color: THEME.gold, html: true }); },
+    buy: async (ctx) => {
+      const id = ctx.args[0];
+      if (!id) return ctx.reply('🎯 Usage: <code>/buy [id] [qty]</code> — e.g. <code>/buy 4</code> or <code>/buy hook 2</code>. Check <code>/shop</code> first.', { title: '🛒 BUY', color: THEME.red, html: true });
+      const r = shop.buyItem(ctx.userId, id, ctx.args[1], metaOf(ctx.msg));
+      await ctx.reply(r.message, { title: r.ok ? '✅ PURCHASED' : '🛒 BUY', color: r.ok ? THEME.gold : THEME.red, html: true });
+    },
+    inv: async (ctx) => { await ctx.reply(shop.inventoryText(ctx.userId), { title: '📦 INVENTORY', color: THEME.cyan, html: true }); },
+    inventory: async (ctx) => { await ctx.reply(shop.inventoryText(ctx.userId), { title: '📦 INVENTORY', color: THEME.cyan, html: true }); },
+    crime: async (ctx) => {
+      const g = cd.guard(ctx.userId, 'crime', 'Crime');
+      if (g.blocked) return ctx.reply(g.message, { title: '🕵️ CRIME', color: THEME.red });
+      const r = crime.commit(ctx.userId, ctx.args[0], metaOf(ctx.msg));
+      if (r.ok) cd.start(ctx.userId, 'crime', config.cooldowns.rob);
+      await ctx.reply(r.message, { title: r.ok ? (r.success ? '✅ CRIME' : '🚔 CRIME') : '🕵️ CRIME', color: r.ok ? (r.success ? THEME.gold : THEME.red) : THEME.red, html: true });
+    },
 
     // ----- leaderboard -----
     lb: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
@@ -1169,6 +1205,10 @@ function createBot() {
       }
       if (data.startsWith('hl:')) {
         await higherlower.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
+        return;
+      }
+      if (data.startsWith('guess:')) {
+        await guess.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
         return;
       }
       if (data.startsWith('race:')) {

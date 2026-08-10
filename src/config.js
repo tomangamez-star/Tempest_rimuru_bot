@@ -218,6 +218,59 @@ const config = {
     daily: [25000, 50000],
     bonus: [100000, 250000],
   },
+
+  // ===================== SHOP / INVENTORY =====================
+  // Items bought with coins (virtual). Some are REQUIRED for features
+  // (crowbar/gun/mask → /crime robbery; fishing hook → /fish); others give
+  // passive boosts (security → better escape odds, cyber security → better
+  // defense). Every item is one-shot consumable unless noted (unlimited).
+  shop: {
+    items: [
+      { id: 'crowbar', name: 'Crowbar', emoji: '🪓', price: 25000, desc: 'Required for robbery-type crimes. Pry open anything.' },
+      { id: 'gun', name: 'Gun', emoji: '🔫', price: 75000, desc: 'Required for armed robbery crimes. Adds real threat.' },
+      { id: 'mask', name: 'Robbery Mask', emoji: '🎭', price: 20000, desc: 'Required for robbery crimes. Hides your identity.' },
+      { id: 'hook', name: 'Fishing Hook', emoji: '🎣', price: 15000, desc: 'Required to /fish. The fish are waiting.' },
+      { id: 'security', name: 'Security', emoji: '🛡️', price: 100000, desc: 'Boosts your odds of escaping robs (+10%).' },
+      { id: 'cyber', name: 'Cyber Security', emoji: '💻', price: 200000, desc: 'Defense against heists — higher chance they fail (+15%).' },
+      { id: 'lockpick', name: 'Lockpick', emoji: '🗝️', price: 30000, desc: 'One-time lockpick for the safe — +8% crime success.' },
+      { id: 'lucky', name: "Lucky Charm", emoji: '🍀', price: 50000, desc: 'A lucky charm. +5% crime success, feels illegal.' },
+      { id: 'drill', name: 'Drill', emoji: '🛠️', price: 125000, desc: 'Heavy drill for vault jobs — +12% crime success.' },
+    ],
+    // Crime config (used by /crime)
+    crime: {
+      minBet: 5000,
+      maxBet: 2000000,
+      baseSuccess: 0.45,
+      // Flat success bonus per item owned (once each)
+      itemBonus: {
+        crowbar: 0.10,
+        gun: 0.12,
+        mask: 0.06,
+        lockpick: 0.08,
+        lucky: 0.05,
+        drill: 0.12,
+      },
+      // Security raises your escape odds from /rob
+      securityEscapeBonus: 0.10,
+      // Cyber security raises the chance a heist on you FAILS
+      cyberDefenseBonus: 0.15,
+    },
+  },
+
+  // /fish rewards when you own a fishing hook
+  fish: {
+    catchLines: [
+      (c) => `🐟 You reel in a fat carp — sold for **${c}**.`,
+      (c) => `🐠 A shimmering tuna! **${c}**.`,
+      (c) => `🦑 A rare squid — the market pays **${c}**.`,
+      (c) => `🦞 A lobster! Dinner AND profit: **${c}**.`,
+    ],
+    junkLines: [
+      `👢 You hooked an old boot. Nothing but shame.`,
+      `🪣 A rusty bucket. The fish laughed at you.`,
+      `🌿 Just seaweed. The ocean is mocking you.`,
+    ],
+  },
 };
 
 // Guard: critical config missing

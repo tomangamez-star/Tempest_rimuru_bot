@@ -161,6 +161,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail     TEXT DEFAULT '',
   created_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inventory (
+  user_id    BIGINT NOT NULL,
+  item_id    TEXT NOT NULL,
+  quantity   BIGINT NOT NULL DEFAULT 0,
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY (user_id, item_id)
+);
 `;
 
 /** Column list per table — mirrors TABLE_COLS in src/db.js (order matters). */
@@ -176,6 +183,7 @@ const TABLE_COLS = {
   audit_log: 'id, actor_id, actor_name, action, target_id, detail, created_at',
   chat_logs: 'id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at',
   game_history: 'id, user_id, username, game, bet, result, amount, meta, created_at',
+  inventory: 'user_id, item_id, quantity, updated_at',
 };
 
 /**
@@ -194,6 +202,7 @@ const PK_COLS = {
   broadcasts: ['id'],
   activity_feed: ['id'],
   audit_log: ['id'],
+  inventory: ['user_id', 'item_id'],
 };
 
 /** Normalize a SQLite value for Postgres (BIGINT/BIGSERIAL/SMALLINT safety). */

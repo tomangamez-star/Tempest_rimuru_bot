@@ -27,6 +27,10 @@ const mines = require('../src/games/mines');
 const blackjack = require('../src/games/blackjack');
 const higherlower = require('../src/games/higherlower');
 const lottery = require('../src/games/lottery');
+const guess = require('../src/games/guess');
+const shop = require('../src/shop');
+const crime = require('../src/crimes/crime');
+const fishing = require('../src/fish');
 const robbery = require('../src/crimes/robbery');
 const heist = require('../src/crimes/heist');
 const income = require('../src/income');
@@ -179,6 +183,84 @@ test('higherlower: rank values', () => {
   assert.strictEqual(higherlower.rankValue({ rank: 'A', suit: '♠' }), 14);
   assert.strictEqual(higherlower.rankValue({ rank: 'K', suit: '♠' }), 13);
   assert.strictEqual(higherlower.rankValue({ rank: '7', suit: '♠' }), 7);
+});
+test('guess: multipliers by chance (1st=5x, 2nd=3x, 3rd=2x)', () => {
+  const s = guess.createSession(2101, 1000);
+  s.answer = 7;
+  assert.strictEqual(guess.multFor(s), 5);
+  s.chancesLeft = 2;
+  assert.strictEqual(guess.multFor(s), 3);
+  s.chancesLeft = 1;
+  assert.strictEqual(guess.multFor(s), 2);
+  assert.strictEqual(guess.MAX_CHANCES, 3);
+});
+test('guess: answer always in 1..10', () => {
+  for (let i = 0; i < 50; i++) {
+    const s = guess.createSession(2101 + i, 500);
+    assert.ok(s.answer >= 1 && s.answer <= 10);
+  }
+});
+
+/* ---------- shop / inventory / crime / fishing ---------- */
+test('shop: catalog has required items', () => {
+  const ids = shop.ITEMS.map((i) => i.id);
+  for (const need of ['crowbar', 'gun', 'mask', 'hook', 'security', 'cyber']) {
+    assert.ok(ids.includes(need), `missing item: ${need}`);
+  }
+});
+test('shop: buy adds inventory and deducts wallet', () => {
+  eco.ensure(2201, { first_name: 'Shopper' });
+  db.setWallet(2201, 200000);
+  const r = shop.buyItem(2201, 'hook', 2, { first_name: 'Shopper' });
+  assert.ok(r.ok);
+  assert.strictEqual(r.qty, 2);
+  assert.strictEqual(db.getItemQty(2201, 'hook'), 2);
+  assert.strictEqual(db.getUser(2201).wallet, 200000 - 15000 * 2);
+});
+test('shop: cannot afford buy fails', () => {
+  db.setWallet(2201, 100);
+  const r = shop.buyItem(2201, 'gun', 1, { first_name: 'Shopper' });
+  assert.ok(!r.ok);
+});
+test('shop: inventory list renders', () => {
+  const t = shop.inventoryText(2201);
+  assert.ok(t.includes('HOOK') || t.includes('hook') || t.includes('Fishing'));
+});
+test('crime: requires bet, higher bet payout scales', () => {
+  eco.ensure(2202, { first_name: 'Criminal' });
+  db.setWallet(2202, 1000000);
+  const noBet = crime.commit(2202, '', { first_name: 'Criminal' });
+  assert.ok(!noBet.ok);
+  const r = crime.commit(2202, '50000', { first_name: 'Criminal' });
+  assert.ok(r.ok);
+  if (r.success) assert.ok(r.payout >= 50000 * 2);
+});
+test('crime: items unlock better crimes + bonus odds', () => {
+  // Armed robbery needs crowbar + gun + mask
+  db.addItem(2202, 'crowbar', 1);
+  db.addItem(2202, 'gun', 1);
+  db.addItem(2202, 'mask', 1);
+  const best = crime.bestCrime(2202);
+  assert.ok(best && ['armed', 'vault'].includes(best.id));
+  const bonus = crime.itemBonus(2202);
+  assert.ok(bonus >= 0.10);
+});
+test('crime: security escape / cyber defense bonuses', () => {
+  db.addItem(2202, 'security', 1);
+  assert.ok(crime.escapeBonus(2202) >= 0.10);
+  db.addItem(2202, 'cyber', 1);
+  assert.ok(crime.defenseBonus(2202) >= 0.15);
+});
+test('fishing: requires hook', () => {
+  const r = fishing.fish(2203, { first_name: 'Angler' });
+  assert.ok(!r.ok); // no hook yet
+  assert.ok(r.message.includes('Hook'));
+});
+test('fishing: works with hook', () => {
+  db.addItem(2203, 'hook', 1);
+  const r = fishing.fish(2203, { first_name: 'Angler' });
+  assert.ok(r.ok);
+  assert.ok(typeof r.caught === 'boolean');
 });
 
 /* ---------- lottery ---------- */

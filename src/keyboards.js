@@ -40,6 +40,9 @@ const B = {
   lottery: '🎟️ Lottery',
   bank: '🏦 Bank',
   income: '💵 Income',
+  shop: '🛒 Shop',
+  crime: '🕵️ Crime',
+  fish: '🎣 Fish',
   back: '🔙 Back',
 };
 
@@ -66,6 +69,9 @@ const BUTTON_COMMANDS = {
   [B.lottery]: { cmd: 'lottery' },
   [B.bank]: { cmd: 'bank' },
   [B.income]: { cmd: 'income' },
+  [B.shop]: { cmd: 'shop' },
+  [B.crime]: { cmd: 'crime' },
+  [B.fish]: { cmd: 'fish' },
   [B.back]: { back: true },
 };
 
@@ -111,7 +117,8 @@ const gamesKeyboard = () =>
 const economyKeyboard = () =>
   kb([
     [B.balance, B.bank],
-    [B.income, B.leaderboard],
+    [B.income, B.shop],
+    [B.crime, B.leaderboard],
     [B.back],
   ]);
 

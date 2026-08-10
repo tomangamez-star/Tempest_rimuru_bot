@@ -146,6 +146,14 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail      TEXT DEFAULT '',
   created_at  INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS inventory (
+  user_id  INTEGER NOT NULL,
+  item_id  TEXT NOT NULL,
+  quantity INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, item_id)
+);
 `);
 
 /* ================= Postgres (durable store) ================= */
@@ -299,6 +307,13 @@ CREATE TABLE IF NOT EXISTS audit_log (
   detail     TEXT DEFAULT '',
   created_at BIGINT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS inventory (
+  user_id    BIGINT NOT NULL,
+  item_id    TEXT NOT NULL,
+  quantity   BIGINT NOT NULL DEFAULT 0,
+  updated_at BIGINT NOT NULL,
+  PRIMARY KEY (user_id, item_id)
+);
 `;
 
 /** Create Postgres tables (idempotent). Returns true on success. */
@@ -368,6 +383,7 @@ const TABLE_COLS = {
   audit_log: 'id, actor_id, actor_name, action, target_id, detail, created_at',
   chat_logs: 'id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at',
   game_history: 'id, user_id, username, game, bet, result, amount, meta, created_at',
+  inventory: 'user_id, item_id, quantity, updated_at',
 };
 
 function sqliteRows(table) {
@@ -391,6 +407,7 @@ const TABLE_PKS = {
   audit_log: ['id'],
   chat_logs: ['id'],
   game_history: ['id'],
+  inventory: ['user_id', 'item_id'], // composite primary key
 };
 
 function mirrorTable(table) {
@@ -980,6 +997,59 @@ function dashboardStats() {
   };
 }
 
+/* ---------------- Shop / Inventory ---------------- */
+
+function mapInvRow(row) {
+  if (!row) return row;
+  return {
+    user_id: Number(row.user_id),
+    item_id: String(row.item_id),
+    quantity: Number(row.quantity) || 0,
+    updated_at: Number(row.updated_at) || 0,
+  };
+}
+
+/** All items a user owns: [{ item_id, quantity }]. */
+function getInventory(userId) {
+  return db.prepare('SELECT user_id, item_id, quantity, updated_at FROM inventory WHERE user_id = ? AND quantity > 0')
+    .all(userId).map(mapInvRow);
+}
+
+/** Quantity owned of one item (0 if none). */
+function getItemQty(userId, itemId) {
+  const row = db.prepare('SELECT quantity FROM inventory WHERE user_id = ? AND item_id = ?').get(userId, itemId);
+  return row ? Number(row.quantity) || 0 : 0;
+}
+
+/** Add (or subtract, if delta negative) quantity of an item. Never goes below 0. */
+function addItem(userId, itemId, delta = 1) {
+  const now = Date.now();
+  db.prepare(`
+    INSERT INTO inventory (user_id, item_id, quantity, updated_at) VALUES (?, ?, ?, ?)
+    ON CONFLICT(user_id, item_id) DO UPDATE SET
+      quantity = MAX(0, quantity + excluded.quantity),
+      updated_at = excluded.updated_at
+  `).run(userId, itemId, delta, now);
+  pgRun(
+    `INSERT INTO inventory (user_id, item_id, quantity, updated_at) VALUES ($1, $2, $3, $4)
+     ON CONFLICT (user_id, item_id) DO UPDATE SET
+       quantity = GREATEST(0, inventory.quantity + EXCLUDED.quantity),
+       updated_at = EXCLUDED.updated_at`,
+    [userId, itemId, delta, now]
+  );
+  return getItemQty(userId, itemId);
+}
+
+/** Remove `qty` of an item (returns new qty; clamps at 0). */
+function removeItem(userId, itemId, qty = 1) {
+  return addItem(userId, itemId, -qty);
+}
+
+/** True if the user owns at least `qty` of `itemId`. */
+function hasItem(userId, itemId, qty = 1) {
+  return getItemQty(userId, itemId) >= qty;
+}
+
 /* ---------------- Cleanup ---------------- */
 
 /** Clear expired temporary penalties (mute/suspend) — called periodically. */
@@ -1216,6 +1286,12 @@ module.exports = {
   logAudit,
   getAuditLog,
   dashboardStats,
+  // Shop / Inventory
+  getInventory,
+  getItemQty,
+  addItem,
+  removeItem,
+  hasItem,
   // Persistence
   initPersistence,
   syncInfo,

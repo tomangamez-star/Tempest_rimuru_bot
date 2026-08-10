@@ -113,7 +113,7 @@ async function play(ctx) {
     return;
   }
 
-  const sent = await reply(render(s), { html: true, reply_markup: keyboard(s) });
+  const sent = await reply(render(s), { html: true, reply_markup: keyboard(s), alwaysShowMarkup: true });
   return { sent, session: s };
 }
 
@@ -186,7 +186,9 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
   }
 
   // Still playing — update board
-  await editMsg(render(s), { parse_mode: 'HTML', reply_markup: keyboard(s) });
+  // alwaysShowMarkup: Hit/Stand/Double are GAMEPLAY buttons — they must
+  // render even when SHOW_INLINE_BUTTONS=false (fixes "no button to press").
+  await editMsg(render(s), { parse_mode: 'HTML', reply_markup: keyboard(s), alwaysShowMarkup: true });
   await answerCb('🎯 Dealt.');
 }
 

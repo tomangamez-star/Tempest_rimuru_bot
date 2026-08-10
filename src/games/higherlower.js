@@ -79,7 +79,7 @@ async function play(ctx) {
   cd.startGame(userId, 'higherlower', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
-  const sent = await reply(render(s), { html: true, reply_markup: keyboard(s) });
+  const sent = await reply(render(s), { html: true, reply_markup: keyboard(s), alwaysShowMarkup: true });
   return { sent, session: s };
 }
 
@@ -117,7 +117,9 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     s.streak++;
     s.current = next;
     const text = `${render(s)}\n\n✅ Correct! Next card was <b>${esc(cardStr(next))}</b>.`;
-    await editMsg(text, { parse_mode: 'HTML', reply_markup: keyboard(s) });
+    // alwaysShowMarkup: Higher/Lower/Cash-out are GAMEPLAY buttons — they
+    // must render even when SHOW_INLINE_BUTTONS=false (fixes "no button").
+    await editMsg(text, { parse_mode: 'HTML', reply_markup: keyboard(s), alwaysShowMarkup: true });
     await answerCb(`✅ Streak ${s.streak}`);
   } else {
     // Bust — lose initial bet + accumulated
