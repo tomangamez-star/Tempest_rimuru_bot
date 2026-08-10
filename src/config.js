@@ -164,9 +164,17 @@ const config = {
   // Mines
   mines: {
     grid: 5,
-    mineCount: 3,
-    multipliers: [1.25, 1.5, 1.75, 2.0, 2.25, 2.5, 2.75, 3.0, 3.5, 4.0, 4.5, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 12.0, 14.0, 16.0, 20.0, 25.0],
-    // index = number of safe picks BEFORE this pick → multiplier for next pick
+    // 4 mines total: only 3 are revealed when you blow up (the 4th stays
+    // hidden forever) and the board RE-RANDOMIZES after every safe pick.
+    mineCount: 4,
+    visibleMines: 3,
+    // The mines move after every safe pick — the board reshuffles each turn.
+    reshuffleAfterPick: true,
+    // Reward: no payout before the 1st move. Every safe pick adds +25% of the
+    // original wager to the cash-out. Cash-out = bet + bet × 0.25 × picks.
+    // multiplier for the NEXT pick = 1 + 0.25 × picks_completed.
+    multPerPick: 0.25,
+    maxPicks: 22, // 25 cells − 3 visible mines (the hidden 4th is never cleared)
   },
 
   // Slots

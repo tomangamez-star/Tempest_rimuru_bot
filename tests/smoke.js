@@ -163,15 +163,35 @@ test('roulette: straight payout 36x', () => {
   const r = roulette.spin(1000, 'straight', '7');
   if (r.win) assert.strictEqual(r.payout, 36000);
 });
-test('mines: multipliers climb', () => {
+test('mines: reward = wager + wager*0.25 per safe pick (none before 1st move)', () => {
   const s = mines.createSession(2001, 1000);
+  // 4 mines: 3 visible + 1 hidden
+  assert.strictEqual(s.mines.size, 4);
+  assert.strictEqual(mines.VISIBLE_MINES, 3);
+  assert.strictEqual(mines.MAX_PICKS, 22);
+  // NO reward before the 1st move: cash-out is exactly the wager, mult 1.00x
+  assert.strictEqual(mines.nextMult(s), 1.0);
+  assert.strictEqual(mines.currentWorth(s), 1000);
+  // 1st safe pick -> +25% of the wager (1000 -> 1250, mult 1.25x)
+  s.picks += 1;
   assert.strictEqual(mines.nextMult(s), 1.25);
-  s.revealed.add(0);
+  assert.strictEqual(mines.currentWorth(s), 1250);
+  // 2nd safe pick -> +250 more (total 1500, mult 1.50x)
+  s.picks += 1;
   assert.strictEqual(mines.nextMult(s), 1.5);
+  assert.strictEqual(mines.currentWorth(s), 1500);
+});
+test('mines: reshuffle never lands on revealed cells', () => {
+  const s = mines.createSession(2002, 5000);
+  s.revealed.add(0);
   s.revealed.add(1);
-  assert.ok(mines.currentWorth(s) > 1000 * 1.5);
-  // 3 mines, 22 safe cells max
-  assert.strictEqual(s.mines.size, 3);
+  for (let i = 0; i < 100; i++) {
+    mines.reshuffleMines(s);
+    assert.strictEqual(s.mines.size, 4);
+    for (const idx of s.revealed) {
+      assert.ok(!s.mines.has(idx), `mine landed on revealed cell ${idx}`);
+    }
+  }
 });
 test('blackjack: hand values & blackjack', () => {
   assert.strictEqual(blackjack.handValue(['A♠', 'K♠']), 21);
@@ -397,7 +417,9 @@ test('config: house edge and key numbers', () => {
   assert.strictEqual(config.startBalance, 500000);
   assert.strictEqual(config.lottery.ticketPrice, 10000);
   assert.strictEqual(config.lottery.minBuyers, 5);
-  assert.strictEqual(config.mines.mineCount, 3);
+  assert.strictEqual(config.mines.mineCount, 4);
+  assert.strictEqual(config.mines.visibleMines, 3);
+  assert.strictEqual(config.mines.multPerPick, 0.25);
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

@@ -460,7 +460,7 @@ function createBot() {
       text:
         `🎮 <b>GAMES — quick & light</b>\n\n` +
         `🪙 <b>Coin Flip</b> — /cf [heads|tails] [amount] · 2×\n` +
-        `💎 <b>Mines</b> — /mines [amount] · 5×5, multiplier climbs\n` +
+        `💎 <b>Mines</b> — /mines [amount] · 5×5, 4 mines (1 hidden) that MOVE after each pick\n` +
         `🎲 <b>Dice</b> — /dice [1-6] [amount] · 6× if you hit\n` +
         `📏 <b>Higher or Lower</b> — /hl [amount] · streak multiplier\n\n` +
         `👇 <i>Tap a game for details, or just type the command.</i>`,
@@ -511,7 +511,7 @@ function createBot() {
     slots: '🍒 <b>Slots</b>\n<code>/slots [amount]</code>\n3 reels — 2 match = 2×, 3 match = 4×. 🎰',
     lottery: '🎟️ <b>Lottery</b>\n<code>/lottery buy [tickets]</code>\nTicket = 10,000 coins. 5 buyers = draw. Pot grows with every ticket! 🤑',
     cf: '🪙 <b>Coin Flip</b>\n<code>/cf [heads|tails] [amount]</code>\nWin = double. 🍀',
-    mines: '💎 <b>Mines</b>\n<code>/mines [amount]</code>\n5×5 grid, 3 mines. Safe pick = multiplier climbs. Cash out anytime. 💣',
+    mines: '💎 <b>Mines</b>\n<code>/mines [amount]</code>\n5×5 grid, 4 mines (1 hidden) — the mines MOVE after every pick. +25% of your bet per safe pick. Cash out anytime. 💣',
     dice: '🎲 <b>Dice</b>\n<code>/dice [1-6] [amount]</code>\nAnimated dice — hit your number = 6×. Rare, but sweet. 😎',
     hl: '📏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
     guess: '🎯 <b>Guess the Number</b>\n<code>/guess [amount]</code>\nPick 1-10. 3 chances with higher/lower hints. 1st try = 5x, 2nd = 3x, 3rd = 2x. 🎲',
@@ -546,27 +546,32 @@ function createBot() {
   const handlers = {
     start: async (ctx) => {
       const u = eco.ensure(ctx.userId, metaOf(ctx.msg));
+      // Blockquote (notebook note) intro — Rimuru welcomes the user to the group.
       await ctx.reply(
-        `Welcome, ${u.first_name || 'mortal'}. The house always wins — but I'll let you play.\n` +
+        `Welcome to the Tempest house, <b>${u.first_name || 'mortal'}</b>. 🐉\n\n` +
+        `I'm <b>Rimuru Tempest</b> — the lord of this casino. The house always wins… but I'll let you play. ✨\n\n` +
         `You start with <b>${fmt(config.startBalance)}</b> coins. 💰\n\n` +
-        `🎮 Games: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /guess · /lottery · /race\n` +
-        `💼 Economy: /balance · /dep · /wd · /donate · /transfer\n` +
-        `🦹 Crime: /rob · /crime · /heist\n` +
-        `🛒 Shop: /shop · /buy · /inv\n` +
-        `💵 Income: /beg · /work · /fish · /dig · /daily · /bonus\n` +
-        `🏆 /lb — rich list · 📜 /menu — interactive menu\n\n` +
-        `⌨️ <i>Tap a button below (above your keyboard) or type a command.</i>\n` +
-        `☰ <i>The menu button next to the text box also lists all commands.</i>\n` +
-        `💬 <i>Reply to me or say "Rimuru" to talk directly.</i>`,
+        `Tap a button below to explore — or just type a command. 👇`,
         {
           title: '🐉 RIMURU TEMPEST CASINO',
           color: THEME.blue,
           html: true,
-          // Native reply keyboard appears automatically after /start —
-          // the grid above the phone keyboard (toggleable, not persistent).
-          reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('main') : undefined,
+          // Centered inline buttons (main menu) — always shown on /start.
+          reply_markup: MENU.main().markup,
+          alwaysShowMarkup: true,
         }
       );
+      // Native reply keyboard appears automatically after /start —
+      // the grid above the phone keyboard (toggleable, not persistent).
+      if (config.showReplyKeyboard) {
+        try {
+          await bot.sendMessage(ctx.chatId, '⌨️ Your quick-menu keyboard is ready below.', {
+            reply_markup: keyboards.keyboardFor('main'),
+          });
+        } catch (e) {
+          console.warn('[start] keyboard:', e.message);
+        }
+      }
       // GROUP GATE: even /start checks membership for non-staff — if they
       // haven't joined the required group yet, show the join prompt.
       if (!isStaff(ctx.userId)) {
@@ -605,7 +610,7 @@ function createBot() {
         `• /slots [amt] — 3 reels, 2×/4×\n` +
         `• /dice [1-6] [amt] — animated dice, 6×\n` +
         `• /cf [heads|tails] [amt] — 2×\n` +
-        `• /mines [amt] — 5×5 minefield, cash out anytime\n` +
+        `• /mines [amt] — 5×5, 4 mines (1 hidden) that MOVE after each pick, +25% per safe pick\n` +
         `• /bj [amt] — blackjack, 3:2 on blackjack\n` +
         `• /roulette [color|even|odd|low|high|dozen|column|straight|split] [amt]\n` +
         `• /hl [amt] — higher or lower, streak multiplier\n` +
@@ -628,6 +633,13 @@ function createBot() {
         `<b>💵 Income</b>\n` +
         `• /beg · /work · /fish · /dig — quick coins\n` +
         `• /daily — 24h · /bonus — weekly\n\n` +
+        `<b>🎣 Activities</b>\n` +
+        `• /fish — needs a Fishing Hook from /shop\n` +
+        `• /dig — treasure hunt\n\n` +
+        `<b>🕹️ Other</b>\n` +
+        `• /guess [amt] — pick 1-10, 3 chances, up to 5x\n` +
+        `• /race [amt] — race against the house\n` +
+        `• /verify — re-check your group membership\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -1154,11 +1166,13 @@ function createBot() {
         }
         if (page === 'help') {
           await replyThreaded(chatId, messageId,
-            `<b>🎮 Games</b>: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /lottery\n` +
+            `<b>🎮 Games</b>: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /guess · /race · /lottery\n` +
             `<b>💼 Economy</b>: /balance · /dep · /wd · /donate · /transfer\n` +
-            `<b>🦹 Crime</b>: /rob · /heist · /join\n` +
-            `<b>💵 Income</b>: /beg · /work · /fish · /dig · /daily · /bonus\n` +
-            `<b>🏆</b> /lb · <b>📜</b> /menu\n` +
+            `<b>🕵️ Crime</b>: /rob · /crime · /heist · /join\n` +
+            `<b>🛒 Shop</b>: /shop · /buy · /inv\n` +
+            `<b>🎣 Activities</b>: /fish · /dig\n` +
+            `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
+            `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
           await answerCb('');
