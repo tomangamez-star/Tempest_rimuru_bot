@@ -46,7 +46,8 @@ CREATE TABLE IF NOT EXISTS users (
   status_reason TEXT DEFAULT '',
   status_until INTEGER DEFAULT 0,         -- 0 = permanent
   hidden_until INTEGER DEFAULT 0,         -- hide-in-shadows expiry (ms epoch)
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT 0  -- version stamp: ONLY timestamp ordering decides which state wins
 );
 
 CREATE TABLE IF NOT EXISTS cooldowns (
@@ -189,6 +190,16 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 `);
 
+// ---- Safe migration for EXISTING SQLite DBs (CREATE IF NOT EXISTS won't add the column) ----
+// Every user-data write now stamps updated_at, so stale snapshots can NEVER
+// overwrite newer data in either direction (SQLite <-> Postgres).
+const USER_COLS = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+if (!USER_COLS.includes('updated_at')) {
+  db.exec('ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0');
+  // Backfill legacy rows with a sensible timestamp (their creation time).
+  db.exec("UPDATE users SET updated_at = created_at WHERE updated_at = 0");
+}
+
 /* ================= Postgres (durable store) ================= */
 
 const DATABASE_URL = (config.databaseUrl || '').trim();
@@ -254,7 +265,8 @@ CREATE TABLE IF NOT EXISTS users (
   status_reason TEXT DEFAULT '',
   status_until  BIGINT DEFAULT 0,
   hidden_until  BIGINT DEFAULT 0,
-  created_at    BIGINT NOT NULL
+  created_at    BIGINT NOT NULL,
+  updated_at    BIGINT NOT NULL DEFAULT 0  -- version stamp: ONLY timestamp ordering decides which state wins
 );
 CREATE TABLE IF NOT EXISTS cooldowns (
   user_id BIGINT NOT NULL,
@@ -382,10 +394,28 @@ CREATE TABLE IF NOT EXISTS settings (
 );
 `;
 
+// Safe migration for EXISTING Postgres DBs (CREATE TABLE IF NOT EXISTS is
+// a no-op when the table already exists, so the new column must be added
+// explicitly). Failures are tolerated — a fresh deploy of the new code will
+// stamp updated_at on every write anyway.
+const PG_ALTERS = [
+  "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0",
+  "UPDATE users SET updated_at = created_at WHERE updated_at = 0",
+];
+
 /** Create Postgres tables (idempotent). Returns true on success. */
 async function initPg() {
   if (!pool) return false;
   try {
+    // Migrate existing tables first (add updated_at to users on old DBs),
+    // then create any missing tables.
+    for (const stmt of PG_ALTERS) {
+      try {
+        await pool.query(stmt);
+      } catch (e) {
+        console.error('[db] pg migration skipped:', stmt.split(' ').slice(0, 2).join(' '), '->', e.message);
+      }
+    }
     await pool.query(PG_SCHEMA);
     return true;
   } catch (e) {
@@ -533,7 +563,7 @@ function pgRun(table, sql, params = []) {
 /* ================= Table mirror helpers ================= */
 
 const TABLE_COLS = {
-  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, hidden_until, created_at',
+  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, hidden_until, created_at, updated_at',
   cooldowns: 'user_id, action, until',
   lottery: 'id, pot, ticket_count, tickets',
   heists: 'leader_id, leader_name, target_id, target_name, members, started_at, status',
@@ -599,9 +629,17 @@ function mirrorTable(table) {
         const pkCols = TABLE_PKS[table] || [cols[0]];
         const updateCols = cols.filter((c) => !pkCols.includes(c)).map((c) => `${c} = EXCLUDED.${c}`).join(', ');
         if (!updateCols) continue; // nothing to update (all-PK row) — skip
+        // VERSIONED MERGE: for tables with an updated_at column, only let the
+        // SQLite copy overwrite the Postgres row when it is NOT older than what
+        // Postgres already has. A stale snapshot can therefore never clobber a
+        // newer write — the periodic full-sync loop is now safe to run forever.
+        const versioned = VERSIONED_TABLES.has(table) && cols.includes('updated_at');
+        const whereClause = versioned
+          ? ` WHERE ${table}.updated_at <= EXCLUDED.updated_at`
+          : '';
         await client.query(
           `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
-           ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols}`,
+           ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols}${whereClause}`,
           cols.map((c) => row[c])
         );
       }
@@ -655,7 +693,39 @@ function mapUser(row) {
     status_until: Number(row.status_until) || 0,
     hidden_until: Number(row.hidden_until) || 0,
     created_at: Number(row.created_at) || 0,
+    updated_at: Number(row.updated_at) || 0,
   };
+}
+
+/* ---------------- Versioned writes (rollback fix) ---------------- */
+
+/**
+ * Tables that carry an `updated_at` version column and therefore use
+ * TIMESTAMP-ORDERED merging in BOTH directions (SQLite <-> Postgres).
+ * ONLY timestamp ordering decides which state wins — never value comparison
+ * (legitimate purchases/bets/losses can decrease balances).
+ */
+const VERSIONED_TABLES = new Set(['users']);
+
+function nowStamp() {
+  return Date.now();
+}
+
+/** Stamp `updated_at` on a user row — always NEWER than any previous write. */
+function touchUser(userId, stamp = nowStamp()) {
+  db.prepare('UPDATE users SET updated_at = ? WHERE user_id = ?').run(stamp, userId);
+  return stamp;
+}
+
+/**
+ * Diagnostic logging for every persistent user-data write:
+ * timestamp, user id, operation, previous value, new value, source function.
+ * (Added during the rollback investigation — observability, never a write blocker.)
+ */
+function logDbWrite(userId, op, prevVal, newVal, src) {
+  try {
+    console.log(`[db-write] t=${Date.now()} user=${userId} op=${op} prev=${prevVal} new=${newVal} src=${src}`);
+  } catch (e) { /* logging must never break a write */ }
 }
 
 /* ---------------- Users ---------------- */
@@ -664,16 +734,20 @@ function getOrCreateUser(userId, meta = {}) {
   let row = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
   if (row) {
     if (meta.username || meta.first_name) {
-      db.prepare('UPDATE users SET username = ?, first_name = ? WHERE user_id = ?')
-        .run(meta.username || row.username, meta.first_name || row.first_name, userId);
+      const stamp = nowStamp();
+      db.prepare('UPDATE users SET username = ?, first_name = ?, updated_at = ? WHERE user_id = ?')
+        .run(meta.username || row.username, meta.first_name || row.first_name, stamp, userId);
       const updated = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
+      logDbWrite(userId, 'updateProfile', '', 'meta', 'getOrCreateUser');
       mirrorTable('users');
       return mapUser(updated);
     }
     return mapUser(row);
   }
-  db.prepare('INSERT INTO users (user_id, username, first_name, wallet, bank, status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
-    .run(userId, meta.username || '', meta.first_name || '', config.startBalance, 0, 'active', Date.now());
+  const now = nowStamp();
+  db.prepare('INSERT INTO users (user_id, username, first_name, wallet, bank, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+    .run(userId, meta.username || '', meta.first_name || '', config.startBalance, 0, 'active', now, now);
+  logDbWrite(userId, 'createUser', 0, config.startBalance, 'getOrCreateUser');
   mirrorTable('users');
   return mapUser(db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId));
 }
@@ -688,40 +762,53 @@ function getNetWorth(userId) {
   return u.wallet + u.bank;
 }
 
-function setWallet(userId, amount) {
-  db.prepare('UPDATE users SET wallet = ? WHERE user_id = ?').run(amount, userId);
+function setWallet(userId, amount, src = 'setWallet') {
+  const prev = getUser(userId);
+  db.prepare('UPDATE users SET wallet = ?, updated_at = ? WHERE user_id = ?').run(amount, nowStamp(), userId);
+  logDbWrite(userId, 'setWallet', prev ? prev.wallet : 0, amount, src);
   mirrorTable('users');
 }
 
-function setBank(userId, amount) {
-  db.prepare('UPDATE users SET bank = ? WHERE user_id = ?').run(amount, userId);
+function setBank(userId, amount, src = 'setBank') {
+  const prev = getUser(userId);
+  db.prepare('UPDATE users SET bank = ?, updated_at = ? WHERE user_id = ?').run(amount, nowStamp(), userId);
+  logDbWrite(userId, 'setBank', prev ? prev.bank : 0, amount, src);
   mirrorTable('users');
 }
 
 /** Atomically add to wallet (positive or negative). Returns new wallet. */
-function addWallet(userId, delta) {
-  db.prepare('UPDATE users SET wallet = wallet + ? WHERE user_id = ?').run(delta, userId);
+function addWallet(userId, delta, src = 'addWallet') {
+  const prev = getUser(userId);
+  db.prepare('UPDATE users SET wallet = wallet + ?, updated_at = ? WHERE user_id = ?').run(delta, nowStamp(), userId);
+  const after = getUser(userId).wallet;
+  logDbWrite(userId, 'addWallet', prev ? prev.wallet : 0, after, src);
   mirrorTable('users');
-  return getUser(userId).wallet;
+  return after;
 }
 
 /** Atomically add to bank. Returns new bank. */
-function addBank(userId, delta) {
-  db.prepare('UPDATE users SET bank = bank + ? WHERE user_id = ?').run(delta, userId);
+function addBank(userId, delta, src = 'addBank') {
+  const prev = getUser(userId);
+  db.prepare('UPDATE users SET bank = bank + ?, updated_at = ? WHERE user_id = ?').run(delta, nowStamp(), userId);
+  const after = getUser(userId).bank;
+  logDbWrite(userId, 'addBank', prev ? prev.bank : 0, after, src);
   mirrorTable('users');
-  return getUser(userId).bank;
+  return after;
 }
 
 function setStatus(userId, status, reason, until = 0) {
-  db.prepare('UPDATE users SET status = ?, status_reason = ?, status_until = ? WHERE user_id = ?')
-    .run(status, reason || '', until, userId);
+  db.prepare('UPDATE users SET status = ?, status_reason = ?, status_until = ?, updated_at = ? WHERE user_id = ?')
+    .run(status, reason || '', until, nowStamp(), userId);
+  logDbWrite(userId, 'setStatus', '', status, 'setStatus');
   mirrorTable('users');
 }
 
 /** /hide — vanish from rob/heist targeting until `untilTs` (ms epoch). */
 function setHidden(userId, untilTs) {
-  db.prepare('UPDATE users SET hidden_until = ? WHERE user_id = ?').run(untilTs || 0, userId);
-  pgRun('users', 'UPDATE users SET hidden_until = $1 WHERE user_id = $2', [untilTs || 0, userId]);
+  const stamp = nowStamp();
+  db.prepare('UPDATE users SET hidden_until = ?, updated_at = ? WHERE user_id = ?').run(untilTs || 0, stamp, userId);
+  logDbWrite(userId, 'setHidden', '', untilTs || 0, 'setHidden');
+  pgRun('users', 'UPDATE users SET hidden_until = $1, updated_at = $2 WHERE user_id = $3', [untilTs || 0, stamp, userId]);
 }
 
 /** True while the user's hide is still active. */
@@ -737,7 +824,8 @@ function getAllUsers() {
 }
 
 function clearStatus(userId) {
-  db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0 WHERE user_id = ?").run(userId);
+  db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0, updated_at = ? WHERE user_id = ?").run(nowStamp(), userId);
+  logDbWrite(userId, 'clearStatus', '', 'active', 'clearStatus');
   mirrorTable('users');
 }
 
@@ -1444,7 +1532,7 @@ function expirePenalties() {
     WHERE status IN ('muted','suspected') AND status_until > 0 AND status_until <= ?
   `).all(now);
   for (const u of expired) {
-    db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0 WHERE user_id = ?").run(u.user_id);
+    db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0, updated_at = ? WHERE user_id = ?").run(nowStamp(), u.user_id);
   }
   if (expired.length) mirrorTable('users');
   return expired.map((u) => ({ ...u, user_id: Number(u.user_id) }));
@@ -1466,6 +1554,26 @@ function expirePenalties() {
  * the write pipeline was healthy, but the READ path was overwriting fresh
  * data with the stale cache on boot.
  */
+/**
+ * Copy Postgres rows back into SQLite (used on boot so the cache starts from
+ * the durable store). VERSIONED MERGE:
+ *
+ *  - For tables with an `updated_at` column (VERSIONED_TABLES), a PG row is
+ *    applied ONLY when its updated_at is NEWER than the local SQLite row's.
+ *    If the LOCAL row is newer, the local value is kept (it will be pushed
+ *    back up by the periodic mirror — no data is lost in either direction).
+ *  - ONLY timestamp ordering decides which state wins — NEVER value
+ *    comparison: legitimate purchases, bets, losses and withdrawals can
+ *    legitimately DECREASE balances, so a lower balance is never treated as
+ *    stale.
+ *  - Non-versioned tables keep the previous upsert behavior (they are
+ *    append-only logs / singleton rows where conflict is harmless).
+ *
+ * This is the permanent fix for the periodic rollback: the old implementation
+ * used INSERT OR REPLACE on every boot, so a boot racing the 1.5s sync loop
+ * could overwrite a fresh balance with a PG snapshot that was one mirror tick
+ * stale.
+ */
 async function hydrateFromPg() {
   if (!pool) return 0;
   let restored = 0;
@@ -1476,12 +1584,25 @@ async function hydrateFromPg() {
         const cols = colsStr.split(', ');
         const { rows } = await client.query(`SELECT ${colsStr} FROM ${table}`);
         if (!rows.length) continue;
-        const upsert = db.prepare(
-          `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
-        );
+        const versioned = VERSIONED_TABLES.has(table) && cols.includes('updated_at');
         for (const r of rows) {
-          const vals = cols.map((c) => r[c]);
-          upsert.run(...vals);
+          const pkCols = TABLE_PKS[table] || [cols[0]];
+          const local = db.prepare(
+            `SELECT ${cols.join(', ')} FROM ${table} WHERE ${pkCols.map((c) => `${c} = ?`).join(' AND ')}`
+          ).get(...pkCols.map((c) => r[c]));
+          if (versioned && local) {
+            // Merge by version: only apply the PG row if it is NEWER than the
+            // local row. Never overwrite newer local data with older PG data.
+            const pgStamp = Number(r.updated_at) || 0;
+            const localStamp = Number(local.updated_at) || 0;
+            if (pgStamp <= localStamp) {
+              continue; // local copy is newer/equal — keep it (mirror will push it up)
+            }
+          }
+          const upsert = db.prepare(
+            `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+          );
+          upsert.run(...cols.map((c) => r[c]));
           restored++;
         }
       }
@@ -1533,6 +1654,49 @@ let reinitTimer = null;
 const PG_RETRY_MS = 15000; // background reconnect/hydrate retry when PG is configured but unreachable
 
 /**
+ * Rollback-fix guard: while a hydration is in flight this flag is set so the
+ * periodic sync loop can NEVER fire mid-hydration and push a half-merged
+ * cache up to Postgres. hydrationToken is compared-and-swapped so concurrent
+ * callers (boot + reconnect) cannot double-hydrate.
+ */
+let hydrating = false;
+let hydrationToken = 0;
+
+/** Run a hydration, keeping `hydrating` set for its whole duration. */
+async function runHydration(label) {
+  const token = ++hydrationToken;
+  hydrating = true;
+  try {
+    const hydrated = await hydrateFromPg();
+    console.log(`[db] ${label}: hydrated ${hydrated} rows from Postgres into SQLite.`);
+    return hydrated;
+  } finally {
+    if (token === hydrationToken) hydrating = false;
+  }
+}
+
+/** True while a hydration is running (sync loop must wait). */
+function isHydrating() {
+  return hydrating;
+}
+
+/**
+ * Start the periodic full-sync loop. It refuses to start while a hydration is
+ * in flight, so the SQLite cache is always fully merged before anything is
+ * pushed up to Postgres.
+ */
+function startSyncLoop() {
+  if (syncTimer || hydrating) return syncTimer;
+  syncTimer = setInterval(() => {
+    if (hydrating) return; // belt-and-braces: never push mid-hydration
+    lastMirrorAt = Date.now();
+    mirrorAll();
+  }, Math.max(config.dbSyncIntervalMs, 500));
+  syncTimer.unref && syncTimer.unref();
+  return syncTimer;
+}
+
+/**
  * Init the Postgres mirror: create tables, hydrate SQLite from Postgres, then
  * start the periodic full-sync loop. Call once from src/index.js before the
  * bot starts. Resolves { enabled, hydrated }.
@@ -1563,16 +1727,13 @@ async function initPersistence() {
       pgFailures = 0;
       pgLastError = '';
       console.log('[db] Postgres ready — hydrating SQLite cache from Postgres…');
-      const hydrated = await hydrateFromPg();
-      console.log(`[db] Hydrated ${hydrated} rows from Postgres into SQLite.`);
+      // Hydration MUST fully complete BEFORE the sync loop starts (rollback
+      // fix): the loop can never push a half-merged cache up to Postgres.
+      const hydrated = await runHydration('Hydrated');
       // Push any local-only rows (new users created before pg connected) up.
       mirrorAll();
       // Periodic full mirror so big tables (chat_logs, game_history) converge.
-      syncTimer = setInterval(() => {
-        lastMirrorAt = Date.now();
-        mirrorAll();
-      }, Math.max(config.dbSyncIntervalMs, 500));
-      syncTimer.unref && syncTimer.unref();
+      startSyncLoop();
       return { enabled: true, hydrated };
     } catch (e) {
       console.error(
@@ -1603,18 +1764,11 @@ function schedulePgRetry() {
         pgFailures = 0;
         pgLastError = '';
         console.log('[db] ✅ Postgres connection restored — hydrating SQLite from Postgres…');
-        const hydrated = await hydrateFromPg();
-        console.log(`[db] Re-hydrated ${hydrated} rows from Postgres.`);
+        const hydrated = await runHydration('Re-hydrated');
         pgInitPromise = null;
         mirrorAll();
         // Restart the periodic full-sync loop if it is not running.
-        if (!syncTimer) {
-          syncTimer = setInterval(() => {
-            lastMirrorAt = Date.now();
-            mirrorAll();
-          }, Math.max(config.dbSyncIntervalMs, 500));
-          syncTimer.unref && syncTimer.unref();
-        }
+        startSyncLoop();
       } else {
         // initPg() failed — retry later (initPg already logged the reason).
         pgConnectivity = 'degraded';
@@ -1717,6 +1871,7 @@ module.exports = {
   // Persistence
   initPersistence,
   hydrateFromPg,
+  mirrorTable,
   syncInfo,
   ping,
   close,
