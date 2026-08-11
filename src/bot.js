@@ -1090,6 +1090,10 @@ function createBot() {
         const pgStatus = pInfo.configured
           ? (pInfo.ready && pInfo.connected ? `✅ connected (${pInfo.host}:${pInfo.port})` : `❌ ${pInfo.host}:${pInfo.port} — ${pInfo.lastPgError || 'connecting…'}`)
           : 'off (SQLite-only, ephemeral)';
+        // Verified write-through status — shows whether writes actually LAND in Postgres.
+        const verified = pInfo.configured
+          ? `✅ writes: ${pInfo.writesOk} · failures: ${pInfo.writesFailed} · last write ${pInfo.lastWriteAt ? `${Math.floor((Date.now() - pInfo.lastWriteAt) / 1000)}s ago` : 'never'} · verified ${pInfo.lastVerifyAt ? `${Math.floor((Date.now() - pInfo.lastVerifyAt) / 1000)}s ago` : 'never'}`
+          : 'n/a';
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
@@ -1100,6 +1104,7 @@ function createBot() {
           `⏳ <b>Active cooldowns</b>: ${fmt(cdCount)}`,
           `🔒 <b>Required group</b>: ${config.requiredGroup || 'off'} (chat ${gid || 'unresolved'})`,
           `🗄 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'})` : ''}`,
+          `✔️ <b>Verified writes</b>: ${verified}`,
           `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
           `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
         ];
@@ -1122,6 +1127,10 @@ function createBot() {
         const pgStatus = pInfo.configured
           ? (pInfo.ready && pInfo.connected ? `✅ connected (${pInfo.host}:${pInfo.port})` : `❌ ${pInfo.host}:${pInfo.port} — ${pInfo.lastPgError || 'connecting…'}`)
           : 'off (SQLite-only, ephemeral)';
+        // Verified write-through status — shows whether writes actually LAND in Postgres.
+        const verified = pInfo.configured
+          ? `✅ writes: ${pInfo.writesOk} · failures: ${pInfo.writesFailed} · last write ${pInfo.lastWriteAt ? `${Math.floor((Date.now() - pInfo.lastWriteAt) / 1000)}s ago` : 'never'} · verified ${pInfo.lastVerifyAt ? `${Math.floor((Date.now() - pInfo.lastVerifyAt) / 1000)}s ago` : 'never'}`
+          : 'n/a';
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
@@ -1130,6 +1139,7 @@ function createBot() {
           `👪 <b>Groups</b>: ${fmt(stats.totalGroups)}`,
           `💰 <b>Coins in circulation</b>: ${fmt(stats.coinsInCirculation)}`,
           `🗄 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'})` : ''}`,
+          `✔️ <b>Verified writes</b>: ${verified}`,
           `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
           `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
         ];

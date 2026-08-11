@@ -10,44 +10,64 @@
  * Tapping a button sends its text as a NORMAL message, which bot.js maps
  * back to the matching command (see BUTTON_COMMANDS).
  *
+ * NATIVE COLORED BUTTONS (Bot API 9.4 — KeyboardButton.style):
+ *   Telegram's ReplyKeyboardMarkup supports `KeyboardButton.style` with the
+ *   values bg_primary (blue), bg_danger (red), bg_success (green). The
+ *   Telegram client renders the ACTUAL colored keyboard UI; the bot only
+ *   sends the ReplyKeyboardMarkup with the appropriate styles. We do NOT
+ *   fake colors with emoji, do NOT build an inline keyboard, and do NOT use
+ *   the three-line menu.
+ *
+ *   - bg_success (green) — safe economy actions (balance/bank/income/fish)
+ *   - bg_primary (blue)  — navigation & games (casino/games/shop/profile)
+ *   - bg_danger  (red)   — risk actions (crime/mines/back)
+ *
+ *   The original emoji labels (💰 Balance, 🎰 Slots, ...) are kept ON TOP
+ *   of the colored backgrounds.
+ *
  * Design:
  *   - Main keyboard (shown after /start): 3 rows × 2 buttons.
  *   - Sub-keyboards (Casino / Games / Economy): replace the main one in
- *     the same space; each has a 🔙 Back button returning to main.
+ *     the same space; each has a ↩ Back button returning to main.
  *   - NOT persistent (is_persistent: false) — the user can hide/unhide it
  *     with Telegram's keyboard toggle button.
  *   - Stays open after each tap (one_time_keyboard: false) — it only closes
  *     when the user taps the typing box or the toggle button.
  */
-const config = require('./config');
+
+/* Bot API 9.4 KeyboardButton.style values */
+const STYLE = {
+  PRIMARY: 'bg_primary', // blue
+  DANGER: 'bg_danger',   // red
+  SUCCESS: 'bg_success', // green
+};
 
 /* ---- button labels (must EXACTLY match what users tap) ----
- * Colored emoji prefixes fake color-coding (Telegram reply keyboards have
- * no native colors): 🟡 games/caution, 🔴 risk, 🟢 safe, 🟣 special,
- * ⚫ neutral, 🔵 navigation. */
+ * Original emoji labels — the native colored background is applied via
+ * KeyboardButton.style (bg_success / bg_primary / bg_danger). */
 const B = {
-  casino: '\ud83d\udfe3 Casino',
-  games: '\ud83d\udfe3 Games',
-  balance: '\ud83d\udfe2 Balance',
-  economy: '\ud83d\udfe2 Economy',
-  leaderboard: '\ud83c\udfc6 Leaderboard',
-  help: '\ud83d\udd35 Help',
-  slots: '\ud83d\udfe1 Slots',
-  blackjack: '\ud83d\udfe1 Blackjack',
-  roulette: '\ud83d\udfe1 Roulette',
-  race: '\ud83d\udfe1 Race',
-  dice: '\ud83d\udfe1 Dice',
-  coinflip: '\ud83d\udfe1 Coin Flip',
-  mines: '\ud83d\udd34 Mines',
-  higherlower: '\ud83d\udfe1 Higher/Lower',
-  lottery: '\ud83d\udfe1 Lottery',
-  bank: '\ud83d\udfe2 Bank',
-  income: '\ud83d\udfe2 Income',
-  shop: '\ud83d\udfe3 Shop',
-  crime: '\ud83d\udd34 Crime',
-  fish: '\ud83d\udfe2 Fish',
-  profile: '\ud83d\udfe3 Profile',
-  back: '\u26ab Back',
+  casino: '🎰 Casino',
+  games: '🎮 Games',
+  balance: '💰 Balance',
+  economy: '💼 Economy',
+  leaderboard: '🏆 Leaderboard',
+  help: '❓ Help',
+  slots: '🎰 Slots',
+  blackjack: '🃏 Blackjack',
+  roulette: '🎡 Roulette',
+  race: '🏁 Race',
+  dice: '🎲 Dice',
+  coinflip: '🪙 Coin Flip',
+  mines: '💣 Mines',
+  higherlower: '📈 Higher/Lower',
+  lottery: '🎟️ Lottery',
+  bank: '🏦 Bank',
+  income: '💵 Income',
+  shop: '🛒 Shop',
+  crime: '🕵️ Crime',
+  fish: '🎣 Fish',
+  profile: '🪪 Profile',
+  back: '↩️ Back',
 };
 
 /**
@@ -81,12 +101,51 @@ const BUTTON_COMMANDS = {
 };
 
 /**
- * Build a native reply-keyboard markup object.
+ * Per-button native style (Bot API 9.4 KeyboardButton.style):
+ *   - bg_success (green) — safe economy actions
+ *   - bg_primary (blue)  — navigation & games
+ *   - bg_danger  (red)   — risk actions & back
+ * The Telegram client renders the actual colored UI from these values.
+ */
+const BUTTON_STYLES = {
+  [B.casino]: STYLE.PRIMARY,
+  [B.games]: STYLE.PRIMARY,
+  [B.balance]: STYLE.SUCCESS,
+  [B.economy]: STYLE.SUCCESS,
+  [B.leaderboard]: STYLE.SUCCESS,
+  [B.help]: STYLE.PRIMARY,
+  [B.slots]: STYLE.PRIMARY,
+  [B.blackjack]: STYLE.PRIMARY,
+  [B.roulette]: STYLE.PRIMARY,
+  [B.race]: STYLE.PRIMARY,
+  [B.dice]: STYLE.PRIMARY,
+  [B.coinflip]: STYLE.PRIMARY,
+  [B.mines]: STYLE.DANGER,
+  [B.higherlower]: STYLE.PRIMARY,
+  [B.lottery]: STYLE.PRIMARY,
+  [B.bank]: STYLE.SUCCESS,
+  [B.income]: STYLE.SUCCESS,
+  [B.shop]: STYLE.PRIMARY,
+  [B.crime]: STYLE.DANGER,
+  [B.fish]: STYLE.SUCCESS,
+  [B.profile]: STYLE.PRIMARY,
+  [B.back]: STYLE.DANGER,
+};
+
+/**
+ * Build a native reply-keyboard markup object with colored KeyboardButtons.
  * @param {string[][]} rows rows of button LABELS (strings)
+ * Each button gets { text, style } — style is one of the Bot API 9.4
+ * KeyboardButton.style values (bg_primary | bg_danger | bg_success).
  */
 function kb(rows) {
   return {
-    keyboard: rows.map((row) => row.map((label) => ({ text: label }))),
+    keyboard: rows.map((row) =>
+      row.map((label) => ({
+        text: label,
+        style: BUTTON_STYLES[label] || STYLE.PRIMARY,
+      }))
+    ),
     resize_keyboard: true,
     is_persistent: false,
     one_time_keyboard: false,
@@ -102,20 +161,20 @@ const mainKeyboard = () =>
     [B.leaderboard, B.help],
   ]);
 
-/** 🎮 Games sub-keyboard. */
-const gamesKeyboard = () =>
-  kb([
-    [B.dice, B.coinflip],
-    [B.mines, B.higherlower],
-    [B.lottery, B.back],
-  ]);
-
 /** 🎰 Casino sub-keyboard. */
 const casinoKeyboard = () =>
   kb([
     [B.slots, B.blackjack],
     [B.roulette, B.race],
     [B.back],
+  ]);
+
+/** 🎮 Games sub-keyboard. */
+const gamesKeyboard = () =>
+  kb([
+    [B.dice, B.coinflip],
+    [B.mines, B.higherlower],
+    [B.lottery, B.back],
   ]);
 
 /** 💼 Economy sub-keyboard. */
@@ -152,7 +211,9 @@ function routeButton(text) {
 
 module.exports = {
   B,
+  STYLE,
   BUTTON_COMMANDS,
+  BUTTON_STYLES,
   kb,
   mainKeyboard,
   casinoKeyboard,

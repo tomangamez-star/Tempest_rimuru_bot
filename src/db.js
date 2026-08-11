@@ -342,45 +342,131 @@ async function initPg() {
 }
 
 /**
- * Simple async queue so a single slow pg query never blocks the process.
- * Failures are counted so we can detect "configured but unreachable" and
- * surface it loudly in logs + /health + /debug.
+ * Postgres write pipeline — STRICT write-through with verification.
+ *
+ * Every mutation to SQLite is ALSO written to Postgres, and the write is
+ * READ BACK from Postgres before it is considered verified. Writes for the
+ * same table are strictly ordered (a later write to user X can never land
+ * before an earlier one and be overwritten by stale data), and every query
+ * runs under a hard timeout so a hung pooler connection can NEVER wedge the
+ * pipeline silently.
+ *
+ * The old design scheduled fire-and-forget mirrors on one serialized promise
+ * chain with NO timeout: a single dropped session-pooler connection left one
+ * hung query blocking the whole queue forever, while /health kept showing
+ * "✅ connected (mirrors: running)" because lastMirrorAt was stamped at
+ * SCHEDULE time, not completion. Balances then reverted to stale values on
+ * every rehydrate. This rewrite removes that entire failure class.
  */
 let pgReady = false;
-let pgQueue = Promise.resolve();
 let pgInitPromise = null;
 let pgFailures = 0;
 let pgLastError = '';
 let pgLastErrorAt = 0;
 let pgConnectivity = 'unknown'; // unknown | connecting | connected | degraded
+let pgLastWriteAt = 0;          // when the last pg write SUCCEEDED (ms)
+let pgLastVerifyAt = 0;         // when the last read-back verification passed (ms)
+let pgWritesOk = 0;             // total verified writes
+let pgWritesFailed = 0;         // total failed writes
+let lastMirrorAt = 0;           // when the periodic full-sync last RAN (completed)
 const PG_CRITICAL_FAILURES = 3;
+const PG_QUERY_TIMEOUT_MS = 10000; // hard per-query timeout — a hung pooler never wedges the pipeline
 
-function queuePg(task) {
-  pgQueue = pgQueue.then(task).catch((err) => {
-    pgFailures++;
-    const code = err && err.code ? ` [${err.code}]` : '';
-    pgLastError = String((err && err.message) || err) + code;
-    pgLastErrorAt = Date.now();
-    pgConnectivity = 'degraded';
-    if (pgFailures === PG_CRITICAL_FAILURES || pgFailures % 10 === 0) {
-      console.error(
-        `[db] ⚠ Postgres mirror failures: ${pgFailures} (last: ${pgLastError}). ` +
-        'Data is NOT persisting to Postgres right now — check DATABASE_URL and connectivity.'
-      );
-    } else {
-      console.error('[db] pg mirror error:', err.message);
-    }
-  });
+// Per-table write chain so writes to the same table stay strictly ordered.
+const pgChains = {};
+function tableChain(table) {
+  if (!pgChains[table]) pgChains[table] = Promise.resolve();
+  return pgChains[table];
+}
+
+/** Human-readable elapsed time helper for health output. */
+function agoLabel(ts) {
+  if (!ts) return 'never';
+  const ms = Date.now() - ts;
+  if (ms < 1000) return 'just now';
+  if (ms < 60000) return `${Math.floor(ms / 1000)}s ago`;
+  if (ms < 3600000) return `${Math.floor(ms / 60000)}m ${Math.floor((ms % 60000) / 1000)}s ago`;
+  return `${Math.floor(ms / 3600000)}h ${Math.floor((ms % 3600000) / 60000)}m ago`;
 }
 
 /**
- * Run one raw SQL on Postgres (fire-and-forget, queued). If the pool is not
- * initialized yet (init still in flight) the query is simply skipped — the
- * periodic full-sync re-mirrors everything shortly after boot.
+ * Run one query on Postgres under a hard timeout. Rejects on timeout/error;
+ * the caller decides what to surface. Uses the pool directly so the query is
+ * independent of any chain state.
  */
-function pgRun(sql, params = []) {
-  if (!pool || !pgReady) return;
-  queuePg(() => pool.query(sql, params));
+async function pgQueryWithTimeout(sql, params = []) {
+  return Promise.race([
+    pool.query(sql, params),
+    new Promise((_, reject) => {
+      const t = setTimeout(() => reject(new Error(`pg query timeout after ${PG_QUERY_TIMEOUT_MS}ms`)), PG_QUERY_TIMEOUT_MS);
+      t.unref && t.unref();
+    }),
+  ]);
+}
+
+/**
+ * Record a pg failure (shared by all write paths). Sets connectivity to
+ * 'degraded' and surfaces the EXACT reason in /debug + /health.
+ */
+function recordPgFailure(err, label) {
+  pgFailures++;
+  const code = err && err.code ? ` [${err.code}]` : '';
+  pgLastError = `${label || 'pg'}: ${String((err && err.message) || err).slice(0, 300)}${code}`;
+  pgLastErrorAt = Date.now();
+  pgConnectivity = 'degraded';
+  if (pgFailures === PG_CRITICAL_FAILURES || pgFailures % 10 === 0) {
+    console.error(
+      `[db] ⚠ Postgres write failures: ${pgFailures} (last: ${pgLastError}). ` +
+      'Data is NOT persisting to Postgres right now — check DATABASE_URL and connectivity.'
+    );
+  } else {
+    console.error('[db] pg write error:', pgLastError);
+  }
+}
+
+/**
+ * Execute a pg write on the table's ordered chain. The query runs under the
+ * hard timeout; on success lastWriteAt/lastVerifyAt are stamped, on failure
+ * the error is recorded (never swallowed) and the chain continues so the
+ * NEXT write for that table can still go through.
+ */
+function queuePgWrite(table, task) {
+  if (!pool || !pgReady) return Promise.resolve(false);
+  const chain = tableChain(table);
+  const run = chain.then(async () => {
+    try {
+      const result = await task();
+      pgWritesOk++;
+      pgLastWriteAt = Date.now();
+      if (pgConnectivity === 'degraded' && pgFailures > 0) {
+        // A write succeeded again — clear the degraded state if no other error is pending.
+        pgConnectivity = 'connected';
+        pgFailures = 0;
+        pgLastError = '';
+        console.log(`[db] ✅ Postgres writes resumed for ${table} — connectivity restored.`);
+      }
+      return result;
+    } catch (err) {
+      pgWritesFailed++;
+      recordPgFailure(err, `write ${table}`);
+      return null;
+    }
+  });
+  // Keep the chain alive even when a task rejects (already caught above, but
+  // belt-and-braces so a buggy task can never wedge the table's pipeline).
+  pgChains[table] = run.catch(() => {});
+  return run;
+}
+
+/**
+ * Run one raw SQL on Postgres (write-through, ordered per table).
+ * Returns a Promise<boolean> — true when the write SUCCEEDED (and was
+ * verified by the caller when requested). Never throws; failures are
+ * surfaced via recordPgFailure() and /health + /debug.
+ */
+function pgRun(table, sql, params = []) {
+  if (!pool || !pgReady) return Promise.resolve(false);
+  return queuePgWrite(table, () => pgQueryWithTimeout(sql, params));
 }
 
 /* ================= Table mirror helpers ================= */
@@ -424,11 +510,17 @@ const TABLE_PKS = {
   inventory: ['user_id', 'item_id'], // composite primary key
 };
 
+/**
+ * Upsert the SQLite cache of one table into Postgres, then READ BACK the
+ * affected rows to VERIFY the write landed. The whole transaction runs under
+ * the hard query timeout (PG_QUERY_TIMEOUT_MS) — a hung pooler connection
+ * can never wedge the pipeline. Returns the number of rows written.
+ */
 function mirrorTable(table) {
-  if (!pool || !pgReady) return;
+  if (!pool || !pgReady) return 0;
   const rows = sqliteRows(table);
-  if (!rows.length) return;
-  queuePg(async () => {
+  if (!rows.length) return 0;
+  queuePgWrite(table, async () => {
     const cols = TABLE_COLS[table].split(', ');
     const client = await pool.connect();
     try {
@@ -451,7 +543,26 @@ function mirrorTable(table) {
     } finally {
       client.release();
     }
+    // READ-BACK VERIFICATION — confirm the write actually landed in Postgres
+    // (catches silent connection drops / pooler black-holing writes).
+    try {
+      const first = rows[0];
+      const pkCols = TABLE_PKS[table] || [TABLE_COLS[table].split(', ')[0]];
+      const where = pkCols.map((c) => `${c} = $${pkCols.indexOf(c) + 1}`).join(' AND ');
+      const vals = pkCols.map((c) => first[c]);
+      const rb = await pgQueryWithTimeout(`SELECT COUNT(*) AS c FROM ${table} WHERE ${where}`, vals);
+      const found = Number((rb.rows && rb.rows[0] && rb.rows[0].c) || 0);
+      if (found > 0) {
+        pgLastVerifyAt = Date.now();
+      } else {
+        throw new Error(`read-back found 0 rows for ${table} pk=${JSON.stringify(vals)} — write did not land`);
+      }
+    } catch (e) {
+      recordPgFailure(e, `verify ${table}`);
+    }
+    return rows.length;
   });
+  return rows.length;
 }
 
 /** Full mirror: push every SQLite table to Postgres (called on boot + periodically). */
@@ -541,7 +652,7 @@ function setStatus(userId, status, reason, until = 0) {
 /** /hide — vanish from rob/heist targeting until `untilTs` (ms epoch). */
 function setHidden(userId, untilTs) {
   db.prepare('UPDATE users SET hidden_until = ? WHERE user_id = ?').run(untilTs || 0, userId);
-  pgRun('UPDATE users SET hidden_until = $1 WHERE user_id = $2', [untilTs || 0, userId]);
+  pgRun('users', 'UPDATE users SET hidden_until = $1 WHERE user_id = $2', [untilTs || 0, userId]);
 }
 
 /** True while the user's hide is still active. */
@@ -584,6 +695,7 @@ function setCooldown(userId, action, until) {
     ON CONFLICT(user_id, action) DO UPDATE SET until = excluded.until
   `).run(userId, action, until);
   pgRun(
+    'cooldowns',
     `INSERT INTO cooldowns (user_id, action, until) VALUES ($1, $2, $3)
      ON CONFLICT (user_id, action) DO UPDATE SET until = EXCLUDED.until`,
     [userId, action, until]
@@ -592,13 +704,13 @@ function setCooldown(userId, action, until) {
 
 function clearCooldown(userId, action) {
   db.prepare('DELETE FROM cooldowns WHERE user_id = ? AND action = ?').run(userId, action);
-  pgRun('DELETE FROM cooldowns WHERE user_id = $1 AND action = $2', [userId, action]);
+  pgRun('cooldowns', 'DELETE FROM cooldowns WHERE user_id = $1 AND action = $2', [userId, action]);
 }
 
 /** Delete ALL cooldowns (used by /restart). */
 function clearAllCooldowns() {
   db.prepare('DELETE FROM cooldowns').run();
-  pgRun('DELETE FROM cooldowns');
+  pgRun('cooldowns', 'DELETE FROM cooldowns');
 }
 
 /* ---------------- Raw-ish query helpers (formerly db.db.prepare call sites) ---------------- */
@@ -680,6 +792,7 @@ function saveLottery(pot, ticketCount, tickets) {
   db.prepare('UPDATE lottery SET pot = ?, ticket_count = ?, tickets = ? WHERE id = 1')
     .run(pot, ticketCount, JSON.stringify(tickets));
   pgRun(
+    'lottery',
     `INSERT INTO lottery (id, pot, ticket_count, tickets) VALUES (1, $1, $2, $3)
      ON CONFLICT (id) DO UPDATE SET pot = EXCLUDED.pot, ticket_count = EXCLUDED.ticket_count, tickets = EXCLUDED.tickets`,
     [pot, ticketCount, JSON.stringify(tickets)]
@@ -699,6 +812,7 @@ function createHeist(heist) {
   db.prepare('INSERT INTO heists (leader_id, leader_name, target_id, target_name, members, started_at, status) VALUES (?, ?, ?, ?, ?, ?, ?)')
     .run(heist.leader_id, heist.leader_name, heist.target_id, heist.target_name, JSON.stringify(heist.members), heist.started_at, heist.status);
   pgRun(
+    'heists',
     `INSERT INTO heists (leader_id, leader_name, target_id, target_name, members, started_at, status)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
      ON CONFLICT (leader_id) DO UPDATE SET leader_name = EXCLUDED.leader_name, target_id = EXCLUDED.target_id,
@@ -709,17 +823,17 @@ function createHeist(heist) {
 
 function updateHeistMembers(leaderId, members) {
   db.prepare('UPDATE heists SET members = ? WHERE leader_id = ?').run(JSON.stringify(members), leaderId);
-  pgRun('UPDATE heists SET members = $1 WHERE leader_id = $2', [JSON.stringify(members), leaderId]);
+  pgRun('heists', 'UPDATE heists SET members = $1 WHERE leader_id = $2', [JSON.stringify(members), leaderId]);
 }
 
 function updateHeistStatus(leaderId, status) {
   db.prepare('UPDATE heists SET status = ? WHERE leader_id = ?').run(status, leaderId);
-  pgRun('UPDATE heists SET status = $1 WHERE leader_id = $2', [status, leaderId]);
+  pgRun('heists', 'UPDATE heists SET status = $1 WHERE leader_id = $2', [status, leaderId]);
 }
 
 function deleteHeist(leaderId) {
   db.prepare('DELETE FROM heists WHERE leader_id = ?').run(leaderId);
-  pgRun('DELETE FROM heists WHERE leader_id = $1', [leaderId]);
+  pgRun('heists', 'DELETE FROM heists WHERE leader_id = $1', [leaderId]);
 }
 
 /* ---------------- Dashboard: chat logs ---------------- */
@@ -741,11 +855,10 @@ function logChat(msg) {
       Date.now()
     );
   // Mirror only the newest row (the id is bigserial — newest row is max id).
-  queuePg(() => {
-    if (!pool || !pgReady) return Promise.resolve();
+  queuePgWrite('chat_logs', async () => {
     const row = db.prepare('SELECT * FROM chat_logs ORDER BY id DESC LIMIT 1').get();
-    if (!row) return Promise.resolve();
-    return pool.query(
+    if (!row) return null;
+    return pgQueryWithTimeout(
       `INSERT INTO chat_logs (id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (id) DO NOTHING`,
@@ -776,11 +889,10 @@ function logGameHistory(entry) {
       JSON.stringify(entry.meta || {}),
       Date.now()
     );
-  queuePg(() => {
-    if (!pool || !pgReady) return Promise.resolve();
+  queuePgWrite('game_history', async () => {
     const row = db.prepare('SELECT * FROM game_history ORDER BY id DESC LIMIT 1').get();
-    if (!row) return Promise.resolve();
-    return pool.query(
+    if (!row) return null;
+    return pgQueryWithTimeout(
       `INSERT INTO game_history (id, user_id, username, game, bet, result, amount, meta, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (id) DO NOTHING`,
@@ -820,6 +932,7 @@ function addAdminUser(userId, username, role, password) {
              ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, role = excluded.role, password = excluded.password`)
     .run(userId, username || '', role || 'mod', password || '', Date.now());
   pgRun(
+    'admin_users',
     `INSERT INTO admin_users (user_id, username, role, password, created_at)
      VALUES ($1, $2, $3, $4, $5)
      ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username, role = EXCLUDED.role, password = EXCLUDED.password, created_at = EXCLUDED.created_at`,
@@ -829,7 +942,7 @@ function addAdminUser(userId, username, role, password) {
 
 function removeAdminUser(userId) {
   db.prepare('DELETE FROM admin_users WHERE user_id = ?').run(userId);
-  pgRun('DELETE FROM admin_users WHERE user_id = $1', [userId]);
+  pgRun('admin_users', 'DELETE FROM admin_users WHERE user_id = $1', [userId]);
 }
 
 function listAdminUsers() {
@@ -839,7 +952,7 @@ function listAdminUsers() {
 
 function setAdminLastLogin(userId) {
   db.prepare('UPDATE admin_users SET last_login = ? WHERE user_id = ?').run(Date.now(), userId);
-  pgRun('UPDATE admin_users SET last_login = $1 WHERE user_id = $2', [Date.now(), userId]);
+  pgRun('admin_users', 'UPDATE admin_users SET last_login = $1 WHERE user_id = $2', [Date.now(), userId]);
 }
 
 /* ---------------- Dashboard: events / missions ---------------- */
@@ -899,12 +1012,12 @@ function updateEvent(id, fields) {
 
 function deleteEvent(id) {
   db.prepare('DELETE FROM bot_events WHERE id = ?').run(id);
-  pgRun('DELETE FROM bot_events WHERE id = $1', [id]);
+  pgRun('bot_events', 'DELETE FROM bot_events WHERE id = $1', [id]);
 }
 
 function incrementEventCompletions(id) {
   db.prepare('UPDATE bot_events SET completions = completions + 1 WHERE id = ?').run(id);
-  pgRun('UPDATE bot_events SET completions = completions + 1 WHERE id = $1', [id]);
+  pgRun('bot_events', 'UPDATE bot_events SET completions = completions + 1 WHERE id = $1', [id]);
 }
 
 /** Get the currently active event/mission for the bot to announce. */
@@ -933,9 +1046,8 @@ function createBroadcast(message, target, createdBy) {
              VALUES (?, ?, ?, ?, ?)`)
     .run(message, target || 'all', 0, createdBy || 0, Date.now());
   const created = db.prepare('SELECT * FROM broadcasts ORDER BY id DESC LIMIT 1').get();
-  queuePg(() => {
-    if (!pool || !pgReady) return Promise.resolve();
-    return pool.query(
+  queuePgWrite('broadcasts', async () => {
+    return pgQueryWithTimeout(
       `INSERT INTO broadcasts (id, message, target, sent_count, created_by, created_at)
        VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
       [created.id, created.message, created.target, created.sent_count, created.created_by, created.created_at]
@@ -946,7 +1058,7 @@ function createBroadcast(message, target, createdBy) {
 
 function updateBroadcastCount(id, count) {
   db.prepare('UPDATE broadcasts SET sent_count = ? WHERE id = ?').run(count, id);
-  pgRun('UPDATE broadcasts SET sent_count = $1 WHERE id = $2', [count, id]);
+  pgRun('broadcasts', 'UPDATE broadcasts SET sent_count = $1 WHERE id = $2', [count, id]);
 }
 
 function listBroadcasts(limit = 50) {
@@ -960,11 +1072,10 @@ function logActivity(type, text, meta = {}) {
     .run(type || 'event', text, JSON.stringify(meta), Date.now());
   // keep the feed lean (last 500 entries)
   db.prepare('DELETE FROM activity_feed WHERE id NOT IN (SELECT id FROM activity_feed ORDER BY id DESC LIMIT 500)').run();
-  queuePg(() => {
-    if (!pool || !pgReady) return Promise.resolve();
+  queuePgWrite('activity_feed', async () => {
     const row = db.prepare('SELECT * FROM activity_feed ORDER BY id DESC LIMIT 1').get();
-    if (!row) return Promise.resolve();
-    return pool.query(
+    if (!row) return null;
+    return pgQueryWithTimeout(
       `INSERT INTO activity_feed (id, type, text, meta, created_at)
        VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING`,
       [row.id, row.type, row.text, row.meta, row.created_at]
@@ -983,11 +1094,10 @@ function logAudit(actorId, actorName, action, targetId, detail) {
   db.prepare(`INSERT INTO audit_log (actor_id, actor_name, action, target_id, detail, created_at)
              VALUES (?, ?, ?, ?, ?, ?)`)
     .run(actorId, actorName || '', action, targetId || 0, detail || '', Date.now());
-  queuePg(() => {
-    if (!pool || !pgReady) return Promise.resolve();
+  queuePgWrite('audit_log', async () => {
     const row = db.prepare('SELECT * FROM audit_log ORDER BY id DESC LIMIT 1').get();
-    if (!row) return Promise.resolve();
-    return pool.query(
+    if (!row) return null;
+    return pgQueryWithTimeout(
       `INSERT INTO audit_log (id, actor_id, actor_name, action, target_id, detail, created_at)
        VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT (id) DO NOTHING`,
       [row.id, row.actor_id, row.actor_name, row.action, row.target_id, row.detail, row.created_at]
@@ -1064,6 +1174,7 @@ function addItem(userId, itemId, delta = 1) {
       updated_at = excluded.updated_at
   `).run(userId, itemId, delta, now);
   pgRun(
+    'inventory',
     `INSERT INTO inventory (user_id, item_id, quantity, updated_at) VALUES ($1, $2, $3, $4)
      ON CONFLICT (user_id, item_id) DO UPDATE SET
        quantity = GREATEST(0, inventory.quantity + EXCLUDED.quantity),
@@ -1151,6 +1262,11 @@ function syncInfo() {
     lastPgError: pgLastError || null,
     lastPgErrorAt: pgLastErrorAt || null,
     lastMirrorAt: lastMirrorAt || 0,
+    // NEW — verified write-through stats (Task A: durable persistence)
+    lastWriteAt: pgLastWriteAt || 0,
+    lastVerifyAt: pgLastVerifyAt || 0,
+    writesOk: pgWritesOk || 0,
+    writesFailed: pgWritesFailed || 0,
     dbSyncIntervalMs: config.dbSyncIntervalMs,
   };
 }
@@ -1166,7 +1282,6 @@ function ping() {
 
 /* ================= Boot / periodic mirror ================= */
 
-let lastMirrorAt = 0;
 let syncTimer = null;
 let reinitTimer = null;
 const PG_RETRY_MS = 15000; // background reconnect/hydrate retry when PG is configured but unreachable

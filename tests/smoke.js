@@ -600,6 +600,61 @@ test('db: ping returns a number (ms)', () => {
   assert.ok(Number.isFinite(p) && p >= 0, 'ping is a non-negative number');
 });
 
+/* ---------- native colored reply keyboards (Bot API 9.4 KeyboardButton.style) ---------- */
+test('keyboards: every KeyboardButton carries a native style (bg_primary/bg_danger/bg_success)', () => {
+  const keyboards = require('../src/keyboards');
+  const pages = ['main', 'casino', 'games', 'economy'];
+  const valid = new Set(['bg_primary', 'bg_danger', 'bg_success']);
+  let total = 0;
+  for (const page of pages) {
+    const markup = keyboards.keyboardFor(page);
+    assert.ok(markup.keyboard && markup.keyboard.length > 0, `${page} has keyboard rows`);
+    for (const row of markup.keyboard) {
+      for (const btn of row) {
+        total++;
+        assert.ok(btn && typeof btn.text === 'string' && btn.text.length > 0, `${page} button has text`);
+        assert.ok(valid.has(btn.style), `${page} button '${btn.text}' has valid style (got: ${btn.style})`);
+      }
+    }
+  }
+  assert.ok(total >= 15, `at least 15 styled buttons across all keyboards (got ${total})`);
+});
+
+test('keyboards: emoji labels restored + risk buttons are red (bg_danger)', () => {
+  const keyboards = require('../src/keyboards');
+  const main = keyboards.mainKeyboard();
+  const all = main.keyboard.flat();
+  // Original emoji labels (not colored-emoji prefixes)
+  assert.ok(all.some((b) => b.text === '💰 Balance'), '💰 Balance label present');
+  assert.ok(all.some((b) => b.text === '🎰 Casino'), '🎰 Casino label present');
+  assert.ok(all.some((b) => b.text === '🏆 Leaderboard'), '🏆 Leaderboard label present');
+  // Mines + crime are risk actions → bg_danger
+  const games = keyboards.gamesKeyboard().keyboard.flat();
+  const mines = games.find((b) => b.text === '💣 Mines');
+  assert.ok(mines && mines.style === 'bg_danger', 'Mines is red (bg_danger)');
+  const eco = keyboards.economyKeyboard().keyboard.flat();
+  const crime = eco.find((b) => b.text === '🕵️ Crime');
+  assert.ok(crime && crime.style === 'bg_danger', 'Crime is red (bg_danger)');
+  // Balance/bank/income are safe → bg_success
+  const bal = all.find((b) => b.text === '💰 Balance');
+  assert.ok(bal && bal.style === 'bg_success', 'Balance is green (bg_success)');
+});
+
+test('keyboards: JSON serialization keeps style (node-telegram-bot-api stringifies reply_markup untouched)', () => {
+  const keyboards = require('../src/keyboards');
+  // Collect every button from all four keyboards and confirm style survives JSON round-trip
+  const allBtns = ['main', 'casino', 'games', 'economy']
+    .flatMap((page) => keyboards.keyboardFor(page).keyboard.flat());
+  const json = JSON.stringify(allBtns);
+  assert.ok(json.includes('"style":"bg_primary"'), 'JSON contains bg_primary');
+  assert.ok(json.includes('"style":"bg_success"'), 'JSON contains bg_success');
+  assert.ok(json.includes('"style":"bg_danger"'), 'JSON contains bg_danger');
+  for (const btn of allBtns) {
+    const roundTrip = JSON.parse(JSON.stringify(btn));
+    assert.strictEqual(roundTrip.style, btn.style, `style survives JSON round-trip for '${btn.text}'`);
+  }
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
 console.log('ALL SMOKE TESTS PASSED ✅');
