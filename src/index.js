@@ -19,11 +19,32 @@ const http = require('http');
 const TelegramBot = require('node-telegram-bot-api');
 const config = require('./config');
 const db = require('./db');
+const backup = require('./backup');
 const { createBot } = require('./bot');
 const { createDashboard, ensureOwnerPassword } = require('./dashboard/server');
 
 const INSTANCE_ID = process.env.RENDER_INSTANCE_ID || '';
 const PRIMARY_ID = process.env.RENDER_PRIMARY_INSTANCE_ID || '';
+
+// Boot commit hash — lets us PROVE which code is running (Render sets
+// RENDER_GIT_COMMIT automatically; local dev falls back to git HEAD).
+const COMMIT_HASH =
+  process.env.RENDER_GIT_COMMIT ||
+  (() => {
+    try {
+      return require('child_process').execSync('git rev-parse --short HEAD', { timeout: 2000 }).toString().trim();
+    } catch (e) {
+      return 'unknown';
+    }
+  })();
+
+// Postgres advisory lock — the HARD single-instance guard. The first process
+// to acquire the lock runs the bot + sync loop; any second process (Render
+// briefly runs two during a deploy, or a stale instance that never died)
+// serves health-only and never writes data. This kills the two-writers race
+// that periodic rollbacks were blamed on. Lock key must match db.js.
+const PG_LOCK_KEY = 0x52494d55; // "RIMU"
+let standby = false;
 
 // ── Single-instance guard ──────────────────────────────────────────────
 // If RENDER_INSTANCE_ID is set AND a primary is defined, only the primary
@@ -51,7 +72,7 @@ if (!isPrimaryInstance()) {
 }
 
 async function main() {
-  console.log(`🐉 Rimuru Tempest Casino — starting (env=${config.env})${INSTANCE_ID ? ` instance=${INSTANCE_ID}` : ''}`);
+  console.log(`🐉 Rimuru Tempest Casino — starting (env=${config.env})${INSTANCE_ID ? ` instance=${INSTANCE_ID}` : ''} commit=${COMMIT_HASH}`);
 
   // ── Durability: hydrate SQLite from Postgres (if DATABASE_URL set), then
   // start the periodic mirror so every write survives redeploys.
@@ -72,6 +93,25 @@ async function main() {
     }
   }
 
+  // ── HARD single-instance guard: acquire the Postgres advisory lock. Only
+  // the process that OWNS the lock runs the bot + sync loop; a duplicate
+  // (Render deploy overlap / stale instance) serves /health as standby.
+  try {
+    if (db.acquireInstanceLock) {
+      standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
+      if (standby) {
+        console.warn(
+          `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
+          'Health server stays up; bot + sync loop NOT started (prevents dual writers).'
+        );
+      } else {
+        console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner.`);
+      }
+    }
+  } catch (e) {
+    console.error('[instance] advisory lock check failed (proceeding as owner):', e.message);
+  }
+
   // ── Dashboard password (owner login) ─────────────────────────────────
   ensureOwnerPassword();
 
@@ -83,7 +123,16 @@ async function main() {
     // Health route always answers first; everything else goes to Express.
     if (req.url === '/health') {
       res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ ok: true, service: 'rimuru-casino', persistence: db.syncInfo(), time: Date.now() }));
+      res.end(JSON.stringify({
+        ok: true,
+        service: 'rimuru-casino',
+        commit: COMMIT_HASH,
+        standby,
+        instance: INSTANCE_ID || null,
+        persistence: db.syncInfo(),
+        backups: backup.getBackupState ? backup.getBackupState() : undefined,
+        time: Date.now(),
+      }));
       return;
     }
     // Dashboard mounted? Route to Express. Otherwise 404.
@@ -125,11 +174,35 @@ async function main() {
   // Let any old overlapping instance finish shutting down before polling.
   await new Promise((r) => setTimeout(r, 5000));
 
+  // Auto-backup scheduler (hidden safety net) - 40-min cycle with rolling
+  // retention + regression detection (see src/backup.js). Only the bot owner
+  // (non-standby) instance schedules backups.
+  if (!standby) {
+    try { backup.getBackupState(); } catch (e) { /* non-fatal */ }
+    setInterval(() => {
+      try {
+        const r = backup.runScheduledBackup();
+        if (r && r.ran && r.suspect) {
+          db.logActivity('backup', `Auto-backup flagged SUSPECT (${r.reason || 'regression'}) - good chain kept`, {});
+        }
+      } catch (e) {
+        console.error('[backup] scheduler tick error:', e.message);
+      }
+    }, config.autoBackup.checkMs);
+    console.log(`[backup] scheduler ON - ${backup.SCHEDULE_OFFSETS.length} backups per ${config.autoBackup.cycleMs / 60000}-min cycle, keep ${config.autoBackup.keep}, regression threshold ${Math.round(config.autoBackup.regressionPct * 100)}%`);
+  } else {
+    console.log('[backup] scheduler SKIPPED (standby instance).');
+  }
+
   // ── Bot ───────────────────────────────────────────────────────────────
   let bot;
   try {
-    bot = createBot();
-    console.log('🤖 Rimuru Tempest is awake. The house is open.');
+    if (standby) {
+      console.warn('[instance] standby — bot NOT started (another instance owns the lock).');
+    } else {
+      bot = createBot();
+      console.log('🤖 Rimuru Tempest is awake. The house is open.');
+    }
   } catch (e) {
     console.error('💥 Failed to start bot:', e.message);
     process.exit(1);
@@ -141,6 +214,7 @@ async function main() {
     try {
       server.close();
       if (bot) bot.stopPolling();
+      if (db.releaseInstanceLock) db.releaseInstanceLock(PG_LOCK_KEY).catch(() => {});
     } catch (e) {
       /* ignore */
     }

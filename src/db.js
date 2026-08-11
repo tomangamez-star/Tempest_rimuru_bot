@@ -704,8 +704,11 @@ function mapUser(row) {
  * TIMESTAMP-ORDERED merging in BOTH directions (SQLite <-> Postgres).
  * ONLY timestamp ordering decides which state wins — never value comparison
  * (legitimate purchases/bets/losses can decrease balances).
+ *  - users:      the rollback target (balances/bank/status/hidden).
+ *  - inventory:  item quantities are user state — same rollback risk.
+ *  - settings:   bot_paused & friends — must never regress either.
  */
-const VERSIONED_TABLES = new Set(['users']);
+const VERSIONED_TABLES = new Set(['users', 'inventory', 'settings']);
 
 function nowStamp() {
   return Date.now();
@@ -733,10 +736,17 @@ function logDbWrite(userId, op, prevVal, newVal, src) {
 function getOrCreateUser(userId, meta = {}) {
   let row = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
   if (row) {
-    if (meta.username || meta.first_name) {
+    // Versioning-hardening fix: only stamp updated_at when a profile field
+    // ACTUALLY changes. The old code stamped on every call, so a trivial
+    // touch (e.g. any /balance with meta) could fabricate a "newest" timestamp
+    // that would then beat a REAL wallet write from another instance during a
+    // versioned merge. No real change -> no version bump.
+    const newUsername = meta.username || row.username;
+    const newFirstName = meta.first_name || row.first_name;
+    if (newUsername !== row.username || newFirstName !== row.first_name) {
       const stamp = nowStamp();
       db.prepare('UPDATE users SET username = ?, first_name = ?, updated_at = ? WHERE user_id = ?')
-        .run(meta.username || row.username, meta.first_name || row.first_name, stamp, userId);
+        .run(newUsername, newFirstName, stamp, userId);
       const updated = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
       logDbWrite(userId, 'updateProfile', '', 'meta', 'getOrCreateUser');
       mirrorTable('users');
@@ -808,7 +818,15 @@ function setHidden(userId, untilTs) {
   const stamp = nowStamp();
   db.prepare('UPDATE users SET hidden_until = ?, updated_at = ? WHERE user_id = ?').run(untilTs || 0, stamp, userId);
   logDbWrite(userId, 'setHidden', '', untilTs || 0, 'setHidden');
-  pgRun('users', 'UPDATE users SET hidden_until = $1, updated_at = $2 WHERE user_id = $3', [untilTs || 0, stamp, userId]);
+  // Versioning-hardening fix: the PG write must ALSO be versioned — only land
+  // when the local stamp is NOT older than what Postgres already has. The old
+  // code wrote PG with no WHERE clause, so a stale setHidden could clobber a
+  // newer row written by another instance in between.
+  pgRun(
+    'users',
+    'UPDATE users SET hidden_until = $1, updated_at = $2 WHERE user_id = $3 AND updated_at <= $2',
+    [untilTs || 0, stamp, userId]
+  );
 }
 
 /** True while the user's hide is still active. */
@@ -1538,6 +1556,47 @@ function expirePenalties() {
   return expired.map((u) => ({ ...u, user_id: Number(u.user_id) }));
 }
 
+/* ---------------- Single-instance advisory lock ---------------- */
+
+/**
+ * HARD single-instance guard: acquire a Postgres advisory lock. Only ONE
+ * process (across all Render instances) can hold it; the holder runs the bot
+ * + sync loop, any duplicate serves health-only. This kills the two-writers
+ * race that periodic rollbacks were blamed on (Render can briefly run 2
+ * processes during a deploy, and a stale instance may linger). If Postgres
+ * is unavailable we log loudly and let the caller decide (default: run —
+ * better a single instance with SQLite than no bot at all; the env-based
+ * RENDER_INSTANCE_ID guard in index.js still applies).
+ * @param {number} key  fixed app-specific lock key (must match index.js)
+ * @returns {Promise<boolean>} true = this process owns the lock
+ */
+async function acquireInstanceLock(key) {
+  if (!pool || !pgReady) {
+    console.warn('[db] advisory lock skipped — Postgres not ready (running as owner).');
+    return true;
+  }
+  try {
+    const r = await pgQueryWithTimeout('SELECT pg_try_advisory_lock($1) AS locked', [Number(key)]);
+    const locked = r.rows && r.rows[0] && r.rows[0].locked === true;
+    if (locked) {
+      // Heartbeat: keep the lock alive while this process lives (advisory
+      // locks are session-scoped; the pool keeps the session open).
+      console.log(`[db] advisory lock ${Number(key)} acquired.`);
+    }
+    return locked;
+  } catch (e) {
+    console.error('[db] advisory lock check failed:', e.message);
+    return true; // fail open — env guard still applies
+  }
+}
+
+/** Release the advisory lock (called on graceful shutdown). */
+async function releaseInstanceLock(key) {
+  try {
+    if (pool) await pgQueryWithTimeout('SELECT pg_advisory_unlock($1)', [Number(key)]);
+  } catch (e) { /* non-fatal */ }
+}
+
 /* ================= Postgres → SQLite rehydration ================= */
 
 /**
@@ -1875,4 +1934,7 @@ module.exports = {
   syncInfo,
   ping,
   close,
+  // Single-instance guard
+  acquireInstanceLock,
+  releaseInstanceLock,
 };

@@ -51,6 +51,28 @@ const config = {
   databaseUrl: process.env.DATABASE_URL || process.env.SUPABASE_URL || '',
   dbSyncIntervalMs: Number(process.env.DB_SYNC_INTERVAL_MS || 1500),
 
+  // ===================== AUTO-BACKUP (hidden safety net) =====================
+  // Automatic backups run on a 40-minute cycle: every 5 min for the first
+  // 25 min, every 2 min for the next 10 min, every 30s for the last 5 min
+  // (20 backups per cycle). Retention keeps a ROLLING WINDOW (default 5)
+  // instead of "only the latest" — so a pre-regression snapshot always
+  // survives. Before writing, the new snapshot is checked for REGRESSION
+  // (total coins in circulation / user count vs the previous backup): a
+  // sharp, unexplained drop is flagged as suspicious and the good backup is
+  // KEPT instead of being overwritten by the regressed state.
+  //  - AUTO_BACKUP_ENABLED=false  disables the scheduler entirely.
+  //  - AUTO_BACKUP_CHECK_MS      how often the scheduler ticks (default 30s).
+  //  - AUTO_BACKUP_KEEP          rolling window size (default 5).
+  //  - AUTO_BACKUP_REGRESSION_PCT  total-supply drop that looks like a
+  //                                rollback (default 0.20 = 20%).
+  autoBackup: {
+    enabled: String(process.env.AUTO_BACKUP_ENABLED || 'true').toLowerCase() !== 'false',
+    checkMs: Math.max(5000, Number(process.env.AUTO_BACKUP_CHECK_MS || 30000)),
+    keep: Math.max(2, Number(process.env.AUTO_BACKUP_KEEP || 5)),
+    regressionPct: Math.min(0.9, Math.max(0.05, Number(process.env.AUTO_BACKUP_REGRESSION_PCT || 0.20))),
+    cycleMs: 40 * 60 * 1000,
+  },
+
   // Rimuru sticker pack — sends a random sticker with Rimuru's replies.
   // Set STICKER_PACK to any public pack name (e.g. Tensei_Shitara_Slime_Datta_Ken2).
   // If unset or invalid, the bot skips stickers gracefully (never crashes).

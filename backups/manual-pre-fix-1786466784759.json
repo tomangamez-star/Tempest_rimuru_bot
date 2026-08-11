@@ -1,0 +1,39 @@
+{
+  "exported_at": "2026-08-11T16:46:24.759Z",
+  "ts": 1786466784759,
+  "version": 1,
+  "counts": {
+    "users": 1,
+    "cooldowns": 0,
+    "inventory": 0,
+    "heists": 0,
+    "lottery": 0,
+    "redeem_codes": 0,
+    "redeem_redemptions": 0,
+    "settings": 0,
+    "admin_users": 0
+  },
+  "manual": "pre-fix safety snapshot",
+  "users": [
+    {
+      "user_id": 8809,
+      "username": "miner",
+      "first_name": "Miner",
+      "wallet": 15500000,
+      "bank": 0,
+      "status": "active",
+      "status_reason": "",
+      "status_until": 0,
+      "hidden_until": 0,
+      "created_at": 1786444131292
+    }
+  ],
+  "cooldowns": [],
+  "inventory": [],
+  "heists": [],
+  "lottery": [],
+  "redeem_codes": [],
+  "redeem_redemptions": [],
+  "settings": [],
+  "admin_users": []
+}

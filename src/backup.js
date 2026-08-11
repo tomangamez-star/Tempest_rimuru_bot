@@ -1,23 +1,67 @@
 'use strict';
 /**
  * Rimuru Tempest Casino — backup & restore 📦
- * /backup  (owner only) — dump ALL user data (balances, status, hidden,
- *            inventory) to backups/backup-<timestamp>.json AND to the
- *            `backups` table in Postgres (survives redeploys).
- * /restore (owner only) — restore from the NEWEST backup, preferring the
- *            Postgres copy (survives Render's ephemeral disk); falls back
- *            to a local backups/*.json file if no PG backup exists yet.
  *
- * Safety: restore is UPSERT-only (wallet/bank/status/inventory are set from
- * the backup; nothing is deleted; rows not present in the backup are never
- * touched). It is a safety net for when Supabase fails.
+ * /backup   (owner only) — dump ALL user data to backups/backup-<ts>.json AND
+ *            to the `backups` table in Postgres (survives redeploys).
+ * /restore  (owner only) — restore from the NEWEST GOOD backup (Postgres copy
+ *            preferred; falls back to a local file). /restore <id> targets a
+ *            specific backup (staff, with owner confirmation).
+ * /backups  (staff)       — list available backups (id, time, users, coins,
+ *            suspect flag, source).
+ *
+ * AUTO-BACKUP (hidden safety net, wired in src/index.js):
+ *   Runs a 40-minute cycle — every 5 min for the first 25 min, every 2 min
+ *   for the next 10 min, every 30 s for the last 5 min = 20 backups/cycle.
+ *
+ * REGRESSION-SAFE RETENTION (the "what if it backs up a regressed
+ * leaderboard?" design answer):
+ *   The naive "keep ONLY the latest backup" scheme is fundamentally flawed:
+ *   if the bot backs up a REGRESSED (rolled-back) state and that is the only
+ *   file kept, the backup IS the bad state — there is no good snapshot to
+ *   restore. The whole point of a backup is a PREVIOUS GOOD state.
+ *   Therefore:
+ *     1. ROLLING WINDOW — we keep the last N GOOD backups (default 5), so a
+ *        pre-regression snapshot always survives.
+ *     2. REGRESSION DETECTION — before a scheduled backup becomes the new
+ *        "good latest", we compare total coins in circulation + user count
+ *        against the previous good backup. A sharp unexplained drop in BOTH
+ *        (a rollback reverts users AND supply together) flags the new
+ *        snapshot as SUSPECT: it is stored (never lose data) but it does NOT
+ *        advance the good chain and does NOT delete the older good backups.
+ *        Legitimate loss events (bets/robs/purchases) drop supply but not
+ *        user count — and an explicit mass-reset/broadcast event in the
+ *        activity feed suppresses the flag.
+ *   Only timestamp/version ordering decides what is "newer" — never value
+ *   comparison (a lower balance is never automatically stale).
  */
 const fs = require('fs');
 const path = require('path');
 const db = require('./db');
+const config = require('./config');
 const { fmt, ensureDir } = require('./utils');
 
 const BACKUP_DIR = path.join(__dirname, '..', 'backups');
+const GOOD_RE = /^backup-(\d+)\.json$/;
+const SUSPECT_RE = /^backup-(\d+)-suspect\.json$/;
+const SUSPECT_KEEP = 10;           // cap on suspect files kept
+const PG_KEEP_MARGIN = 15;         // extra PG rows kept beyond the good window
+
+/* ---------------- Auto-backup schedule (40-min cycle, 20 backups) ----------------
+ *   Phase 1 (min 0-25): every 5 min  -> backups at 5,10,15,20,25         (5)
+ *   Phase 2 (min 25-35): every 2 min  -> backups at 27,29,31,33,35        (5)
+ *   Phase 3 (min 35-40): every 30 s   -> backups at 35.5..40 step 0.5    (10)
+ *   Total: 20 backups per 40-min cycle, then the cycle restarts.
+ */
+const SCHEDULE_OFFSETS = (() => {
+  const offs = [];
+  for (let m = 5; m <= 25; m += 5) offs.push(m * 60000);                 // 5
+  for (let m = 27; m <= 35; m += 2) offs.push(m * 60000);                // 5
+  for (let i = 1; i <= 10; i++) offs.push((35 + i * 0.5) * 60000);       // 10 (35.5..40)
+  return [...new Set(offs)].sort((a, b) => a - b);
+})();
+
+/* ---------------- small helpers ---------------- */
 
 /** Sanitize a filename so only [a-z0-9._-] survives. */
 function safeName(s) {
@@ -38,64 +82,29 @@ function userSnapshot(u) {
     status_until: u.status_until || 0,
     hidden_until: u.hidden_until || 0,
     created_at: u.created_at || 0,
+    updated_at: u.updated_at || 0,
     inventory: inv,
   };
 }
 
-/**
- * /backup — dump every user (with inventory) to a local JSON file AND to
- * Postgres (backups table) so the snapshot survives redeploys.
- * @returns { ok, message, file?, pg? }
- */
-function backup() {
-  try {
-    ensureDir(BACKUP_DIR);
-    const users = db.getAllUsers();
-    const ts = Date.now();
-    const file = path.join(BACKUP_DIR, `backup-${ts}.json`);
-    const data = {
-      exported_at: new Date().toISOString(),
-      ts,
-      version: 1,
-      counts: { users: users.length },
-      users: users.map(userSnapshot),
-    };
-    const json = JSON.stringify(data, null, 2);
-    fs.writeFileSync(file, json, 'utf8');
-    // NEW: also persist the snapshot to Postgres (survives redeploys).
-    let pgStored = false;
-    try {
-      db.saveBackupPg(`backup-${ts}.json`, json, users.length, 0);
-      pgStored = true;
-    } catch (e) {
-      console.error('[backup] PG snapshot store failed (local file kept):', e.message);
-    }
-    return {
-      ok: true,
-      file,
-      pg: pgStored,
-      message:
-        `📦 <b>BACKUP COMPLETE</b>\n\n` +
-        `👥 Users: <b>${fmt(users.length)}</b>\n` +
-        `📄 File: <code>backups/backup-${ts}.json</code>\n` +
-        (pgStored
-          ? `🗄️ <b>Postgres copy: SAVED</b> — survives redeploys.\n\n`
-          : `⚠️ <b>Postgres copy FAILED</b> — only the local file was written (ephemeral).\n\n`) +
-        `The safety net is in place. Restore with <code>/restore</code> if the vault ever fails.`,
-    };
-  } catch (e) {
-    return { ok: false, message: `❌ Backup failed: ${e.message}` };
-  }
+/** Total coins in circulation for a backup payload (wallet + bank, all users). */
+function coinsOf(data) {
+  if (!data || !Array.isArray(data.users)) return 0;
+  return data.users.reduce((sum, u) => sum + (Number(u.wallet) || 0) + (Number(u.bank) || 0), 0);
 }
 
-/** Newest backup file in backups/ (null if none). */
-function newestBackupFile() {
-  ensureDir(BACKUP_DIR);
-  const files = fs.readdirSync(BACKUP_DIR)
-    .filter((f) => /^backup-\d+\.json$/.test(f))
-    .sort()
-    .reverse();
-  return files.length ? path.join(BACKUP_DIR, files[0]) : null;
+/** Build a snapshot of the CURRENT sqlite state. */
+function buildSnapshot() {
+  const users = db.getAllUsers();
+  const ts = Date.now();
+  const data = {
+    exported_at: new Date().toISOString(),
+    ts,
+    version: 2,
+    counts: { users: users.length, coinsInCirculation: coinsOf({ users }) },
+    users: users.map(userSnapshot),
+  };
+  return { ts, data };
 }
 
 /** Parse a backup payload (either from a file or from Postgres). */
@@ -104,20 +113,223 @@ function parseBackupData(raw) {
   return Array.isArray(data.users) ? data.users : [];
 }
 
+/* ---------------- File helpers ---------------- */
+
+function listFiles(re) {
+  ensureDir(BACKUP_DIR);
+  return fs.readdirSync(BACKUP_DIR)
+    .filter((f) => re.test(f))
+    .map((f) => {
+      const m = f.match(/(\d+)/);
+      return { file: path.join(BACKUP_DIR, f), ts: Number(m[1]), suspect: f.includes('-suspect') };
+    })
+    .sort((a, b) => b.ts - a.ts);
+}
+
+/** Newest backup file in backups/ (null if none). Good files only. */
+function newestBackupFile() {
+  const files = listFiles(GOOD_RE);
+  return files.length ? files[0].file : null;
+}
+
+/* ---------------- Postgres helpers ---------------- */
+
+/** Newest GOOD backup stored in Postgres (null if none) — skips suspects.
+ *  Fetches the FULL row including `data` (db.listBackupsPg strips it). */
+function newestGoodBackupPg() {
+  try {
+    const rows = db.db.prepare(
+      'SELECT id, filename, data, user_count, created_by, created_at FROM backups ORDER BY id DESC LIMIT 50'
+    ).all();
+    const good = rows.find((r) => !String(r.filename || '').includes('-suspect'));
+    return good || null;
+  } catch (e) {
+    return null;
+  }
+}
+
+/** Newest backup stored in Postgres (any, incl. suspect) — used by db.newestBackupPg tests. */
+function newestBackupPg() {
+  return db.newestBackupPg();
+}
+
+/* ---------------- Regression detection ---------------- */
+
+/** Look for a legitimate mass-loss / reset event in the recent activity feed
+ *  (an explicit broadcast/reset makes a supply drop expected, not a rollback). */
+function recentMassLossEvent() {
+  try {
+    const now = Date.now();
+    const recent = db.getActivity(80).filter((a) => now - (Number(a.created_at) || 0) < 10 * 60 * 1000);
+    return recent.some((a) => {
+      const t = String(a.text || '') + ' ' + String(a.type || '');
+      return /mass|reset|wipe|clear|rollback|restore/i.test(t);
+    });
+  } catch (e) {
+    return false;
+  }
+}
+
 /**
- * /restore — restore from the NEWEST backup, preferring the Postgres copy
- * (survives redeploys); falls back to the newest local backups/*.json file.
- * Upserts every user in the backup (wallet/bank/status/inventory).
- * @returns { ok, message, source? }
+ * Regression check for a scheduled backup: compare total coins + user count
+ * against the previous GOOD backup. A rollback reverts BOTH (users disappear
+ * AND supply drops); legitimate losses drop supply only. Returns
+ * { suspicious, reason }.
+ */
+function regressionCheck(data) {
+  const prev = newestGoodBackupPg() || null;
+  let prevData = null;
+  if (prev && prev.data) {
+    try { prevData = JSON.parse(prev.data); } catch (e) { prevData = null; }
+  }
+  if (!prevData) {
+    // No previous good baseline yet — nothing to regress against.
+    return { suspicious: false, reason: '' };
+  }
+  const prevUsers = Number(prevData.counts && prevData.counts.users) || (Array.isArray(prevData.users) ? prevData.users.length : 0);
+  const prevCoins = Number(prevData.counts && prevData.counts.coinsInCirculation) || coinsOf(prevData);
+  const newUsers = Array.isArray(data.users) ? data.users.length : 0;
+  const newCoins = coinsOf(data);
+  if (!prevUsers || !prevCoins) return { suspicious: false, reason: '' };
+  const userDrop = 1 - newUsers / prevUsers;
+  const coinDrop = 1 - newCoins / prevCoins;
+  // A rollback reverts users AND supply together; use a small user-drop
+  // threshold + the configured coin-drop threshold.
+  if (userDrop > 0.05 && coinDrop > config.autoBackup.regressionPct) {
+    if (recentMassLossEvent()) {
+      return { suspicious: false, reason: 'mass-loss event logged — drop expected' };
+    }
+    return {
+      suspicious: true,
+      reason: `users ${prevUsers}->${newUsers} (${(userDrop * 100).toFixed(1)}%), ` +
+              `supply ${fmt(prevCoins)}->${fmt(newCoins)} (${(coinDrop * 100).toFixed(1)}%)`,
+    };
+  }
+  return { suspicious: false, reason: '' };
+}
+
+/* ---------------- Snapshot save / retention ---------------- */
+
+/** Persist a snapshot to disk + Postgres, then prune the rolling window. */
+function saveSnapshot(ts, data, suspect) {
+  ensureDir(BACKUP_DIR);
+  const filename = suspect ? `backup-${ts}-suspect.json` : `backup-${ts}.json`;
+  const file = path.join(BACKUP_DIR, filename);
+  const json = JSON.stringify(data, null, 2);
+  fs.writeFileSync(file, json, 'utf8');
+  let pgStored = false;
+  try {
+    db.saveBackupPg(filename, json, data.counts ? data.counts.users : data.users.length, 0);
+    pgStored = true;
+  } catch (e) {
+    console.error('[backup] PG snapshot store failed (local file kept):', e.message);
+  }
+  prune(suspect);
+  return { file, pg: pgStored };
+}
+
+/** Rolling-window retention: keep the last N GOOD backups (pre-regression
+ *  snapshots always survive), cap suspects, and prune old PG rows. */
+function prune(lastWasSuspect) {
+  try {
+    const keep = config.autoBackup.keep;
+    const good = listFiles(GOOD_RE);
+    for (const g of good.slice(keep)) {
+      try { fs.unlinkSync(g.file); } catch (e) { /* non-fatal */ }
+    }
+    const suspects = listFiles(SUSPECT_RE);
+    for (const s of suspects.slice(SUSPECT_KEEP)) {
+      try { fs.unlinkSync(s.file); } catch (e) { /* non-fatal */ }
+    }
+    // Prune PG backups beyond (good window + margin). The newest PG row is
+    // always preserved, so restore()/tests never find an empty store.
+    try {
+      const cap = keep + PG_KEEP_MARGIN;
+      db.db.prepare(
+        'DELETE FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY id DESC LIMIT ?)'
+      ).run(cap);
+    } catch (e) { /* non-fatal */ }
+    if (lastWasSuspect) {
+      console.warn('[backup] ⚠ new snapshot flagged SUSPECT — previous GOOD backups kept (rolling window intact).');
+    }
+  } catch (e) {
+    console.error('[backup] prune failed:', e.message);
+  }
+}
+
+/* ---------------- Manual /backup ---------------- */
+
+/**
+ * /backup — dump every user (with inventory) to a local JSON file AND to
+ * Postgres (backups table) so the snapshot survives redeploys.
+ * Manual backups are always saved as GOOD (explicit owner intent).
+ * @returns { ok, message, file?, pg? }
+ */
+function backup() {
+  try {
+    const { ts, data } = buildSnapshot();
+    const saved = saveSnapshot(ts, data, false);
+    const reg = regressionCheck(data);
+    return {
+      ok: true,
+      file: saved.file,
+      pg: saved.pg,
+      suspect: reg.suspicious,
+      message:
+        `📦 <b>BACKUP COMPLETE</b>\n\n` +
+        `👥 Users: <b>${fmt(data.counts.users)}</b>\n` +
+        `💰 Coins in circulation: <b>${fmt(data.counts.coinsInCirculation)}</b>\n` +
+        `📄 File: <code>backups/backup-${ts}.json</code>\n` +
+        (saved.pg
+          ? `🗄️ <b>Postgres copy: SAVED</b> — survives redeploys.\n\n`
+          : `⚠️ <b>Postgres copy FAILED</b> — only the local file was written (ephemeral).\n\n`) +
+        (reg.suspicious
+          ? `⚠️ <b>Regression WARNING</b>: ${reg.reason} — inspect before restoring.\n\n`
+          : '') +
+        `The safety net is in place. Restore with <code>/restore</code> if the vault ever fails.`,
+    };
+  } catch (e) {
+    return { ok: false, message: `❌ Backup failed: ${e.message}` };
+  }
+}
+
+/* ---------------- Restore ---------------- */
+
+/** Upsert a parsed backup payload into the DB (never deletes anything). */
+function applyRestore(users) {
+  let restored = 0;
+  for (const u of users) {
+    const id = Number(u.user_id);
+    if (!Number.isFinite(id) || id <= 0) continue;
+    db.getOrCreateUser(id, { username: u.username || '', first_name: u.first_name || '' });
+    if (Number.isFinite(Number(u.wallet))) db.setWallet(id, Number(u.wallet) || 0);
+    if (Number.isFinite(Number(u.bank))) db.setBank(id, Number(u.bank) || 0);
+    if (u.status) db.setStatus(id, u.status, u.status_reason || '', Number(u.status_until) || 0);
+    if (Number.isFinite(Number(u.hidden_until))) db.setHidden(id, Number(u.hidden_until) || 0);
+    if (Array.isArray(u.inventory)) {
+      for (const it of u.inventory) {
+        const qty = Math.max(0, Math.floor(Number(it.quantity) || 0));
+        if (qty > 0) db.addItem(id, String(it.item_id), qty);
+      }
+    }
+    restored++;
+  }
+  return restored;
+}
+
+/**
+ * /restore — restore from the NEWEST GOOD backup, preferring the Postgres
+ * copy (survives redeploys); falls back to the newest local backups/*.json.
+ * Suspect (possibly regressed) snapshots are NEVER auto-selected.
  */
 function restore() {
   try {
     let source = 'postgres';
     let users = [];
 
-    // 1) Prefer the newest backup stored in Postgres.
+    // 1) Prefer the newest GOOD backup stored in Postgres.
     try {
-      const pgBackup = db.newestBackupPg();
+      const pgBackup = newestGoodBackupPg();
       if (pgBackup && pgBackup.data) {
         users = parseBackupData(pgBackup.data);
       }
@@ -125,7 +337,7 @@ function restore() {
       console.error('[restore] PG backup read failed (falling back to file):', e.message);
     }
 
-    // 2) Fall back to a local file when no PG backup exists (or is unreadable).
+    // 2) Fall back to a local GOOD file when no PG backup exists.
     if (!users.length) {
       const file = newestBackupFile();
       if (file) {
@@ -142,29 +354,13 @@ function restore() {
       };
     }
 
-    let restored = 0;
-    for (const u of users) {
-      const id = Number(u.user_id);
-      if (!Number.isFinite(id) || id <= 0) continue;
-      db.getOrCreateUser(id, { username: u.username || '', first_name: u.first_name || '' });
-      if (Number.isFinite(Number(u.wallet))) db.setWallet(id, Number(u.wallet) || 0);
-      if (Number.isFinite(Number(u.bank))) db.setBank(id, Number(u.bank) || 0);
-      if (u.status) db.setStatus(id, u.status, u.status_reason || '', Number(u.status_until) || 0);
-      if (Number.isFinite(Number(u.hidden_until))) db.setHidden(id, Number(u.hidden_until) || 0);
-      if (Array.isArray(u.inventory)) {
-        for (const it of u.inventory) {
-          const qty = Math.max(0, Math.floor(Number(it.quantity) || 0));
-          if (qty > 0) db.addItem(id, String(it.item_id), qty);
-        }
-      }
-      restored++;
-    }
+    const restored = applyRestore(users);
     return {
       ok: true,
       source,
       message:
         `♻️ <b>RESTORE COMPLETE</b>\n\n` +
-        `📦 Source: <b>${source === 'postgres' ? '🗄️ Postgres (latest snapshot)' : '📄 local backup file'}</b>\n` +
+        `📦 Source: <b>${source === 'postgres' ? '🗄️ Postgres (latest GOOD snapshot)' : '📄 local backup file'}</b>\n` +
         `👥 Users restored: <b>${fmt(restored)}</b>\n\n` +
         `The vault has been rebuilt from the backup.`,
     };
@@ -173,4 +369,196 @@ function restore() {
   }
 }
 
-module.exports = { backup, restore, newestBackupFile };
+/** Find a specific backup by id (Postgres row id) or timestamp (filename). */
+function findBackup(idOrTs) {
+  const key = Number(idOrTs);
+  if (!Number.isFinite(key) || key <= 0) return null;
+  try {
+    const rows = db.db.prepare(
+      'SELECT id, filename, data, user_count, created_by, created_at FROM backups ORDER BY id DESC LIMIT 100'
+    ).all();
+    const pgRow = rows.find((r) => Number(r.id) === key);
+    if (pgRow && pgRow.data) {
+      return { source: 'postgres', id: Number(pgRow.id), ts: Number(pgRow.created_at) || key, data: pgRow.data, filename: pgRow.filename };
+    }
+  } catch (e) { /* fall through to files */ }
+  const files = [...listFiles(GOOD_RE), ...listFiles(SUSPECT_RE)];
+  const fileMatch = files.find((f) => f.ts === key);
+  if (fileMatch) {
+    return { source: 'file', id: key, ts: key, data: fs.readFileSync(fileMatch.file, 'utf8'), filename: path.basename(fileMatch.file) };
+  }
+  return null;
+}
+
+/**
+ * /restore <id> — restore a SPECIFIC backup (staff). Caller must confirm the
+ * id first; this function applies it. Returns { ok, message, source }.
+ */
+function restoreById(idOrTs) {
+  try {
+    const found = findBackup(idOrTs);
+    if (!found) {
+      return { ok: false, message: `❌ No backup found for id <code>${idOrTs}</code>. Use <code>/backups</code> to list them.` };
+    }
+    const users = parseBackupData(found.data);
+    const restored = applyRestore(users);
+    return {
+      ok: true,
+      source: found.source,
+      message:
+        `♻️ <b>RESTORE COMPLETE</b>\n\n` +
+        `📦 Source: <b>${found.source === 'postgres' ? '🗄️ Postgres' : '📄 file'}</b> — <code>${found.filename || 'backup'}</code>\n` +
+        `👥 Users restored: <b>${fmt(restored)}</b>\n\n` +
+        `The vault has been rebuilt from backup <code>${idOrTs}</code>.`,
+    };
+  } catch (e) {
+    return { ok: false, message: `❌ Restore failed: ${e.message}` };
+  }
+}
+
+/* ---------------- /backups listing ---------------- */
+
+/** Merged backup list (PG rows + local files), newest first. */
+function listBackups(limit = 20) {
+  const out = new Map();
+  try {
+    for (const r of db.listBackupsPg(100)) {
+      out.set(`pg:${r.id}`, {
+        id: Number(r.id),
+        ts: Number(r.created_at) || 0,
+        filename: r.filename || '',
+        userCount: Number(r.user_count) || 0,
+        suspect: String(r.filename || '').includes('-suspect'),
+        source: 'postgres',
+      });
+    }
+  } catch (e) { /* non-fatal */ }
+  for (const f of [...listFiles(GOOD_RE), ...listFiles(SUSPECT_RE)]) {
+    const key = `file:${f.ts}`;
+    if (!out.has(key)) {
+      out.set(key, {
+        id: f.ts,
+        ts: f.ts,
+        filename: path.basename(f.file),
+        userCount: 0,
+        suspect: f.suspect,
+        source: 'file',
+      });
+    }
+  }
+  return [...out.values()].sort((a, b) => b.ts - a.ts).slice(0, limit);
+}
+
+/* ---------------- Scheduled auto-backup ---------------- */
+
+// In-memory scheduler state (cycle start + how many offsets of this cycle ran).
+let cycleStartMs = 0;
+let doneIdx = 0;
+let runCount = 0;
+let suspectCount = 0;
+
+function persistState() {
+  try {
+    db.setSetting('backup_cycle_start', String(cycleStartMs));
+    db.setSetting('backup_done_idx', String(doneIdx));
+  } catch (e) { /* non-fatal */ }
+}
+
+function loadState() {
+  try {
+    cycleStartMs = Number(db.getSetting('backup_cycle_start')) || 0;
+    doneIdx = Number(db.getSetting('backup_done_idx')) || 0;
+    runCount = Number(db.getSetting('backup_run_count')) || 0;
+    suspectCount = Number(db.getSetting('backup_suspect_count')) || 0;
+  } catch (e) { /* ignore */ }
+}
+
+/**
+ * Scheduled backup tick — called by src/index.js every config.autoBackup.checkMs.
+ * Runs exactly one backup per schedule offset; the cycle restarts every 40 min.
+ * A regressed snapshot is stored as SUSPECT and never advances the good chain.
+ * @returns { ok, ran, suspect, reason? } — ran=false when nothing is due.
+ */
+function runScheduledBackup() {
+  if (!config.autoBackup.enabled) return { ok: false, ran: false, reason: 'disabled' };
+  if (!cycleStartMs) {
+    loadState();
+    if (!cycleStartMs) {
+      cycleStartMs = Date.now();
+      persistState();
+    }
+  }
+  const now = Date.now();
+  const elapsed = now - cycleStartMs;
+  if (elapsed >= config.autoBackup.cycleMs) {
+    // Cycle complete — restart it.
+    cycleStartMs = now;
+    doneIdx = 0;
+    persistState();
+  }
+  // Any offset due and not yet run?
+  let due = -1;
+  while (due + 1 < SCHEDULE_OFFSETS.length && SCHEDULE_OFFSETS[due + 1] <= elapsed) due++;
+  const targetIdx = Math.min(due, SCHEDULE_OFFSETS.length - 1);
+  if (targetIdx < 0 || targetIdx < doneIdx) return { ok: false, ran: false };
+  // Only one backup per tick (the next offset runs on a later tick).
+  const idx = doneIdx;
+  if (idx > targetIdx) return { ok: false, ran: false };
+
+  try {
+    const { ts, data } = buildSnapshot();
+    const reg = regressionCheck(data);
+    // Regression gate: a suspicious snapshot is stored but does NOT become the
+    // new good reference (the good chain keeps the previous backups).
+    const saved = saveSnapshot(ts, data, reg.suspicious);
+    if (reg.suspicious) {
+      suspectCount++;
+      db.setSetting('backup_suspect_count', String(suspectCount));
+      console.warn(`[backup] ⚠ auto-backup ${ts} flagged SUSPECT (${reg.reason}) — stored separately; good chain intact.`);
+    } else {
+      runCount++;
+      db.setSetting('backup_run_count', String(runCount));
+    }
+    doneIdx = idx + 1;
+    persistState();
+    console.log(
+      `[backup] auto-backup #${idx + 1}/${SCHEDULE_OFFSETS.length} done (users=${data.counts.users}, coins=${fmt(data.counts.coinsInCirculation)}${reg.suspicious ? ', SUSPECT' : ''})`
+    );
+    return { ok: true, ran: true, suspect: reg.suspicious, reason: reg.reason, ts };
+  } catch (e) {
+    console.error('[backup] scheduled backup failed:', e.message);
+    return { ok: false, ran: false, reason: e.message };
+  }
+}
+
+/** Current auto-backup state for /debug. */
+function getBackupState() {
+  if (!runCount && !suspectCount) loadState();
+  return {
+    enabled: config.autoBackup.enabled,
+    cycleMs: config.autoBackup.cycleMs,
+    keep: config.autoBackup.keep,
+    regressionPct: config.autoBackup.regressionPct,
+    scheduleOffsets: SCHEDULE_OFFSETS.length,
+    doneIdx,
+    runCount,
+    suspectCount,
+    lastBackupAt: Number(db.getSetting('backup_last_ts')) || 0,
+    cycleStartAt: cycleStartMs || 0,
+  };
+}
+
+module.exports = {
+  backup,
+  restore,
+  restoreById,
+  findBackup,
+  listBackups,
+  newestBackupFile,
+  newestBackupPg,
+  parseBackupData,
+  runScheduledBackup,
+  getBackupState,
+  SCHEDULE_OFFSETS,
+  regressionCheck,
+};

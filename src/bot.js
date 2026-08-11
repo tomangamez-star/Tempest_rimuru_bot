@@ -681,7 +681,7 @@ function createBot() {
         `• /health — bot health &amp; persistence status (anyone)\n\n` +
         `<b>👑 Staff</b>\n` +
         `• /redeem create [CODE] [AMT] [USES] — mint a code (mods capped at 50M)\n` +
-        `• /redeem list · /redeem delete [CODE] · /backup · /restore\n` +
+        `• /redeem list · /redeem delete [CODE] · /backup · /backups · /restore [id]\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
@@ -1144,6 +1144,7 @@ function createBot() {
           `🔒 <b>Required group</b>: ${config.requiredGroup || 'off'} (chat ${gid || 'unresolved'})`,
           `🗄 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'})` : ''}`,
           `✔️ <b>Verified writes</b>: ${verified}`,
+          `Auto-backup: ${(() => { try { const bs = backup.getBackupState(); return `on · ${bs.scheduleOffsets} per ${Math.round(bs.cycleMs / 60000)}min · keep ${bs.keep} · ran ${bs.runCount} · suspect ${bs.suspectCount}`; } catch (e) { return 'n/a'; } })()}`,
           `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
           `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
         ];
@@ -1195,10 +1196,36 @@ function createBot() {
       db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'backup', 0, 'owner backup dump');
       await ctx.reply(r.message, { title: r.ok ? '📦 BACKUP' : '❌ BACKUP', color: r.ok ? THEME.gold : THEME.red, html: true });
     },
+    // ----- staff backup listing + targeted restore (owner confirmation) -----
+    backups: async (ctx) => {
+      if (!isStaff(ctx.userId)) return ctx.reply('Only staff can do that. 👑', { title: '🔒 STAFF ONLY', color: THEME.red });
+      const list = backup.listBackups(15);
+      if (!list.length) {
+        return ctx.reply('No backups yet. Run <code>/backup</code> to create one.', { title: '📦 BACKUPS', color: THEME.cyan, html: true });
+      }
+      const lines = list.map((b) => {
+        const when = new Date(b.ts).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+        const flag = b.suspect ? ' ⚠️ SUSPECT' : '';
+        return `• <b>${b.source === 'postgres' ? '🗄️' : '📄'} ${b.id}</b> — ${when}${flag}\n` +
+               `  <code>${b.filename}</code> · ${fmt(b.userCount || '?')} users`;
+      });
+      await ctx.reply(
+        `<b>AVAILABLE BACKUPS</b> (${list.length})\n\n${lines.join('\n')}\n\n` +
+        `Restore one with <code>/restore &lt;id&gt;</code> (owner). ⚠️ SUSPECT snapshots may be a regressed state — prefer a non-suspect one.`,
+        { title: '📦 BACKUPS', color: THEME.cyan, html: true }
+      );
+    },
     restore: async (ctx) => {
       if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
-      const r = backup.restore();
-      db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'restore', 0, 'owner restore from backup');
+      const idArg = (ctx.args && ctx.args[0]) ? Number(ctx.args[0]) : NaN;
+      let r;
+      if (Number.isFinite(idArg) && idArg > 0) {
+        // Targeted restore by id — always logged; caller confirmed the id.
+        r = backup.restoreById(idArg);
+      } else {
+        r = backup.restore(); // newest GOOD backup only (never a suspect)
+      }
+      db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'restore', 0, Number.isFinite(idArg) && idArg > 0 ? `restore by id ${idArg}` : 'restore newest good');
       await ctx.reply(r.message, { title: r.ok ? '♻️ RESTORE' : '❌ RESTORE', color: r.ok ? THEME.gold : THEME.red, html: true });
     },
 
@@ -1473,7 +1500,7 @@ function createBot() {
   // never locked out. Each user/chat gets ONE short notice, then silence.
   const PAUSED_NOTICE =
     '🔒 Rimuru is paused for maintenance. Please try again later.';
-  const PAUSE_EXEMPT_CMDS = ['run', 'backup', 'restore', 'health', 'debug', 'stop', 'start', 'help'];
+  const PAUSE_EXEMPT_CMDS = ['run', 'backup', 'backups', 'restore', 'health', 'debug', 'stop', 'start', 'help'];
   const pausedNotified = new Set(); // `chatId:userId` seen while paused
 
   /** Should this message be ignored because the bot is paused? */
@@ -1534,7 +1561,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'restore', 'redeem', 'stop', 'run'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
