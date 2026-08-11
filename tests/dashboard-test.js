@@ -126,5 +126,29 @@ test('config: dashboard block present', () => {
   assert.ok(config.dashboard.enabled === true);
 });
 
+/* ---------- Task 6: giveaway announces itself (event + broadcast row) ---------- */
+test('dashboard: giveaway creates event AND a broadcast announcement', () => {
+  // Simulate what POST /api/events/giveaway now does (server.js): create the
+  // giveaway event, then create + queue a broadcast so it is actually seen.
+  const ev = db.createEvent({
+    title: '🎁 Free Giveaway',
+    description: 'Free entry — big reward!',
+    type: 'giveaway',
+    reward: 500000,
+    created_by: 1,
+  });
+  assert.ok(ev.id > 0);
+  assert.strictEqual(ev.type, 'giveaway');
+  const msg = `🎁 <b>${ev.title}</b>\n\n${ev.description}\n\n💰 Reward: <b>500,000</b> coins — free entry! Try <code>/mission ${ev.id}</code> to claim it, mortal.`;
+  const bc = db.createBroadcast(msg, 'all', 1);
+  assert.ok(bc.id > 0, 'announcement broadcast row created');
+  assert.ok(bc.message.includes('500,000'), 'broadcast carries the reward');
+  assert.ok(bc.target === 'all', 'targets all chats (users + groups)');
+  // The event is active and claimable
+  const active = db.activeEvents();
+  assert.ok(active.some((e) => e.id === ev.id && e.type === 'giveaway'), 'giveaway is active');
+  db.deleteEvent(ev.id);
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 process.exit(failed ? 1 : 0);

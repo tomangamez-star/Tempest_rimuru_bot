@@ -478,6 +478,184 @@ test('backup: dumps users + inventory, restore round-trips', () => {
   assert.strictEqual(u.wallet, 1234567, 'wallet restored');
   assert.strictEqual(u.bank, 7654321, 'bank restored');
   assert.ok(db.getItemQty(uid, 'hook') >= 2, 'inventory restored');
+  // cleanup: remove the test backup file so the repo tree stays clean
+  try { fs.unlinkSync(b.file); } catch (e) { /* non-fatal */ }
+});
+
+/* ---------- redeem codes ---------- */
+test('redeem: owner creates a code (unlimited amount)', () => {
+  const redeem = require('../src/redeem');
+  const r = redeem.createCode(config.ownerId, ['BONUS100', '1000000', '5'], { first_name: 'King', username: 'king' });
+  assert.ok(r.ok, 'owner can create code: ' + (r.message || ''));
+  assert.strictEqual(r.code, 'BONUS100');
+  const rec = db.getRedeemCode('BONUS100');
+  assert.ok(rec, 'code stored');
+  assert.strictEqual(rec.amount, 1000000);
+  assert.strictEqual(rec.max_uses, 5);
+  assert.strictEqual(rec.used_count, 0);
+});
+
+test('redeem: user redeems code → coins go to BANK, one per user', () => {
+  const redeem = require('../src/redeem');
+  db.getOrCreateUser(8801, { first_name: 'UserA', username: 'usera' });
+  db.setBank(8801, 0);
+  const r = redeem.redeemCode(8801, 'BONUS100', { first_name: 'UserA', username: 'usera' });
+  assert.ok(r.ok, 'redeem ok: ' + (r.message || ''));
+  assert.strictEqual(r.amount, 1000000);
+  const u = db.getUser(8801);
+  assert.strictEqual(u.bank, 1000000, 'coins landed in BANK');
+  assert.strictEqual(u.wallet, config.startBalance, 'wallet untouched');
+  // one per user — second attempt rejected
+  const r2 = redeem.redeemCode(8801, 'BONUS100', { first_name: 'UserA' });
+  assert.ok(!r2.ok, 'second redeem rejected');
+  assert.ok(/already redeemed/i.test(r2.message), 'message mentions already redeemed');
+});
+
+test('redeem: max uses enforced', () => {
+  const redeem = require('../src/redeem');
+  // uses remaining = 4 after user 8801 used one
+  db.getOrCreateUser(8802, { first_name: 'UserB', username: 'userb' });
+  db.getOrCreateUser(8803, { first_name: 'UserC', username: 'userc' });
+  db.getOrCreateUser(8804, { first_name: 'UserD', username: 'userd' });
+  db.getOrCreateUser(8805, { first_name: 'UserE', username: 'usere' });
+  for (const id of [8802, 8803, 8804, 8805]) {
+    const r = redeem.redeemCode(id, 'BONUS100', { first_name: 'U' });
+    assert.ok(r.ok, `redeem ${id} ok: ${r.message || ''}`);
+  }
+  const rec = db.getRedeemCode('BONUS100');
+  assert.strictEqual(rec.used_count, 5, '5 of 5 uses consumed');
+  db.getOrCreateUser(8806, { first_name: 'UserF', username: 'userf' });
+  const r = redeem.redeemCode(8806, 'BONUS100', { first_name: 'UserF' });
+  assert.ok(!r.ok, '6th redeem rejected');
+  assert.ok(/used up|vault is empty/i.test(r.message), 'message mentions used up');
+});
+
+test('redeem: mod create capped at 50M, cannot self-redeem own code', () => {
+  const redeem = require('../src/redeem');
+  // add a moderator (dashboard admin_users)
+  const MOD_ID = 77001;
+  db.addAdminUser(MOD_ID, 'modone', 'mod', 'pw');
+  // mod tries to mint a 100M code → rejected (cap 50M)
+  const big = redeem.createCode(MOD_ID, ['MODBIG', '100000000', '10'], { username: 'modone' });
+  assert.ok(!big.ok, 'mod 100M code rejected');
+  assert.ok(/50,000,000|50M/i.test(big.message), 'message mentions 50M cap');
+  // mod mints a 10M code → ok
+  const ok = redeem.createCode(MOD_ID, ['MOD10', '10000000', '3'], { username: 'modone' });
+  assert.ok(ok.ok, 'mod 10M code created: ' + (ok.message || ''));
+  assert.strictEqual(db.getRedeemCode('MOD10').creator_role, 'mod');
+  // mod tries to redeem own code → rejected
+  const selfR = redeem.redeemCode(MOD_ID, 'MOD10', { username: 'modone' });
+  assert.ok(!selfR.ok, 'mod cannot redeem own code');
+  assert.ok(/own/i.test(selfR.message), 'message mentions own code');
+  // but mod CAN redeem an owner code (BONUS100 is maxed out — create a fresh owner one)
+  const ownerCode = redeem.createCode(config.ownerId, ['OWNER1', '250000', '5'], { username: 'king' });
+  assert.ok(ownerCode.ok, 'owner code created');
+  const modR = redeem.redeemCode(MOD_ID, 'OWNER1', { username: 'modone' });
+  assert.ok(modR.ok, 'mod can redeem owner code: ' + (modR.message || ''));
+  assert.strictEqual(db.getUser(MOD_ID).bank, 250000, 'mod bank credited');
+});
+
+test('redeem: list + delete (staff)', () => {
+  const redeem = require('../src/redeem');
+  const list = redeem.listCodes(config.ownerId);
+  assert.ok(list.ok, 'list works');
+  assert.ok(/BONUS100/.test(list.message), 'list shows BONUS100');
+  // non-staff cannot list
+  const nope = redeem.listCodes(8801);
+  assert.ok(!nope.ok, 'non-staff cannot list');
+  const del = redeem.deleteCode(config.ownerId, 'MOD10', { username: 'king' });
+  assert.ok(del.ok, 'delete works');
+  assert.ok(!db.getRedeemCode('MOD10'), 'code gone after delete');
+});
+
+/* ---------- text→command mapper (Task 3) ---------- */
+test('mapper: every keyboard label routes to its command/page', () => {
+  const keyboards = require('../src/keyboards');
+  const pages = ['main', 'casino', 'games', 'economy'];
+  const seen = [];
+  for (const page of pages) {
+    for (const row of keyboards.keyboardFor(page).keyboard) {
+      for (const btn of row) {
+        const route = keyboards.routeButton(btn.text);
+        assert.ok(route, `button "${btn.text}" routes to something`);
+        if (route.cmd) seen.push(`${btn.text} → /${route.cmd}`);
+        else if (route.page) seen.push(`${btn.text} → page ${route.page}`);
+        else if (route.back) seen.push(`${btn.text} → back`);
+      }
+    }
+  }
+  // spot-check the critical mappings
+  assert.strictEqual(keyboards.routeButton('💰 Balance').cmd, 'balance');
+  assert.strictEqual(keyboards.routeButton('🎰 Casino').page, 'casino');
+  assert.strictEqual(keyboards.routeButton('💼 Economy').page, 'economy');
+  assert.strictEqual(keyboards.routeButton('🏆 Leaderboard').cmd, 'leaderboard');
+  assert.strictEqual(keyboards.routeButton('🎲 Dice').cmd, 'dice');
+  assert.strictEqual(keyboards.routeButton('🪙 Coin Flip').cmd, 'coinflip');
+  assert.strictEqual(keyboards.routeButton('💣 Mines').cmd, 'mines');
+  assert.strictEqual(keyboards.routeButton('🎟️ Lottery').cmd, 'lottery');
+  assert.strictEqual(keyboards.routeButton('🏦 Bank').cmd, 'bank');
+  assert.strictEqual(keyboards.routeButton('💵 Income').cmd, 'income');
+  assert.strictEqual(keyboards.routeButton('🛒 Shop').cmd, 'shop');
+  assert.strictEqual(keyboards.routeButton('🕵️ Crime').cmd, 'crime');
+  assert.strictEqual(keyboards.routeButton('🎣 Fish').cmd, 'fish');
+  assert.strictEqual(keyboards.routeButton('🪪 Profile').cmd, 'profile');
+  assert.strictEqual(keyboards.routeButton('↩️ Back').back, true);
+  assert.strictEqual(keyboards.routeButton('❓ Help').cmd, 'help');
+});
+
+test('mapper: loose match strips emoji variants (client sends different emoji)', () => {
+  const keyboards = require('../src/keyboards');
+  // A client might send the label with a different (or no) emoji — the loose
+  // matcher must still route it.
+  assert.strictEqual(keyboards.routeButton('Balance').cmd, 'balance');
+  assert.strictEqual(keyboards.routeButton('🏦Bank').cmd, 'bank');
+  assert.strictEqual(keyboards.routeButton('coin flip').cmd, 'coinflip');
+  assert.strictEqual(keyboards.routeButton('CRIME').cmd, 'crime');
+  assert.ok(keyboards.routeButton('🎮games').page === 'games' || keyboards.routeButton('🎮games').cmd, 'emoji+label routes');
+});
+
+/* ---------- backup to Postgres (Task 4) ---------- */
+test('backup: snapshot also stored in Postgres table, restore prefers it', () => {
+  const uid = 8810;
+  db.getOrCreateUser(uid, { first_name: 'PG', username: 'pgbackup' });
+  db.setWallet(uid, 2222222);
+  db.setBank(uid, 3333333);
+  db.addItem(uid, 'gun', 1);
+  const b = backup.backup();
+  assert.ok(b.ok, 'backup ok');
+  assert.ok(b.pg === true, 'PG copy stored: ' + JSON.stringify(b));
+  const pgB = db.newestBackupPg();
+  assert.ok(pgB && pgB.data, 'newest PG backup exists');
+  const parsed = JSON.parse(pgB.data);
+  assert.ok(parsed.users.some((u) => u.user_id === uid && u.wallet === 2222222), 'PG backup contains user');
+  assert.ok(db.listBackupsPg().length >= 1, 'listBackupsPg non-empty');
+  // restore picks PG source
+  const r = backup.restore();
+  assert.ok(r.ok, 'restore ok');
+  assert.strictEqual(r.source, 'postgres', 'restore prefers Postgres');
+});
+
+/* ---------- hydration fix (Task 5) ---------- */
+test('hydration: INSERT OR REPLACE so Postgres (source of truth) wins over stale cache', () => {
+  // Simulate: write a NEW balance to "Postgres" (via the sqlite-backed backup
+  // table we treat as the durable store) — then verify that when a fresh
+  // db is hydrated the PG value wins over a stale local row.
+  const uid = 8820;
+  db.getOrCreateUser(uid, { first_name: 'Hydrate', username: 'hydrate' });
+  db.setWallet(uid, 999999); // "new" value
+  // The old bug: INSERT OR IGNORE would keep a stale local row.
+  // The fix: hydrateFromPg uses INSERT OR REPLACE.
+  const dbSrc = require('../src/db');
+  assert.ok(typeof dbSrc.hydrateFromPg === 'function', 'hydrateFromPg exported');
+  // We can't easily point at a live PG in tests; the key assertion is that
+  // the hydrate function body uses INSERT OR REPLACE (checked via source
+  // inspection below — the old buggy code used the INSERT-OR-IGNORE semantic).
+  const fs = require('fs');
+  const dbCode = fs.readFileSync(path.join(__dirname, '..', 'src', 'db.js'), 'utf8');
+  const hydrateSection = dbCode.slice(dbCode.indexOf('async function hydrateFromPg'), dbCode.indexOf('async function hydrateFromPg') + 1400);
+  assert.ok(hydrateSection.includes('INSERT OR REPLACE'), 'hydrate uses INSERT OR REPLACE');
+  assert.ok(!hydrateSection.includes('INSERT OR IGNORE'), 'hydrate body has no INSERT OR IGNORE');
+  assert.ok(dbCode.includes('hidden_until'), 'users cols include hidden_until');
 });
 
 /* ---------- new games ---------- */

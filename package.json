@@ -8,6 +8,7 @@
     "start": "node src/index.js",
     "dev": "node src/index.js",
     "test": "node tests/smoke.js && node tests/dashboard-test.js",
+    "test:pg": "node tests/hydrate-pg-test.js && node tests/pg-persist-test.js",
     "migrate": "node scripts/migrate-sqlite-to-pg.js",
     "migrate:dry": "node scripts/migrate-sqlite-to-pg.js --dry-run",
     "check": "node --check src/index.js && for f in src/*.js src/dashboard/*.js src/games/*.js src/crimes/*.js tests/*.js scripts/*.js; do node --check \"$f\" || exit 1; done && echo 'ALL SYNTAX OK'"

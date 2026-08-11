@@ -155,6 +155,32 @@ CREATE TABLE IF NOT EXISTS inventory (
   updated_at INTEGER NOT NULL,
   PRIMARY KEY (user_id, item_id)
 );
+
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  code       TEXT PRIMARY KEY,
+  amount     INTEGER NOT NULL,
+  max_uses   INTEGER NOT NULL,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER NOT NULL,           -- Telegram user ID of the creator
+  creator_role TEXT DEFAULT 'owner',     -- owner | mod (mods are capped at 50M)
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS redeem_redemptions (
+  code       TEXT NOT NULL,
+  user_id    INTEGER NOT NULL,
+  redeemed_at INTEGER NOT NULL,
+  PRIMARY KEY (code, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS backups (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  filename   TEXT NOT NULL,
+  data       TEXT NOT NULL,              -- full JSON snapshot (users + inventory)
+  user_count INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
 `);
 
 /* ================= Postgres (durable store) ================= */
@@ -319,6 +345,29 @@ CREATE TABLE IF NOT EXISTS inventory (
   updated_at BIGINT NOT NULL,
   PRIMARY KEY (user_id, item_id)
 );
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  code         TEXT PRIMARY KEY,
+  amount       BIGINT NOT NULL,
+  max_uses     BIGINT NOT NULL,
+  used_count   BIGINT NOT NULL DEFAULT 0,
+  created_by   BIGINT NOT NULL,
+  creator_role TEXT DEFAULT 'owner',
+  created_at   BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS redeem_redemptions (
+  code        TEXT NOT NULL,
+  user_id     BIGINT NOT NULL,
+  redeemed_at BIGINT NOT NULL,
+  PRIMARY KEY (code, user_id)
+);
+CREATE TABLE IF NOT EXISTS backups (
+  id         BIGSERIAL PRIMARY KEY,
+  filename   TEXT NOT NULL,
+  data       TEXT NOT NULL,
+  user_count BIGINT NOT NULL DEFAULT 0,
+  created_by BIGINT DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
 `;
 
 /** Create Postgres tables (idempotent). Returns true on success. */
@@ -472,7 +521,7 @@ function pgRun(table, sql, params = []) {
 /* ================= Table mirror helpers ================= */
 
 const TABLE_COLS = {
-  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, created_at',
+  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, hidden_until, created_at',
   cooldowns: 'user_id, action, until',
   lottery: 'id, pot, ticket_count, tickets',
   heists: 'leader_id, leader_name, target_id, target_name, members, started_at, status',
@@ -484,6 +533,9 @@ const TABLE_COLS = {
   chat_logs: 'id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at',
   game_history: 'id, user_id, username, game, bet, result, amount, meta, created_at',
   inventory: 'user_id, item_id, quantity, updated_at',
+  redeem_codes: 'code, amount, max_uses, used_count, created_by, creator_role, created_at',
+  redeem_redemptions: 'code, user_id, redeemed_at',
+  backups: 'id, filename, data, user_count, created_by, created_at',
 };
 
 function sqliteRows(table) {
@@ -508,6 +560,9 @@ const TABLE_PKS = {
   chat_logs: ['id'],
   game_history: ['id'],
   inventory: ['user_id', 'item_id'], // composite primary key
+  redeem_codes: ['code'],
+  redeem_redemptions: ['code', 'user_id'], // composite primary key
+  backups: ['id'],
 };
 
 /**
@@ -1194,6 +1249,139 @@ function hasItem(userId, itemId, qty = 1) {
   return getItemQty(userId, itemId) >= qty;
 }
 
+/* ---------------- Redeem codes ---------------- */
+
+/** Create a redeem code. Returns the row or null on duplicate. */
+function createRedeemCode(code, amount, maxUses, createdBy, creatorRole = 'owner') {
+  const c = String(code || '').trim().toUpperCase();
+  if (!c) return null;
+  try {
+    db.prepare(`INSERT INTO redeem_codes (code, amount, max_uses, used_count, created_by, creator_role, created_at)
+               VALUES (?, ?, ?, 0, ?, ?, ?)`)
+      .run(c, amount, maxUses, createdBy, creatorRole || 'owner', Date.now());
+  } catch (e) {
+    return null; // duplicate code (PRIMARY KEY)
+  }
+  const row = db.prepare('SELECT * FROM redeem_codes WHERE code = ?').get(c);
+  pgRun(
+    'redeem_codes',
+    `INSERT INTO redeem_codes (code, amount, max_uses, used_count, created_by, creator_role, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6, $7)
+     ON CONFLICT (code) DO UPDATE SET amount = EXCLUDED.amount, max_uses = EXCLUDED.max_uses,
+       created_by = EXCLUDED.created_by, creator_role = EXCLUDED.creator_role` ,
+    [c, amount, maxUses, 0, createdBy, creatorRole || 'owner', Date.now()]
+  );
+  return row;
+}
+
+/** Look up a redeem code (null if missing). */
+function getRedeemCode(code) {
+  const row = db.prepare('SELECT * FROM redeem_codes WHERE code = ?').get(String(code || '').trim().toUpperCase());
+  if (!row) return null;
+  return {
+    code: row.code,
+    amount: Number(row.amount) || 0,
+    max_uses: Number(row.max_uses) || 0,
+    used_count: Number(row.used_count) || 0,
+    created_by: Number(row.created_by) || 0,
+    creator_role: row.creator_role || 'owner',
+    created_at: Number(row.created_at) || 0,
+  };
+}
+
+/** All active codes (newest first). */
+function listRedeemCodes() {
+  return db.prepare('SELECT * FROM redeem_codes ORDER BY created_at DESC').all()
+    .map((row) => ({
+      code: row.code,
+      amount: Number(row.amount) || 0,
+      max_uses: Number(row.max_uses) || 0,
+      used_count: Number(row.used_count) || 0,
+      created_by: Number(row.created_by) || 0,
+      creator_role: row.creator_role || 'owner',
+      created_at: Number(row.created_at) || 0,
+    }));
+}
+
+/** Delete a redeem code. Returns true if a row was removed. */
+function deleteRedeemCode(code) {
+  const c = String(code || '').trim().toUpperCase();
+  const r = db.prepare('DELETE FROM redeem_codes WHERE code = ?').run(c);
+  pgRun('redeem_codes', 'DELETE FROM redeem_codes WHERE code = $1', [c]);
+  return r.changes > 0;
+}
+
+/** Has this user already redeemed this code? */
+function hasRedeemed(userId, code) {
+  const row = db.prepare('SELECT 1 FROM redeem_redemptions WHERE code = ? AND user_id = ?')
+    .get(String(code || '').trim().toUpperCase(), userId);
+  return !!row;
+}
+
+/** Record a redemption (code + user). Returns true if newly recorded. */
+function recordRedemption(userId, code) {
+  const c = String(code || '').trim().toUpperCase();
+  try {
+    db.prepare('INSERT INTO redeem_redemptions (code, user_id, redeemed_at) VALUES (?, ?, ?)')
+      .run(c, userId, Date.now());
+  } catch (e) {
+    return false; // already redeemed (PRIMARY KEY)
+  }
+  // bump used_count on the code
+  db.prepare('UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = ?').run(c);
+  pgRun(
+    'redeem_redemptions',
+    `INSERT INTO redeem_redemptions (code, user_id, redeemed_at) VALUES ($1, $2, $3)
+     ON CONFLICT (code, user_id) DO NOTHING`,
+    [c, userId, Date.now()]
+  );
+  pgRun('redeem_codes', 'UPDATE redeem_codes SET used_count = used_count + 1 WHERE code = $1', [c]);
+  return true;
+}
+
+/* ---------------- Backups (Postgres snapshot store) ---------------- */
+
+/** Save a backup snapshot to BOTH the local file (legacy) and Postgres. */
+function saveBackupPg(filename, data, userCount, createdBy) {
+  db.prepare(`INSERT INTO backups (filename, data, user_count, created_by, created_at)
+             VALUES (?, ?, ?, ?, ?)`)
+    .run(filename, data, userCount, createdBy || 0, Date.now());
+  const row = db.prepare('SELECT * FROM backups ORDER BY id DESC LIMIT 1').get();
+  pgRun(
+    'backups',
+    `INSERT INTO backups (id, filename, data, user_count, created_by, created_at)
+     VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT (id) DO NOTHING`,
+    [row.id, row.filename, row.data, row.user_count, row.created_by, row.created_at]
+  );
+  return row;
+}
+
+/** The NEWEST backup stored in Postgres (null if none). */
+function newestBackupPg() {
+  const row = db.prepare('SELECT * FROM backups ORDER BY id DESC LIMIT 1').get();
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    filename: row.filename,
+    data: row.data,
+    user_count: Number(row.user_count) || 0,
+    created_by: Number(row.created_by) || 0,
+    created_at: Number(row.created_at) || 0,
+  };
+}
+
+/** All backups stored (newest first) \u2014 used by /backup list. */
+function listBackupsPg(limit = 10) {
+  return db.prepare('SELECT * FROM backups ORDER BY id DESC LIMIT ?').all(limit)
+    .map((row) => ({
+      id: Number(row.id),
+      filename: row.filename,
+      user_count: Number(row.user_count) || 0,
+      created_by: Number(row.created_by) || 0,
+      created_at: Number(row.created_at) || 0,
+    }));
+}
+
 /* ---------------- Cleanup ---------------- */
 
 /** Clear expired temporary penalties (mute/suspend) — called periodically. */
@@ -1214,7 +1402,17 @@ function expirePenalties() {
 
 /**
  * Copy Postgres rows back into SQLite (used on boot so the cache starts from
- * the durable store). Idempotent; skips rows already present.
+ * the durable store). Postgres is the SOURCE OF TRUTH for persistence: rows
+ * that exist in Postgres OVERWRITE any local SQLite row (INSERT OR REPLACE),
+ * so a stale local snapshot can never win over newer Postgres data. Rows that
+ * only exist locally are kept and pushed up by mirrorAll() right after.
+ *
+ * FIX (Task 5): the old implementation kept the local SQLite row whenever it
+ * already existed (INSERT OR IGNORE semantics) — i.e. the STALE cache beat the
+ * fresh Postgres data on every boot. That is exactly why balances kept
+ * reverting to old digits even though writes were verified (writesOk > 0):
+ * the write pipeline was healthy, but the READ path was overwriting fresh
+ * data with the stale cache on boot.
  */
 async function hydrateFromPg() {
   if (!pool) return 0;
@@ -1224,18 +1422,14 @@ async function hydrateFromPg() {
     try {
       for (const [table, colsStr] of Object.entries(TABLE_COLS)) {
         const cols = colsStr.split(', ');
-        const pk = cols[0];
         const { rows } = await client.query(`SELECT ${colsStr} FROM ${table}`);
         if (!rows.length) continue;
-        const insert = db.prepare(
-          `INSERT OR IGNORE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
+        const upsert = db.prepare(
+          `INSERT OR REPLACE INTO ${table} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')})`
         );
         for (const r of rows) {
           const vals = cols.map((c) => r[c]);
-          if (table === 'users') {
-            // keep newest row on conflict for users (INSERT OR IGNORE keeps existing — fine)
-          }
-          insert.run(...vals);
+          upsert.run(...vals);
           restored++;
         }
       }
@@ -1452,8 +1646,20 @@ module.exports = {
   addItem,
   removeItem,
   hasItem,
+  // Redeem codes
+  createRedeemCode,
+  getRedeemCode,
+  listRedeemCodes,
+  deleteRedeemCode,
+  hasRedeemed,
+  recordRedemption,
+  // Backups (Postgres snapshot store)
+  saveBackupPg,
+  newestBackupPg,
+  listBackupsPg,
   // Persistence
   initPersistence,
+  hydrateFromPg,
   syncInfo,
   ping,
   close,

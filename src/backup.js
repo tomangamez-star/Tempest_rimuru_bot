@@ -1,15 +1,16 @@
 'use strict';
 /**
- * Rimuru Tempest Casino — backup & restore 🛟
+ * Rimuru Tempest Casino — backup & restore 📦
  * /backup  (owner only) — dump ALL user data (balances, status, hidden,
- *            inventory) to backups/backup-<timestamp>.json committed to repo.
- * /restore (owner only) — read the NEWEST backups/backup-*.json and restore
- *            balances/user data from it. Restores exactly what the backup
- *            contains — never touches users/items not present in the file.
+ *            inventory) to backups/backup-<timestamp>.json AND to the
+ *            `backups` table in Postgres (survives redeploys).
+ * /restore (owner only) — restore from the NEWEST backup, preferring the
+ *            Postgres copy (survives Render's ephemeral disk); falls back
+ *            to a local backups/*.json file if no PG backup exists yet.
  *
- * Safety: restore is UPSERT-only (existing rows keep newer data only where
- * the backup explicitly has values — wallet/bank/status are set from the
- * backup, nothing is deleted). It is a safety net for when Supabase fails.
+ * Safety: restore is UPSERT-only (wallet/bank/status/inventory are set from
+ * the backup; nothing is deleted; rows not present in the backup are never
+ * touched). It is a safety net for when Supabase fails.
  */
 const fs = require('fs');
 const path = require('path');
@@ -42,8 +43,9 @@ function userSnapshot(u) {
 }
 
 /**
- * /backup — dump every user (with inventory) to backups/backup-<ts>.json.
- * @returns { ok, message, file? }
+ * /backup — dump every user (with inventory) to a local JSON file AND to
+ * Postgres (backups table) so the snapshot survives redeploys.
+ * @returns { ok, message, file?, pg? }
  */
 function backup() {
   try {
@@ -58,18 +60,31 @@ function backup() {
       counts: { users: users.length },
       users: users.map(userSnapshot),
     };
-    fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8');
+    const json = JSON.stringify(data, null, 2);
+    fs.writeFileSync(file, json, 'utf8');
+    // NEW: also persist the snapshot to Postgres (survives redeploys).
+    let pgStored = false;
+    try {
+      db.saveBackupPg(`backup-${ts}.json`, json, users.length, 0);
+      pgStored = true;
+    } catch (e) {
+      console.error('[backup] PG snapshot store failed (local file kept):', e.message);
+    }
     return {
       ok: true,
       file,
+      pg: pgStored,
       message:
-        `\ud83d\udce6 <b>BACKUP COMPLETE</b>\n\n` +
-        `\ud83d\udc65 Users: <b>${fmt(users.length)}</b>\n` +
-        `\ud83d\udcc1 File: <code>backups/backup-${ts}.json</code>\n\n` +
+        `📦 <b>BACKUP COMPLETE</b>\n\n` +
+        `👥 Users: <b>${fmt(users.length)}</b>\n` +
+        `📄 File: <code>backups/backup-${ts}.json</code>\n` +
+        (pgStored
+          ? `🗄️ <b>Postgres copy: SAVED</b> — survives redeploys.\n\n`
+          : `⚠️ <b>Postgres copy FAILED</b> — only the local file was written (ephemeral).\n\n`) +
         `The safety net is in place. Restore with <code>/restore</code> if the vault ever fails.`,
     };
   } catch (e) {
-    return { ok: false, message: `\u274c Backup failed: ${e.message}` };
+    return { ok: false, message: `❌ Backup failed: ${e.message}` };
   }
 }
 
@@ -83,22 +98,50 @@ function newestBackupFile() {
   return files.length ? path.join(BACKUP_DIR, files[0]) : null;
 }
 
+/** Parse a backup payload (either from a file or from Postgres). */
+function parseBackupData(raw) {
+  const data = typeof raw === 'string' ? JSON.parse(raw) : raw;
+  return Array.isArray(data.users) ? data.users : [];
+}
+
 /**
- * /restore — restore from the newest backup file.
+ * /restore — restore from the NEWEST backup, preferring the Postgres copy
+ * (survives redeploys); falls back to the newest local backups/*.json file.
  * Upserts every user in the backup (wallet/bank/status/inventory).
- * @returns { ok, message }
+ * @returns { ok, message, source? }
  */
 function restore() {
   try {
-    const file = newestBackupFile();
-    if (!file) {
-      return { ok: false, message: '\u274c No backups found. Run <code>/backup</code> first to create one.' };
+    let source = 'postgres';
+    let users = [];
+
+    // 1) Prefer the newest backup stored in Postgres.
+    try {
+      const pgBackup = db.newestBackupPg();
+      if (pgBackup && pgBackup.data) {
+        users = parseBackupData(pgBackup.data);
+      }
+    } catch (e) {
+      console.error('[restore] PG backup read failed (falling back to file):', e.message);
     }
-    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
-    const users = Array.isArray(data.users) ? data.users : [];
+
+    // 2) Fall back to a local file when no PG backup exists (or is unreadable).
     if (!users.length) {
-      return { ok: false, message: '\u274c That backup contains no users.' };
+      const file = newestBackupFile();
+      if (file) {
+        source = 'file';
+        users = parseBackupData(fs.readFileSync(file, 'utf8'));
+      }
     }
+
+    if (!users.length) {
+      return {
+        ok: false,
+        message:
+          '❌ No backups found (Postgres or local). Run <code>/backup</code> first to create one.',
+      };
+    }
+
     let restored = 0;
     for (const u of users) {
       const id = Number(u.user_id);
@@ -118,14 +161,15 @@ function restore() {
     }
     return {
       ok: true,
+      source,
       message:
-        `\u267b\ufe0f <b>RESTORE COMPLETE</b>\n\n` +
-        `\ud83d\udcc1 File: <code>${safeName(path.basename(file))}</code>\n` +
-        `\ud83d\udc65 Users restored: <b>${fmt(restored)}</b>\n\n` +
+        `♻️ <b>RESTORE COMPLETE</b>\n\n` +
+        `📦 Source: <b>${source === 'postgres' ? '🗄️ Postgres (latest snapshot)' : '📄 local backup file'}</b>\n` +
+        `👥 Users restored: <b>${fmt(restored)}</b>\n\n` +
         `The vault has been rebuilt from the backup.`,
     };
   } catch (e) {
-    return { ok: false, message: `\u274c Restore failed: ${e.message}` };
+    return { ok: false, message: `❌ Restore failed: ${e.message}` };
   }
 }
 

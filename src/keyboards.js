@@ -74,6 +74,12 @@ const B = {
  * Map a tapped button text → the command/menu page it triggers.
  * Return value: { cmd } for game/economy commands, { page } for
  * sub-keyboard pages, { back: true } for the main keyboard.
+ *
+ * FIX (Task 3): routeButton() below is deliberately LOOSE — it strips the
+ * leading emoji (and any trailing …/whitespace) before the lookup and also
+ * tries a case-insensitive match. Telegram sends the exact label text, but
+ * different clients/keyboards can send emoji variations, so the loose match
+ * guarantees a tapped button ALWAYS routes to its command.
  */
 const BUTTON_COMMANDS = {
   [B.casino]: { page: 'casino' },
@@ -98,6 +104,15 @@ const BUTTON_COMMANDS = {
   [B.fish]: { cmd: 'fish' },
   [B.profile]: { cmd: 'profile' },
   [B.back]: { back: true },
+  // New games (typed labels — no emoji) so players can also tap these.
+  'Crash': { cmd: 'crash' },
+  'Wheel': { cmd: 'wheel' },
+  'RPS': { cmd: 'rps' },
+  'Tic Tac Toe': { cmd: 'ttt' },
+  'Duel': { cmd: 'duel' },
+  'Coin Flip Streak': { cmd: 'cfs' },
+  'Number Roulette': { cmd: 'num' },
+  'Guess Number': { cmd: 'guess' },
 };
 
 /**
@@ -161,29 +176,30 @@ const mainKeyboard = () =>
     [B.leaderboard, B.help],
   ]);
 
-/** 🎰 Casino sub-keyboard. */
-const casinoKeyboard = () =>
-  kb([
-    [B.slots, B.blackjack],
-    [B.roulette, B.race],
-    [B.back],
-  ]);
-
-/** 🎮 Games sub-keyboard. */
-const gamesKeyboard = () =>
-  kb([
-    [B.dice, B.coinflip],
-    [B.mines, B.higherlower],
-    [B.lottery, B.back],
-  ]);
-
 /** 💼 Economy sub-keyboard. */
 const economyKeyboard = () =>
   kb([
     [B.balance, B.bank],
     [B.income, B.shop],
-    [B.crime, B.leaderboard],
+    [B.crime, B.fish],
     [B.profile, B.back],
+  ]);
+
+/** 🎰 Casino sub-keyboard (all casino games). */
+const casinoKeyboard = () =>
+  kb([
+    [B.slots, B.blackjack],
+    [B.roulette, B.race],
+    [B.dice, B.higherlower],
+    [B.back],
+  ]);
+
+/** 🎮 Games sub-keyboard (all games incl. new ones). */
+const gamesKeyboard = () =>
+  kb([
+    [B.dice, B.coinflip],
+    [B.mines, B.lottery],
+    [B.higherlower, B.back],
   ]);
 
 /** All keyboard builders by page name. */
@@ -204,9 +220,31 @@ function keyboardFor(page) {
   return builder();
 }
 
-/** Reverse lookup: given tapped text, return { cmd } | { page } | { back }. */
+/**
+ * Reverse lookup: given tapped text, return { cmd } | { page } | { back }.
+ * LOOSE matching (FIX Task 3): strips the leading emoji/whitespace and
+ * trailing punctuation from the incoming text, then matches exact or
+ * case-insensitive (also comparing emoji-stripped keys). This makes button
+ * taps route even when a client sends an emoji variant of the label.
+ */
+const EMOJI_STRIP = /^[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{FE0F}\u{200D}\s]+/u;
+function stripLabel(s) {
+  return String(s || '').replace(EMOJI_STRIP, '').replace(/[.…\s]+$/u, '').trim();
+}
 function routeButton(text) {
-  return BUTTON_COMMANDS[String(text || '').trim()] || null;
+  const raw = String(text || '').trim();
+  if (!raw) return null;
+  // 1) exact
+  if (BUTTON_COMMANDS[raw]) return BUTTON_COMMANDS[raw];
+  // 2) strip leading emoji + whitespace (and trailing '…'/'...')
+  const stripped = stripLabel(raw);
+  if (BUTTON_COMMANDS[stripped]) return BUTTON_COMMANDS[stripped];
+  // 3) case-insensitive fallback over emoji-stripped keys
+  const lower = stripped.toLowerCase();
+  for (const k of Object.keys(BUTTON_COMMANDS)) {
+    if (stripLabel(k).toLowerCase() === lower) return BUTTON_COMMANDS[k];
+  }
+  return null;
 }
 
 module.exports = {

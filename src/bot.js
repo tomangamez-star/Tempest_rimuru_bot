@@ -54,6 +54,7 @@ const heist = require('./crimes/heist');
 const keyboards = require('./keyboards');
 const missions = require('./missions');
 const backup = require('./backup');
+const redeem = require('./redeem');
 const profile = require('./profile');
 const dashboard = require('./dashboard/server');
 
@@ -671,8 +672,12 @@ function createBot() {
         `<b>🕹️ Other</b>\n` +
         `• /race [amt] — race against the house\n` +
         `• /hide — 50M coins, vanish from robs &amp; heists for 60s\n` +
+        `• /redeem [CODE] — claim a code (coins go to BANK)\n` +
         `• /verify — re-check your group membership\n` +
         `• /health — bot health &amp; persistence status (anyone)\n\n` +
+        `<b>👑 Staff</b>\n` +
+        `• /redeem create [CODE] [AMT] [USES] — mint a code (mods capped at 50M)\n` +
+        `• /redeem list · /redeem delete [CODE] · /backup · /restore\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -1162,6 +1167,26 @@ function createBot() {
       db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'restore', 0, 'owner restore from backup');
       await ctx.reply(r.message, { title: r.ok ? '♻️ RESTORE' : '❌ RESTORE', color: r.ok ? THEME.gold : THEME.red, html: true });
     },
+
+    // ----- redeem codes: /redeem [CODE] (user) · create/list/delete (staff) -----
+    redeem: async (ctx) => {
+      const args = ctx.args || [];
+      const sub = String(args[0] || '').toLowerCase();
+      const rest = args.slice(1);
+      let r;
+      if (sub === 'create') {
+        r = redeem.createCode(ctx.userId, rest, metaOf(ctx.msg));
+      } else if (sub === 'list') {
+        r = redeem.listCodes(ctx.userId);
+      } else if (sub === 'delete') {
+        r = redeem.deleteCode(ctx.userId, rest[0], metaOf(ctx.msg));
+      } else {
+        r = redeem.redeemCode(ctx.userId, args[0], metaOf(ctx.msg));
+      }
+      await ctx.reply(r.message, {
+        title: '🎟️ REDEEM', color: r.ok ? THEME.gold : THEME.red, html: true,
+      });
+    },
   };
 
   /** Split "/ban 2h spamming" → { dur: '2h', reason: 'spamming' } */
@@ -1446,7 +1471,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'restore'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'restore', 'redeem'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {

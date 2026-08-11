@@ -61,6 +61,15 @@ function setActiveBot(bot) {
   activeBot = bot;
 }
 
+/** HTML-escape text for Telegram parse_mode=HTML broadcasts. */
+function escHtml(s) {
+  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+/** Format a number with thousands separators. */
+function fmt(n) {
+  return Number(n || 0).toLocaleString('en-US');
+}
+
 /* ---------- broadcast queue (module-level — bot.js drains it) ---------- */
 const broadcastQueue = [];
 function queueBroadcast(id, message, target) {
@@ -427,7 +436,9 @@ function createDashboard(server, bot) {
     res.json({ ok: true, event: ev });
   });
 
-  /** Create a pre-built free-entry giveaway event (no cost, big reward). */
+  /** Create a pre-built free-entry giveaway event (no cost, big reward) AND
+   *  broadcast the announcement to the bot's chats (users + groups) via the
+   *  same queue the /broadcast API uses — so the giveaway is actually SEEN. */
   app.post('/api/events/giveaway', requireAuth, (req, res) => {
     const { title, description, reward } = req.body || {};
     const ev = db.createEvent({
@@ -440,7 +451,22 @@ function createDashboard(server, bot) {
     });
     db.logActivity('event', `Giveaway event created: ${ev.title}`, { event_id: ev.id });
     audit(req.admin, 'create_giveaway', 0, ev.title);
-    res.json({ ok: true, event: ev });
+    // FIX: actually ANNOUNCE the giveaway — queue a broadcast so the bot
+    // fan-out sends it to every user + group chat (was missing before).
+    if (activeBot) {
+      try {
+        const rec = db.createBroadcast(
+          `🎁 <b>${escHtml(ev.title)}</b>\n\n${escHtml(ev.description || '')}\n\n💰 Reward: <b>${fmt(ev.reward)}</b> coins — free entry! Try <code>/mission ${ev.id}</code> to claim it, mortal.`,
+          'all',
+          req.admin.userId
+        );
+        queueBroadcast(rec.id, rec.message, 'all');
+        db.logActivity('broadcast', `Giveaway announced to all chats: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
+      } catch (e) {
+        console.error('[dashboard] giveaway broadcast failed:', e.message);
+      }
+    }
+    res.json({ ok: true, event: ev, announced: !!activeBot });
   });
 
   app.patch('/api/events/:id', requireAuth, (req, res) => {

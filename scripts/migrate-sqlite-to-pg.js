@@ -168,11 +168,34 @@ CREATE TABLE IF NOT EXISTS inventory (
   updated_at BIGINT NOT NULL,
   PRIMARY KEY (user_id, item_id)
 );
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  code         TEXT PRIMARY KEY,
+  amount       BIGINT NOT NULL,
+  max_uses     BIGINT NOT NULL,
+  used_count   BIGINT NOT NULL DEFAULT 0,
+  created_by   BIGINT NOT NULL,
+  creator_role TEXT DEFAULT 'owner',
+  created_at   BIGINT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS redeem_redemptions (
+  code        TEXT NOT NULL,
+  user_id     BIGINT NOT NULL,
+  redeemed_at BIGINT NOT NULL,
+  PRIMARY KEY (code, user_id)
+);
+CREATE TABLE IF NOT EXISTS backups (
+  id         BIGSERIAL PRIMARY KEY,
+  filename   TEXT NOT NULL,
+  data       TEXT NOT NULL,
+  user_count BIGINT NOT NULL DEFAULT 0,
+  created_by BIGINT DEFAULT 0,
+  created_at BIGINT NOT NULL
+);
 `;
 
 /** Column list per table — mirrors TABLE_COLS in src/db.js (order matters). */
 const TABLE_COLS = {
-  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, created_at',
+  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, hidden_until, created_at',
   cooldowns: 'user_id, action, until',
   lottery: 'id, pot, ticket_count, tickets',
   heists: 'leader_id, leader_name, target_id, target_name, members, started_at, status',
@@ -184,6 +207,9 @@ const TABLE_COLS = {
   chat_logs: 'id, user_id, username, first_name, chat_id, chat_title, text, is_command, created_at',
   game_history: 'id, user_id, username, game, bet, result, amount, meta, created_at',
   inventory: 'user_id, item_id, quantity, updated_at',
+  redeem_codes: 'code, amount, max_uses, used_count, created_by, creator_role, created_at',
+  redeem_redemptions: 'code, user_id, redeemed_at',
+  backups: 'id, filename, data, user_count, created_by, created_at',
 };
 
 /**
@@ -203,6 +229,9 @@ const PK_COLS = {
   activity_feed: ['id'],
   audit_log: ['id'],
   inventory: ['user_id', 'item_id'],
+  redeem_codes: ['code'],
+  redeem_redemptions: ['code', 'user_id'],
+  backups: ['id'],
 };
 
 /** Normalize a SQLite value for Postgres (BIGINT/BIGSERIAL/SMALLINT safety). */
