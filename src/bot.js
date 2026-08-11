@@ -584,6 +584,10 @@ function createBot() {
       );
       // Native reply keyboard appears automatically after /start —
       // the grid above the phone keyboard (toggleable, not persistent).
+      // ALWAYS re-send a FRESH main keyboard: Telegram caches the keyboard
+      // per chat, so a group that saw an OLD deploy's labels (e.g. colored
+      // emojis from a previous build) keeps tapping stale text. Re-sending
+      // here replaces the stale cached keyboard with the current labels.
       if (config.showReplyKeyboard) {
         try {
           await bot.sendMessage(ctx.chatId, '⌨️ Your quick-menu keyboard is ready below.', {
@@ -677,7 +681,8 @@ function createBot() {
         `• /health — bot health &amp; persistence status (anyone)\n\n` +
         `<b>👑 Staff</b>\n` +
         `• /redeem create [CODE] [AMT] [USES] — mint a code (mods capped at 50M)\n` +
-        `• /redeem list · /redeem delete [CODE] · /backup · /restore\n\n` +
+        `• /redeem list · /redeem delete [CODE] · /backup · /restore\n` +
+        `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -1016,6 +1021,35 @@ function createBot() {
       if (!target) return ctx.reply('Reply to someone with <code>/unmute</code>. 🎯', { title: '👑 ADMIN', color: THEME.red, html: true });
       const r = admin.liftPenalty(target.id);
       await ctx.reply(r.message, { title: '👑 ADMIN — UNMUTE', color: THEME.cyan });
+    },
+
+    // ----- /stop & /run — maintenance pause (owner only, persisted) -----
+    // While paused Rimuru ignores ALL non-owner users in groups AND DMs
+    // (commands, games, button taps, chat). The owner stays exempt so they
+    // can always /run, /backup, /restore, /health. The flag lives in the DB
+    // (SQLite + Postgres) so the pause survives redeploys.
+    stop: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '🔒 PAUSE', color: THEME.red });
+      db.setBotPaused(true);
+      db.logActivity('mod', `/stop by ${metaOf(ctx.msg).username || ctx.userId} — bot PAUSED`, { target: ctx.userId });
+      await ctx.reply(
+        `🔒 <b>RIMURU PAUSED</b>\n\n` +
+        `All non-owner users are now ignored — no commands, no games, no button taps.\n` +
+        `The pause is <b>persisted</b> and survives redeploys.\n\n` +
+        `Resume with <code>/run</code>. The house is closed. 🚪`,
+        { title: '🔒 PAUSE', color: THEME.red, html: true }
+      );
+    },
+    run: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '▶️ RESUME', color: THEME.red });
+      db.setBotPaused(false);
+      pausedNotified.clear(); // fresh notices after resume
+      db.logActivity('mod', `/run by ${metaOf(ctx.msg).username || ctx.userId} — bot RESUMED`, { target: ctx.userId });
+      await ctx.reply(
+        `▶️ <b>RIMURU RESUMED</b>\n\n` +
+        `The house is open again. Welcome back, mortals. 🎰`,
+        { title: '▶️ RESUME', color: THEME.gold, html: true }
+      );
     },
 
     // ----- staff reset: clear ALL active state (owner + moderators) -----
@@ -1432,12 +1466,41 @@ function createBot() {
 
   /* ---------- message routing ---------- */
 
+  // Maintenance pause (/stop, owner only) — persisted, survives redeploys.
+  // While paused, EVERY non-owner interaction is ignored (commands, games,
+  // button taps, Rimuru chat). The owner stays exempt and can always use
+  // /run, /backup, /restore, /health and other admin commands so they are
+  // never locked out. Each user/chat gets ONE short notice, then silence.
+  const PAUSED_NOTICE =
+    '🔒 Rimuru is paused for maintenance. Please try again later.';
+  const PAUSE_EXEMPT_CMDS = ['run', 'backup', 'restore', 'health', 'debug', 'stop', 'start', 'help'];
+  const pausedNotified = new Set(); // `chatId:userId` seen while paused
+
+  /** Should this message be ignored because the bot is paused? */
+  function isPausedFor(msg) {
+    if (!db.getBotPaused()) return false;
+    const from = msg.from || {};
+    if (String(from.id) === String(config.ownerId)) return false; // owner exempt
+    const parsed = parseCommand(String(msg.text || msg.caption || ''));
+    if (parsed && PAUSE_EXEMPT_CMDS.includes(parsed.cmd)) return false;
+    const key = `${msg.chat.id}:${from.id}`;
+    if (!pausedNotified.has(key)) {
+      pausedNotified.add(key);
+      try {
+        bot.sendMessage(msg.chat.id, PAUSED_NOTICE).catch(() => {});
+      } catch (e) { /* non-fatal */ }
+    }
+    return true;
+  }
+
   async function onMessage(msg) {
     // Ignore non-user messages (channel posts, etc.)
     if (!msg.from || msg.from.is_bot) return;
     const text = String(msg.text || msg.caption || '');
     const userId = msg.from.id;
     const chatId = msg.chat.id;
+    // Maintenance pause gate — BEFORE any handling (except owner + exempt).
+    if (isPausedFor(msg)) return;
     // Dashboard: log every user message (chat log for moderation).
     try { db.logChat(msg); } catch (e) { /* non-fatal */ }
     // Quote the triggering message on EVERY response from this handler —
@@ -1471,7 +1534,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'restore', 'redeem'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'restore', 'redeem', 'stop', 'run'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
@@ -1616,7 +1679,11 @@ function createBot() {
       const target = item.target || 'all';
       const chats = new Set();
       try {
-        for (const row of db.getSeenChatIds()) chats.add(row.chat_id);
+        // FIX: getSeenChatIds() returns a FLAT array of chat ids (numbers),
+        // NOT rows — iterating `row.chat_id` made every entry `undefined` and
+        // the fan-out list became [undefined], so broadcasts silently
+        // delivered to 0 chats. Use the ids directly.
+        for (const cid of db.getSeenChatIds()) chats.add(Number(cid));
       } catch (e) { /* non-fatal */ }
       let list = [...chats];
       if (target === 'groups') list = list.filter((c) => c < 0);

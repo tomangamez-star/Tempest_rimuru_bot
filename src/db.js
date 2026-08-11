@@ -181,6 +181,12 @@ CREATE TABLE IF NOT EXISTS backups (
   created_by INTEGER DEFAULT 0,
   created_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
 `);
 
 /* ================= Postgres (durable store) ================= */
@@ -368,6 +374,12 @@ CREATE TABLE IF NOT EXISTS backups (
   created_by BIGINT DEFAULT 0,
   created_at BIGINT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+  key        TEXT PRIMARY KEY,
+  value      TEXT NOT NULL,
+  updated_at BIGINT NOT NULL
+);
 `;
 
 /** Create Postgres tables (idempotent). Returns true on success. */
@@ -536,6 +548,7 @@ const TABLE_COLS = {
   redeem_codes: 'code, amount, max_uses, used_count, created_by, creator_role, created_at',
   redeem_redemptions: 'code, user_id, redeemed_at',
   backups: 'id, filename, data, user_count, created_by, created_at',
+  settings: 'key, value, updated_at',
 };
 
 function sqliteRows(table) {
@@ -563,6 +576,7 @@ const TABLE_PKS = {
   redeem_codes: ['code'],
   redeem_redemptions: ['code', 'user_id'], // composite primary key
   backups: ['id'],
+  settings: ['key'],
 };
 
 /**
@@ -1382,6 +1396,44 @@ function listBackupsPg(limit = 10) {
     }));
 }
 
+/* ---------------- Settings / pause flag ---------------- */
+
+const SETTINGS_KEYS = ['bot_paused'];
+
+/**
+ * Read a persisted setting. Returns null when absent.
+ * Local SQLite is the hot cache; the value is mirrored to Postgres on write.
+ */
+function getSetting(key) {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+/** Write a setting (upsert) and mirror it to Postgres via the pipeline. */
+function setSetting(key, value) {
+  const now = Date.now();
+  db.prepare(`INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+              ON CONFLICT (key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`)
+    .run(key, String(value == null ? '' : value), now);
+  pgRun(
+    'settings',
+    `INSERT INTO settings (key, value, updated_at) VALUES ($1, $2, $3)
+     ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+    [key, String(value == null ? '' : value), now]
+  );
+}
+
+/** True while the bot is paused for maintenance (/stop). Persisted — survives redeploys. */
+function getBotPaused() {
+  const v = getSetting('bot_paused');
+  return v === '1' || v === 'true';
+}
+
+/** Pause (/stop) or resume (/run) the bot. Persisted to SQLite + Postgres. */
+function setBotPaused(paused) {
+  setSetting('bot_paused', paused ? '1' : '0');
+}
+
 /* ---------------- Cleanup ---------------- */
 
 /** Clear expired temporary penalties (mute/suspend) — called periodically. */
@@ -1657,6 +1709,11 @@ module.exports = {
   saveBackupPg,
   newestBackupPg,
   listBackupsPg,
+  // Settings / pause flag (/stop, /run — persisted across redeploys)
+  getSetting,
+  setSetting,
+  getBotPaused,
+  setBotPaused,
   // Persistence
   initPersistence,
   hydrateFromPg,

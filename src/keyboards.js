@@ -12,15 +12,15 @@
  *
  * NATIVE COLORED BUTTONS (Bot API 9.4 — KeyboardButton.style):
  *   Telegram's ReplyKeyboardMarkup supports `KeyboardButton.style` with the
- *   values bg_primary (blue), bg_danger (red), bg_success (green). The
+ *   values primary (blue), danger (red), success (green). The
  *   Telegram client renders the ACTUAL colored keyboard UI; the bot only
  *   sends the ReplyKeyboardMarkup with the appropriate styles. We do NOT
  *   fake colors with emoji, do NOT build an inline keyboard, and do NOT use
  *   the three-line menu.
  *
- *   - bg_success (green) — safe economy actions (balance/bank/income/fish)
- *   - bg_primary (blue)  — navigation & games (casino/games/shop/profile)
- *   - bg_danger  (red)   — risk actions (crime/mines/back)
+ *   - success (green) — safe economy actions (balance/bank/income/fish)
+ *   - primary (blue)  — navigation & games (casino/games/shop/profile)
+ *   - danger  (red)   — risk actions (crime/mines/back)
  *
  *   The original emoji labels (💰 Balance, 🎰 Slots, ...) are kept ON TOP
  *   of the colored backgrounds.
@@ -35,16 +35,19 @@
  *     when the user taps the typing box or the toggle button.
  */
 
-/* Bot API 9.4 KeyboardButton.style values */
+/* Bot API 9.4 KeyboardButton.style values — NOTE: valid values are
+ * `primary` (blue), `danger` (red), `success` (green) — NO `bg_` prefix.
+ * (The earlier `bg_*` values were invalid; Telegram ignored them and fell
+ * back to the default grey, so colors never rendered.) */
 const STYLE = {
-  PRIMARY: 'bg_primary', // blue
-  DANGER: 'bg_danger',   // red
-  SUCCESS: 'bg_success', // green
+  PRIMARY: 'primary', // blue
+  DANGER: 'danger',   // red
+  SUCCESS: 'success', // green
 };
 
 /* ---- button labels (must EXACTLY match what users tap) ----
  * Original emoji labels — the native colored background is applied via
- * KeyboardButton.style (bg_success / bg_primary / bg_danger). */
+ * KeyboardButton.style (success / primary / danger). */
 const B = {
   casino: '🎰 Casino',
   games: '🎮 Games',
@@ -113,13 +116,39 @@ const BUTTON_COMMANDS = {
   'Coin Flip Streak': { cmd: 'cfs' },
   'Number Roulette': { cmd: 'num' },
   'Guess Number': { cmd: 'guess' },
+  // Panel-switch buttons WITHOUT the emoji prefix — some Telegram clients /
+  // stale cached keyboards send the bare label (or the OLD colored-emoji
+  // variant from a previous deploy), so the loose mapper must still route
+  // them to the right panel/command instead of treating them as plain chat.
+  'Casino': { page: 'casino' },
+  'Games': { page: 'games' },
+  'Economy': { page: 'economy' },
+  'Balance': { cmd: 'balance' },
+  'Leaderboard': { cmd: 'leaderboard' },
+  'Help': { cmd: 'help' },
+  'Slots': { cmd: 'slots' },
+  'Blackjack': { cmd: 'blackjack' },
+  'Roulette': { cmd: 'roulette' },
+  'Race': { cmd: 'race' },
+  'Dice': { cmd: 'dice' },
+  'Coin Flip': { cmd: 'coinflip' },
+  'Mines': { cmd: 'mines' },
+  'Higher/Lower': { cmd: 'higherlower' },
+  'Lottery': { cmd: 'lottery' },
+  'Bank': { cmd: 'bank' },
+  'Income': { cmd: 'income' },
+  'Shop': { cmd: 'shop' },
+  'Crime': { cmd: 'crime' },
+  'Fish': { cmd: 'fish' },
+  'Profile': { cmd: 'profile' },
+  'Back': { back: true },
 };
 
 /**
  * Per-button native style (Bot API 9.4 KeyboardButton.style):
- *   - bg_success (green) — safe economy actions
- *   - bg_primary (blue)  — navigation & games
- *   - bg_danger  (red)   — risk actions & back
+ *   - success (green) — safe economy actions
+ *   - primary (blue)  — navigation & games
+ *   - danger  (red)   — risk actions & back
  * The Telegram client renders the actual colored UI from these values.
  */
 const BUTTON_STYLES = {
@@ -151,7 +180,7 @@ const BUTTON_STYLES = {
  * Build a native reply-keyboard markup object with colored KeyboardButtons.
  * @param {string[][]} rows rows of button LABELS (strings)
  * Each button gets { text, style } — style is one of the Bot API 9.4
- * KeyboardButton.style values (bg_primary | bg_danger | bg_success).
+ * KeyboardButton.style values (primary | danger | success).
  */
 function kb(rows) {
   return {

@@ -779,10 +779,10 @@ test('db: ping returns a number (ms)', () => {
 });
 
 /* ---------- native colored reply keyboards (Bot API 9.4 KeyboardButton.style) ---------- */
-test('keyboards: every KeyboardButton carries a native style (bg_primary/bg_danger/bg_success)', () => {
+test('keyboards: every KeyboardButton carries a native style (primary/danger/success)', () => {
   const keyboards = require('../src/keyboards');
   const pages = ['main', 'casino', 'games', 'economy'];
-  const valid = new Set(['bg_primary', 'bg_danger', 'bg_success']);
+  const valid = new Set(['primary', 'danger', 'success']);
   let total = 0;
   for (const page of pages) {
     const markup = keyboards.keyboardFor(page);
@@ -798,7 +798,7 @@ test('keyboards: every KeyboardButton carries a native style (bg_primary/bg_dang
   assert.ok(total >= 15, `at least 15 styled buttons across all keyboards (got ${total})`);
 });
 
-test('keyboards: emoji labels restored + risk buttons are red (bg_danger)', () => {
+test('keyboards: emoji labels restored + risk buttons are red (danger)', () => {
   const keyboards = require('../src/keyboards');
   const main = keyboards.mainKeyboard();
   const all = main.keyboard.flat();
@@ -809,13 +809,13 @@ test('keyboards: emoji labels restored + risk buttons are red (bg_danger)', () =
   // Mines + crime are risk actions → bg_danger
   const games = keyboards.gamesKeyboard().keyboard.flat();
   const mines = games.find((b) => b.text === '💣 Mines');
-  assert.ok(mines && mines.style === 'bg_danger', 'Mines is red (bg_danger)');
+  assert.ok(mines && mines.style === 'danger', 'Mines is red (bg_danger)');
   const eco = keyboards.economyKeyboard().keyboard.flat();
   const crime = eco.find((b) => b.text === '🕵️ Crime');
-  assert.ok(crime && crime.style === 'bg_danger', 'Crime is red (bg_danger)');
+  assert.ok(crime && crime.style === 'danger', 'Crime is red (bg_danger)');
   // Balance/bank/income are safe → bg_success
   const bal = all.find((b) => b.text === '💰 Balance');
-  assert.ok(bal && bal.style === 'bg_success', 'Balance is green (bg_success)');
+  assert.ok(bal && bal.style === 'success', 'Balance is green (bg_success)');
 });
 
 test('keyboards: JSON serialization keeps style (node-telegram-bot-api stringifies reply_markup untouched)', () => {
@@ -824,13 +824,50 @@ test('keyboards: JSON serialization keeps style (node-telegram-bot-api stringifi
   const allBtns = ['main', 'casino', 'games', 'economy']
     .flatMap((page) => keyboards.keyboardFor(page).keyboard.flat());
   const json = JSON.stringify(allBtns);
-  assert.ok(json.includes('"style":"bg_primary"'), 'JSON contains bg_primary');
-  assert.ok(json.includes('"style":"bg_success"'), 'JSON contains bg_success');
-  assert.ok(json.includes('"style":"bg_danger"'), 'JSON contains bg_danger');
+  assert.ok(json.includes('"style":"primary"'), 'JSON contains bg_primary');
+  assert.ok(json.includes('"style":"success"'), 'JSON contains bg_success');
+  assert.ok(json.includes('"style":"danger"'), 'JSON contains bg_danger');
   for (const btn of allBtns) {
     const roundTrip = JSON.parse(JSON.stringify(btn));
     assert.strictEqual(roundTrip.style, btn.style, `style survives JSON round-trip for '${btn.text}'`);
   }
+});
+
+test('keyboards: routeButton maps panel-switch + all labels (emoji, bare, old colored variants)', () => {
+  const keyboards = require('../src/keyboards');
+  // Panel switches (emoji + bare + stale colored-emoji variants)
+  assert.deepStrictEqual(keyboards.routeButton('🎰 Casino'), { page: 'casino' });
+  assert.deepStrictEqual(keyboards.routeButton('Casino'), { page: 'casino' });
+  assert.deepStrictEqual(keyboards.routeButton('🟣🎰 Casino'), { page: 'casino' }); // stale variant
+  assert.deepStrictEqual(keyboards.routeButton('🎮 Games'), { page: 'games' });
+  assert.deepStrictEqual(keyboards.routeButton('Games'), { page: 'games' });
+  assert.deepStrictEqual(keyboards.routeButton('💼 Economy'), { page: 'economy' });
+  assert.deepStrictEqual(keyboards.routeButton('Economy'), { page: 'economy' });
+  assert.deepStrictEqual(keyboards.routeButton('↩️ Back'), { back: true });
+  assert.deepStrictEqual(keyboards.routeButton('Back'), { back: true });
+  // Command buttons (emoji + bare)
+  assert.deepStrictEqual(keyboards.routeButton('💰 Balance'), { cmd: 'balance' });
+  assert.deepStrictEqual(keyboards.routeButton('Balance'), { cmd: 'balance' });
+  assert.deepStrictEqual(keyboards.routeButton('🪙 Coin Flip'), { cmd: 'coinflip' });
+  assert.deepStrictEqual(keyboards.routeButton('Coin Flip'), { cmd: 'coinflip' });
+  assert.deepStrictEqual(keyboards.routeButton('🪪 Profile'), { cmd: 'profile' });
+  assert.deepStrictEqual(keyboards.routeButton('Profile'), { cmd: 'profile' });
+  // New games
+  assert.deepStrictEqual(keyboards.routeButton('Crash'), { cmd: 'crash' });
+  assert.deepStrictEqual(keyboards.routeButton('Number Roulette'), { cmd: 'num' });
+  assert.strictEqual(keyboards.routeButton('gibberish'), null);
+});
+
+test('pause flag: setBotPaused/getBotPaused persisted (SQLite + mirrored to PG pipeline)', () => {
+  db.setBotPaused(false);
+  assert.strictEqual(db.getBotPaused(), false, 'not paused by default');
+  db.setBotPaused(true);
+  assert.strictEqual(db.getBotPaused(), true, 'paused after /stop');
+  db.setBotPaused(false);
+  assert.strictEqual(db.getBotPaused(), false, 'resumed after /run');
+  // persisted row exists
+  const row = db.db.prepare('SELECT value FROM settings WHERE key = ?').get('bot_paused');
+  assert.ok(row && String(row.value) === '0', 'settings row persisted');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

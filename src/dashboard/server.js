@@ -72,9 +72,10 @@ function fmt(n) {
 
 /* ---------- broadcast queue (module-level — bot.js drains it) ---------- */
 const broadcastQueue = [];
+const MAX_QUEUE = 100;
 function queueBroadcast(id, message, target) {
   broadcastQueue.push({ id, message, target, queuedAt: Date.now() });
-  while (broadcastQueue.length > 100) broadcastQueue.shift();
+  while (broadcastQueue.length > MAX_QUEUE) broadcastQueue.shift();
 }
 /** Called by bot.js periodically to drain the queue (real fan-out). */
 function drainBroadcastQueue(sendFn) {
@@ -89,10 +90,19 @@ function drainBroadcastQueue(sendFn) {
         db.logActivity('broadcast', `Broadcast delivered to ${count} chats`, { broadcast_id: item.id });
       } catch (e) { /* non-fatal */ }
     };
+    // FIX (broadcast reliability): if sendFn returns a rejected promise the
+    // message would be LOST. Re-queue it (once) so the next drain tick retries
+    // instead of silently dropping the broadcast.
     const ret = sendFn(item, cb);
-    if (ret && typeof ret.catch === 'function') ret.catch((e) => console.error('[dashboard] broadcast send failed:', e.message));
+    if (ret && typeof ret.catch === 'function') {
+      ret.catch((e) => {
+        console.error('[dashboard] broadcast send failed, re-queueing:', e && e.message);
+        queueBroadcast(item.id, item.message, item.target);
+      });
+    }
   } catch (e) {
-    console.error('[dashboard] broadcast drain error:', e.message);
+    console.error('[dashboard] broadcast drain error, re-queueing:', e.message);
+    queueBroadcast(item.id, item.message, item.target);
   }
   return item;
 }
@@ -453,18 +463,17 @@ function createDashboard(server, bot) {
     audit(req.admin, 'create_giveaway', 0, ev.title);
     // FIX: actually ANNOUNCE the giveaway — queue a broadcast so the bot
     // fan-out sends it to every user + group chat (was missing before).
-    if (activeBot) {
-      try {
-        const rec = db.createBroadcast(
-          `🎁 <b>${escHtml(ev.title)}</b>\n\n${escHtml(ev.description || '')}\n\n💰 Reward: <b>${fmt(ev.reward)}</b> coins — free entry! Try <code>/mission ${ev.id}</code> to claim it, mortal.`,
-          'all',
-          req.admin.userId
-        );
-        queueBroadcast(rec.id, rec.message, 'all');
-        db.logActivity('broadcast', `Giveaway announced to all chats: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
-      } catch (e) {
-        console.error('[dashboard] giveaway broadcast failed:', e.message);
-      }
+    // Always queue (even mid-redeploy): bot.js drains the queue every 10s.
+    try {
+      const rec = db.createBroadcast(
+        `🎁 <b>${escHtml(ev.title)}</b>\n\n${escHtml(ev.description || '')}\n\n💰 Reward: <b>${fmt(ev.reward)}</b> coins — free entry! Try <code>/mission ${ev.id}</code> to claim it, mortal.`,
+        'all',
+        req.admin.userId
+      );
+      queueBroadcast(rec.id, rec.message, 'all');
+      db.logActivity('broadcast', `Giveaway announced to all chats: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
+    } catch (e) {
+      console.error('[dashboard] giveaway broadcast failed:', e.message);
     }
     res.json({ ok: true, event: ev, announced: !!activeBot });
   });
@@ -496,12 +505,11 @@ function createDashboard(server, bot) {
     audit(req.admin, 'broadcast', 0, `target=${tgt}`);
 
     // Fan out via the live bot (best-effort, async — never blocks the API).
-    if (activeBot && typeof activeBot.sendMessage === 'function') {
-      queueBroadcast(rec.id, String(message).trim(), tgt);
-      console.log(`[dashboard] broadcast #${rec.id} queued (target=${tgt})`);
-    } else {
-      console.warn('[dashboard] broadcast queued but bot not ready — will deliver on next boot cycle');
-    }
+    // FIX: ALWAYS queue the broadcast even when the bot is not ready yet —
+    // bot.js drains the queue every 10s, so a broadcast created during a
+    // redeploy window is still delivered once the bot is back up.
+    queueBroadcast(rec.id, String(message).trim(), tgt);
+    console.log(`[dashboard] broadcast #${rec.id} queued (target=${tgt}, botReady=${!!activeBot})`);
     res.json({ ok: true, broadcast: rec, note: 'Queued for delivery' });
   });
 
