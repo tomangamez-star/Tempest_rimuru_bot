@@ -9,6 +9,9 @@ services:
     buildCommand: npm install
     startCommand: npm start
     healthCheckPath: /health
+    # Heap headroom: the start script (package.json) runs node with
+    # --max-old-space-size=512 so the default V8 heap can't trigger
+    # "JavaScript heap out of memory" crashes after ~20 min uptime.
     envVars:
       - key: TELEGRAM_TOKEN
         sync: false # set this manually in Render dashboard — never commit it

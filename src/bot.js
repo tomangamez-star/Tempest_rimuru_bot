@@ -262,6 +262,15 @@ function createBot() {
   // hammering the Telegram API; the /verify button always re-checks fresh.
 
   const membershipCache = new Map(); // userId -> { ok: boolean, at: number }
+  const MEMBERSHIP_CACHE_MAX = 5000; // OOM fix: bound the cache so it can't grow forever
+  /** Cache a membership result, evicting the oldest entry when over cap. */
+  function cacheMembership(userId, val) {
+    membershipCache.set(userId, val);
+    if (membershipCache.size > MEMBERSHIP_CACHE_MAX) {
+      const oldest = membershipCache.keys().next().value;
+      if (oldest !== undefined) membershipCache.delete(oldest);
+    }
+  }
 
   let resolvedGroupId = config.requiredGroupId || 0;
   let groupResolvePromise = null;
@@ -301,6 +310,7 @@ function createBot() {
       const status = m && m.status;
       const member = ['creator', 'administrator', 'member'].includes(status);
       membershipCache.set(userId, { ok: member, at: Date.now() });
+      cacheMembership(userId, { ok: member, at: Date.now() });
       return { ok: member, status };
     } catch (e) {
       console.warn(`[gate] getChatMember(${gid}, ${userId}) error: ${e.message}`);
@@ -1144,7 +1154,7 @@ function createBot() {
           `🔒 <b>Required group</b>: ${config.requiredGroup || 'off'} (chat ${gid || 'unresolved'})`,
           `🗄 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'})` : ''}`,
           `✔️ <b>Verified writes</b>: ${verified}`,
-          `Auto-backup: ${(() => { try { const bs = backup.getBackupState(); return `on · ${bs.scheduleOffsets} per ${Math.round(bs.cycleMs / 60000)}min · keep ${bs.keep} · ran ${bs.runCount} · suspect ${bs.suspectCount}`; } catch (e) { return 'n/a'; } })()}`,
+          `Auto-backup: ${(() => { try { const bs = backup.getBackupState(); return `on · ${bs.schedule} · keep ${bs.keep} · ran ${bs.runCount} · suspect ${bs.suspectCount}`; } catch (e) { return 'n/a'; } })()}`,
           `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
           `⚠️ <b>Last error</b>: ${lastError ? String(lastError.message || lastError).slice(0, 200) : 'none'}`,
         ];

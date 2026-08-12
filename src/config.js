@@ -70,7 +70,10 @@ const config = {
     checkMs: Math.max(5000, Number(process.env.AUTO_BACKUP_CHECK_MS || 30000)),
     keep: Math.max(2, Number(process.env.AUTO_BACKUP_KEEP || 5)),
     regressionPct: Math.min(0.9, Math.max(0.05, Number(process.env.AUTO_BACKUP_REGRESSION_PCT || 0.20))),
-    cycleMs: 40 * 60 * 1000,
+    // Flat schedule: one backup every 5 minutes, continuously. (The old
+    // 40-min multi-phase cycle — 25min@5 + 10min@2 + 5min@30s — was removed;
+    // the bursts raced the snapshot/retention logic.)
+    intervalMs: 5 * 60 * 1000,
   },
 
   // Rimuru sticker pack — sends a random sticker with Rimuru's replies.

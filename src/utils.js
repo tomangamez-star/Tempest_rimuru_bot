@@ -104,13 +104,15 @@ const THEME = {
 
 /**
  * Escape HTML for Telegram parse_mode=HTML.
+ * Telegram does NOT support <br> — newlines are kept as literal \n (which
+ * Telegram renders as line breaks). keepBr is kept for call-site compat but
+ * no longer emits <br>.
  * @param {*} s
- * @param {boolean} [keepBr] keep \n as <br> inside the note body (default true)
+ * @param {boolean} [keepBr] unused — \n is always preserved (never <br>)
  */
 function esc(s, keepBr = true) {
-  let out = String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
-  if (keepBr) out = out.replace(/\n/g, '<br>');
-  return out;
+  void keepBr; // compat: \n is kept as-is; Telegram HTML has no <br>
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
 /**
@@ -130,11 +132,11 @@ function note(title, body, opts = {}) {
   let b;
   if (opts.html === true) {
     // Trusted HTML body: keep <b>/<code>/<a> tags intact, still convert
-    // markdown **bold** / `code`, and newlines to <br>.
+    // markdown **bold** / `code`. Newlines are KEPT as \n — Telegram's HTML
+    // subset has no <br> tag (it rejects it with "Unsupported start tag").
     b = String(body == null ? '' : body)
       .replace(/\*\*(.+?)\*\*/g, '<b>$1</b>')
-      .replace(/`([^`]+)`/g, '<code>$1</code>')
-      .replace(/\n/g, '<br>');
+      .replace(/`([^`]+)`/g, '<code>$1</code>');
   } else {
     // Plain/markdown body: escape everything, then convert markdown to HTML.
     b = esc(body || '')
@@ -162,7 +164,10 @@ function note(title, body, opts = {}) {
  * cause a "can't parse entities" 400.
  *
  * Rules (Telegram Bot API HTML subset):
- *  - Allowed tags: b, i, u, s, a, code, pre, blockquote, tg-spoiler, br.
+ *  - Allowed tags: b, i, u, s, a, code, pre, blockquote, tg-spoiler.
+ *    (Telegram does NOT support <br> — newlines are literal \n. Any <br> in
+ *    input is escaped to &lt;br&gt; so it renders as text instead of a 400
+ *    "Unsupported start tag".)
  *  - ALL tag ATTRIBUTES are stripped (no attribute is legal on allowed
  *    tags — e.g. <b style="..."> is rejected by Telegram).
  *  - Empty pairs and duplicated opens are removed so no dangling/unmatched
@@ -176,7 +181,7 @@ function sanitizeHtml(html) {
     .replace(/<span\s+class=["']tg-spoiler["']\s*>/gi, '<tg-spoiler>')
     .replace(/<\/span\s*>/gi, '</tg-spoiler>')
     // 2) strip attributes from every remaining tag
-    .replace(/<(\/?)(b|i|u|s|a|code|pre|blockquote|tg-spoiler|br)(\s[^>]*)?>/gi, '<$1$2>');
+    .replace(/<(\/?)(b|i|u|s|a|code|pre|blockquote|tg-spoiler)(\s[^>]*)?>/gi, '<$1$2>');
   // 3) fixpoint: drop empty pairs + duplicate opens so no dangling tags remain
   for (let i = 0; i < 5; i++) {
     const prev = out;
@@ -186,7 +191,7 @@ function sanitizeHtml(html) {
     if (out === prev) break;
   }
   // 4) escape anything else that still looks like a tag
-  return out.replace(/<(?!\/?(?:b|i|u|s|a|code|pre|blockquote|tg-spoiler|br)\s*>)/gi, '&lt;');
+  return out.replace(/<(?!\/?(?:b|i|u|s|a|code|pre|blockquote|tg-spoiler)\s*>)/gi, '&lt;');
 }
 
 /** Default Rimuru note header used across the bot. */

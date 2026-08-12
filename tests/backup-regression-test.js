@@ -7,8 +7,8 @@
  *   2. Rolling retention keeps the last N good backups (pre-regression
  *      snapshot always available).
  *   3. /backups lists everything; restore prefers the newest GOOD backup.
- *   4. Scheduler produces the 40-min cycle (20 offsets: 25min@5min +
- *      10min@2min + 5min@30s) and restarts the cycle.
+ *   4. Scheduler produces the flat every-5-min schedule (single offset, no
+ *      cycle bursts) and runs when the 5-min interval elapses.
  * Run: node tests/backup-regression-test.js   (SQLite-only, no PG needed)
  */
 const assert = require('assert');
@@ -34,16 +34,11 @@ function t(name, fn) {
 
 console.log('🗄️  Backup regression-safety test\n');
 
-t('schedule: 40-min cycle = 20 offsets (5@5min + 5@2min + 10@30s)', () => {
+t('schedule: flat every-5-min = 1 offset, no burst phases', () => {
   const offs = backup.SCHEDULE_OFFSETS;
-  assert.strictEqual(offs.length, 20, `expected 20 offsets, got ${offs.length}`);
-  const by5 = offs.filter((o) => o <= 25 * 60000 && o % 300000 === 0);
-  assert.strictEqual(by5.length, 5, 'first 25 min: 5 backups every 5 min');
-  const by2 = offs.filter((o) => o > 25 * 60000 && o <= 35 * 60000);
-  assert.strictEqual(by2.length, 5, 'next 10 min: 5 backups every 2 min (27,29,31,33,35)');
-  const by30 = offs.filter((o) => o > 35 * 60000 && o % 30000 === 0);
-  assert.strictEqual(by30.length, 10, 'last 5 min: 10 backups every 30s');
-  assert.ok(offs.every((o) => o <= 40 * 60000), 'all offsets within the 40-min cycle');
+  assert.strictEqual(offs.length, 1, `expected 1 offset (flat 5 min), got ${offs.length}`);
+  assert.strictEqual(offs[0], 5 * 60000, 'single offset = 5 minutes');
+  assert.strictEqual(backup.BACKUP_INTERVAL_MS, 5 * 60 * 1000, 'interval constant = 5 min');
 });
 
 t('backup: creates snapshot with counts + coins in circulation', () => {
@@ -65,9 +60,9 @@ t('backup: creates snapshot with counts + coins in circulation', () => {
 });
 
 t('regression: suspicious snapshot is stored but does NOT advance the good chain', () => {
-  // Seed the scheduler so the FIRST offset (5 min) is due NOW.
-  db.setSetting('backup_cycle_start', String(Date.now() - 5 * 60000));
-  db.setSetting('backup_done_idx', '0');
+  // Seed the scheduler so the 5-min interval is due NOW: the flat schedule
+  // anchors on backup_last_ts, so backdate it by 5 minutes.
+  db.setSetting('backup_last_ts', String(Date.now() - 5 * 60000));
 
   // Baseline good backups (from the previous test).
   const before = backup.listBackups().filter((x) => !x.suspect).length;

@@ -1013,6 +1013,32 @@ function deleteHeist(leaderId) {
 
 /* ---------------- Dashboard: chat logs ---------------- */
 
+// OOM fix: cap the unbounded log tables so they cannot grow forever.
+// chat_logs + game_history are written on EVERY message/game, mirrored to
+// Postgres every 1.5s, and read back in full by hydration — with no cap they
+// were the dominant heap consumer and the reason the process hit
+// "JavaScript heap out of memory" after ~20 min of uptime. Keep the newest
+// rows only (dashboard queries already use ORDER BY id DESC LIMIT).
+const CHAT_LOGS_CAP = 5000;
+const GAME_HISTORY_CAP = 5000;
+
+// Prune is gated on a write counter (every N writes) — deterministic and
+// cheap, unlike a Date.now() modulo gate which can skip for long stretches.
+let logWriteCounter = 0;
+const LOG_PRUNE_EVERY = 100;
+
+function pruneLogTables() {
+  try {
+    db.prepare('DELETE FROM chat_logs WHERE id NOT IN (SELECT id FROM chat_logs ORDER BY id DESC LIMIT ?)').run(CHAT_LOGS_CAP);
+    db.prepare('DELETE FROM game_history WHERE id NOT IN (SELECT id FROM game_history ORDER BY id DESC LIMIT ?)').run(GAME_HISTORY_CAP);
+  } catch (e) { /* non-fatal */ }
+}
+
+function maybePruneLogs() {
+  if (++logWriteCounter % LOG_PRUNE_EVERY !== 0) return;
+  pruneLogTables();
+}
+
 function logChat(msg) {
   if (!msg || !msg.from) return;
   const text = String(msg.text || msg.caption || '');
@@ -1029,6 +1055,8 @@ function logChat(msg) {
       text.startsWith('/') ? 1 : 0,
       Date.now()
     );
+  // OOM fix: keep the table bounded (deterministic every-N-writes prune).
+  maybePruneLogs();
   // Mirror only the newest row (the id is bigserial — newest row is max id).
   queuePgWrite('chat_logs', async () => {
     const row = db.prepare('SELECT * FROM chat_logs ORDER BY id DESC LIMIT 1').get();
@@ -1064,6 +1092,8 @@ function logGameHistory(entry) {
       JSON.stringify(entry.meta || {}),
       Date.now()
     );
+  // OOM fix: keep the table bounded (deterministic every-N-writes prune).
+  maybePruneLogs();
   queuePgWrite('game_history', async () => {
     const row = db.prepare('SELECT * FROM game_history ORDER BY id DESC LIMIT 1').get();
     if (!row) return null;

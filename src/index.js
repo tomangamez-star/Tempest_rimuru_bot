@@ -189,7 +189,7 @@ async function main() {
         console.error('[backup] scheduler tick error:', e.message);
       }
     }, config.autoBackup.checkMs);
-    console.log(`[backup] scheduler ON - ${backup.SCHEDULE_OFFSETS.length} backups per ${config.autoBackup.cycleMs / 60000}-min cycle, keep ${config.autoBackup.keep}, regression threshold ${Math.round(config.autoBackup.regressionPct * 100)}%`);
+    console.log(`[backup] scheduler ON - every ${config.autoBackup.intervalMs / 60000} min, keep ${config.autoBackup.keep}, regression threshold ${Math.round(config.autoBackup.regressionPct * 100)}%`);
   } else {
     console.log('[backup] scheduler SKIPPED (standby instance).');
   }

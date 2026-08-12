@@ -11,8 +11,12 @@
  *            suspect flag, source).
  *
  * AUTO-BACKUP (hidden safety net, wired in src/index.js):
- *   Runs a 40-minute cycle — every 5 min for the first 25 min, every 2 min
- *   for the next 10 min, every 30 s for the last 5 min = 20 backups/cycle.
+ *   Runs a flat every-5-minute schedule — one backup every 5 minutes,
+ *   continuously. (Previous 40-min cycle with 2-min/30-sec bursts was
+ *   removed: it produced bursts that raced the snapshot/retention logic and
+ *   made the schedule look erratic.)
+ *   Rolling window of the last 5 GOOD backups + SUSPECT regression detection
+ *   are kept unchanged.
  *
  * REGRESSION-SAFE RETENTION (the "what if it backs up a regressed
  * leaderboard?" design answer):
@@ -47,19 +51,13 @@ const SUSPECT_RE = /^backup-(\d+)-suspect\.json$/;
 const SUSPECT_KEEP = 10;           // cap on suspect files kept
 const PG_KEEP_MARGIN = 15;         // extra PG rows kept beyond the good window
 
-/* ---------------- Auto-backup schedule (40-min cycle, 20 backups) ----------------
- *   Phase 1 (min 0-25): every 5 min  -> backups at 5,10,15,20,25         (5)
- *   Phase 2 (min 25-35): every 2 min  -> backups at 27,29,31,33,35        (5)
- *   Phase 3 (min 35-40): every 30 s   -> backups at 35.5..40 step 0.5    (10)
- *   Total: 20 backups per 40-min cycle, then the cycle restarts.
+/* ---------------- Auto-backup schedule (flat every 5 min) ----------------
+ * One backup every 5 minutes, continuously. There is no cycle and no
+ * 2-min/30-sec burst phase — the user explicitly wants a flat interval so
+ * the backup cadence is predictable and never races the snapshot logic.
  */
-const SCHEDULE_OFFSETS = (() => {
-  const offs = [];
-  for (let m = 5; m <= 25; m += 5) offs.push(m * 60000);                 // 5
-  for (let m = 27; m <= 35; m += 2) offs.push(m * 60000);                // 5
-  for (let i = 1; i <= 10; i++) offs.push((35 + i * 0.5) * 60000);       // 10 (35.5..40)
-  return [...new Set(offs)].sort((a, b) => a - b);
-})();
+const SCHEDULE_OFFSETS = [5 * 60000]; // single offset: 5 minutes
+const BACKUP_INTERVAL_MS = 5 * 60 * 1000; // flat 5-min interval
 
 /* ---------------- small helpers ---------------- */
 
@@ -535,23 +533,14 @@ function listBackups(limit = 20) {
 
 /* ---------------- Scheduled auto-backup ---------------- */
 
-// In-memory scheduler state (cycle start + how many offsets of this cycle ran).
-let cycleStartMs = 0;
-let doneIdx = 0;
+// In-memory scheduler state (counters only — the flat 5-min schedule needs
+// no cycle state; "when the last backup ran" is persisted in backup_last_ts).
 let runCount = 0;
 let suspectCount = 0;
-
-function persistState() {
-  try {
-    db.setSetting('backup_cycle_start', String(cycleStartMs));
-    db.setSetting('backup_done_idx', String(doneIdx));
-  } catch (e) { /* non-fatal */ }
-}
+let lastBackupRanAt = 0; // monotonic guard: at most one backup per tick
 
 function loadState() {
   try {
-    cycleStartMs = Number(db.getSetting('backup_cycle_start')) || 0;
-    doneIdx = Number(db.getSetting('backup_done_idx')) || 0;
     runCount = Number(db.getSetting('backup_run_count')) || 0;
     suspectCount = Number(db.getSetting('backup_suspect_count')) || 0;
   } catch (e) { /* ignore */ }
@@ -559,35 +548,21 @@ function loadState() {
 
 /**
  * Scheduled backup tick — called by src/index.js every config.autoBackup.checkMs.
- * Runs exactly one backup per schedule offset; the cycle restarts every 40 min.
- * A regressed snapshot is stored as SUSPECT and never advances the good chain.
+ * Runs exactly one backup per 5-minute interval; there is no multi-phase cycle
+ * (the flat interval replaces the old 40-min cycle). A regressed snapshot is
+ * stored as SUSPECT and never advances the good chain.
  * @returns { ok, ran, suspect, reason? } — ran=false when nothing is due.
  */
 function runScheduledBackup() {
   if (!config.autoBackup.enabled) return { ok: false, ran: false, reason: 'disabled' };
-  if (!cycleStartMs) {
-    loadState();
-    if (!cycleStartMs) {
-      cycleStartMs = Date.now();
-      persistState();
-    }
-  }
   const now = Date.now();
-  const elapsed = now - cycleStartMs;
-  if (elapsed >= config.autoBackup.cycleMs) {
-    // Cycle complete — restart it.
-    cycleStartMs = now;
-    doneIdx = 0;
-    persistState();
-  }
-  // Any offset due and not yet run?
-  let due = -1;
-  while (due + 1 < SCHEDULE_OFFSETS.length && SCHEDULE_OFFSETS[due + 1] <= elapsed) due++;
-  const targetIdx = Math.min(due, SCHEDULE_OFFSETS.length - 1);
-  if (targetIdx < 0 || targetIdx < doneIdx) return { ok: false, ran: false };
-  // Only one backup per tick (the next offset runs on a later tick).
-  const idx = doneIdx;
-  if (idx > targetIdx) return { ok: false, ran: false };
+  // The 5-min interval is anchored to the last completed backup: a backup is
+  // due when BACKUP_INTERVAL_MS has elapsed since the previous one. No cycle
+  // state, no offsets, no restart — the schedule is flat and predictable.
+  const lastAt = Number(db.getSetting('backup_last_ts')) || 0;
+  if (!lastAt || now - lastAt < BACKUP_INTERVAL_MS) return { ok: false, ran: false };
+  // Also ensure at most one backup per tick even if the scheduler tick is slow.
+  if (lastBackupRanAt && now - lastBackupRanAt < BACKUP_INTERVAL_MS) return { ok: false, ran: false };
 
   try {
     const { ts, data } = buildSnapshot();
@@ -595,6 +570,7 @@ function runScheduledBackup() {
     // Regression gate: a suspicious snapshot is stored but does NOT become the
     // new good reference (the good chain keeps the previous backups).
     const saved = saveSnapshot(ts, data, reg.suspicious);
+    lastBackupRanAt = now;
     if (reg.suspicious) {
       suspectCount++;
       db.setSetting('backup_suspect_count', String(suspectCount));
@@ -603,10 +579,9 @@ function runScheduledBackup() {
       runCount++;
       db.setSetting('backup_run_count', String(runCount));
     }
-    doneIdx = idx + 1;
-    persistState();
+    db.setSetting('backup_last_ts', String(ts));
     console.log(
-      `[backup] auto-backup #${idx + 1}/${SCHEDULE_OFFSETS.length} done (users=${data.counts.users}, coins=${fmt(data.counts.coinsInCirculation)}${reg.suspicious ? ', SUSPECT' : ''})`
+      `[backup] auto-backup done (users=${data.counts.users}, coins=${fmt(data.counts.coinsInCirculation)}${reg.suspicious ? ', SUSPECT' : ''})`
     );
     return { ok: true, ran: true, suspect: reg.suspicious, reason: reg.reason, ts };
   } catch (e) {
@@ -618,17 +593,16 @@ function runScheduledBackup() {
 /** Current auto-backup state for /debug. */
 function getBackupState() {
   if (!runCount && !suspectCount) loadState();
+  const lastAt = Number(db.getSetting('backup_last_ts')) || 0;
   return {
     enabled: config.autoBackup.enabled,
-    cycleMs: config.autoBackup.cycleMs,
+    intervalMs: BACKUP_INTERVAL_MS,
     keep: config.autoBackup.keep,
     regressionPct: config.autoBackup.regressionPct,
-    scheduleOffsets: SCHEDULE_OFFSETS.length,
-    doneIdx,
+    schedule: 'every 5 min',
     runCount,
     suspectCount,
-    lastBackupAt: Number(db.getSetting('backup_last_ts')) || 0,
-    cycleStartAt: cycleStartMs || 0,
+    lastBackupAt: lastAt,
   };
 }
 
@@ -644,5 +618,6 @@ module.exports = {
   runScheduledBackup,
   getBackupState,
   SCHEDULE_OFFSETS,
+  BACKUP_INTERVAL_MS,
   regressionCheck,
 };
