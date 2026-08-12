@@ -41,7 +41,7 @@ const db = require('./db');
 const config = require('./config');
 const { fmt, ensureDir } = require('./utils');
 
-const BACKUP_DIR = path.join(__dirname, '..', 'backups');
+const BACKUP_DIR = process.env.BACKUP_DIR || path.join(__dirname, '..', 'backups');
 const GOOD_RE = /^backup-(\d+)\.json$/;
 const SUSPECT_RE = /^backup-(\d+)-suspect\.json$/;
 const SUSPECT_KEEP = 10;           // cap on suspect files kept
@@ -93,10 +93,22 @@ function coinsOf(data) {
   return data.users.reduce((sum, u) => sum + (Number(u.wallet) || 0) + (Number(u.bank) || 0), 0);
 }
 
+/* Monotonic snapshot timestamp guard: rapid backups (e.g. a burst of
+ * /backup calls, or the 30s-phase of the auto cycle) can land on the SAME
+ * Date.now() millisecond, which would make two snapshots share one filename
+ * and silently overwrite each other — collapsing the retention window.
+ * Every snapshot ts is strictly greater than the previous one. */
+let lastSnapshotTs = 0;
+function nextSnapshotTs() {
+  const now = Date.now();
+  lastSnapshotTs = Math.max(now, lastSnapshotTs + 1);
+  return lastSnapshotTs;
+}
+
 /** Build a snapshot of the CURRENT sqlite state. */
 function buildSnapshot() {
   const users = db.getAllUsers();
-  const ts = Date.now();
+  const ts = nextSnapshotTs();
   const data = {
     exported_at: new Date().toISOString(),
     ts,
@@ -228,27 +240,72 @@ function saveSnapshot(ts, data, suspect) {
   return { file, pg: pgStored };
 }
 
+/** Does the backups table still hold a canonical row for this timestamp?
+ *  (Used as the ordering guard: a raw file is only deleted when its
+ *  canonical metadata record is safely retained.) */
+function pgHasBackupForTs(ts) {
+  try {
+    return !!db.db.prepare('SELECT 1 FROM backups WHERE filename LIKE ? LIMIT 1').get(`backup-${ts}%`);
+  } catch (e) {
+    return false;
+  }
+}
+
 /** Rolling-window retention: keep the last N GOOD backups (pre-regression
  *  snapshots always survive), cap suspects, and prune old PG rows. */
 function prune(lastWasSuspect) {
   try {
     const keep = config.autoBackup.keep;
+    const deleted = []; // audit trail: { kind, id, filename?, reason }
     const good = listFiles(GOOD_RE);
     for (const g of good.slice(keep)) {
-      try { fs.unlinkSync(g.file); } catch (e) { /* non-fatal */ }
+      if (pgHasBackupForTs(g.ts)) {
+        try {
+          fs.unlinkSync(g.file);
+          deleted.push({ kind: 'file', id: g.ts, filename: path.basename(g.file), reason: `rolling-window prune (kept last ${keep} GOOD backups)` });
+        } catch (e) { /* non-fatal */ }
+      } else {
+        console.warn(`[backup] kept file backup-${g.ts}.json: no canonical metadata row retained (only copy)`);
+      }
     }
     const suspects = listFiles(SUSPECT_RE);
     for (const s of suspects.slice(SUSPECT_KEEP)) {
-      try { fs.unlinkSync(s.file); } catch (e) { /* non-fatal */ }
+      if (pgHasBackupForTs(s.ts)) {
+        try {
+          fs.unlinkSync(s.file);
+          deleted.push({ kind: 'suspect-file', id: s.ts, filename: path.basename(s.file), reason: `suspect cap (${SUSPECT_KEEP} kept)` });
+        } catch (e) { /* non-fatal */ }
+      } else {
+        console.warn(`[backup] kept suspect file backup-${s.ts}-suspect.json: no canonical metadata row retained (only copy)`);
+      }
     }
     // Prune PG backups beyond (good window + margin). The newest PG row is
     // always preserved, so restore()/tests never find an empty store.
     try {
       const cap = keep + PG_KEEP_MARGIN;
-      db.db.prepare(
-        'DELETE FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY id DESC LIMIT ?)'
-      ).run(cap);
+      const victims = db.db.prepare(
+        'SELECT id, filename FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY id DESC LIMIT ?)'
+      ).all(cap);
+      for (const v of victims) {
+        deleted.push({ kind: 'pg-row', id: Number(v.id), filename: v.filename, reason: `PG retention cap (${cap} rows kept)` });
+      }
+      if (victims.length) {
+        db.db.prepare(
+          'DELETE FROM backups WHERE id NOT IN (SELECT id FROM backups ORDER BY id DESC LIMIT ?)'
+        ).run(cap);
+      }
     } catch (e) { /* non-fatal */ }
+    // Audit log: exactly which backup ids were deleted and why — so the user
+    // can see it's expected rolling-window pruning, not data loss.
+    if (deleted.length) {
+      const detail = deleted
+        .map((d) => `${d.kind}:${d.id}${d.filename ? ` (${d.filename})` : ''} [${d.reason}]`)
+        .join('; ');
+      try {
+        db.logAudit(0, 'auto-backup', 'backup_prune', 0, detail);
+      } catch (e) { /* non-fatal */ }
+      console.log(`[backup] cleanup: pruned ${deleted.length} stale backup(s) — ${deleted.map((d) => `${d.kind}:${d.id}`).join(', ')}`);
+    }
     if (lastWasSuspect) {
       console.warn('[backup] ⚠ new snapshot flagged SUSPECT — previous GOOD backups kept (rolling window intact).');
     }
@@ -418,14 +475,42 @@ function restoreById(idOrTs) {
 
 /* ---------------- /backups listing ---------------- */
 
-/** Merged backup list (PG rows + local files), newest first. */
+/** Normalize a snapshot's user count: prefer counts.users (v2 payload),
+ *  fall back to the users array length. Returns 0 when unreadable. */
+function countUsersInFile(file) {
+  try {
+    const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (data && data.counts && Number.isFinite(Number(data.counts.users))) return Number(data.counts.users);
+    if (Array.isArray(data.users)) return data.users.length;
+  } catch (e) { /* ignore */ }
+  return 0;
+}
+
+/** Extract the canonical snapshot timestamp from a backup filename
+ *  (backup-<ts>.json / backup-<ts>-suspect.json). 0 when unparseable. */
+function tsFromFilename(filename) {
+  const m = String(filename || '').match(/(\d+)/);
+  return m ? Number(m[1]) : 0;
+}
+
+/**
+ * Merged backup list — ONE canonical entry per snapshot timestamp, newest
+ * first. Every snapshot is stored BOTH as a raw file (backups/*.json) AND as
+ * a row in the `backups` table (mirrored to Postgres). The table row is the
+ * canonical record (it carries the authoritative user_count); the raw file is
+ * only listed as a fallback when no table row exists for that timestamp.
+ * Fixes: duplicate entries for the same snapshot + "NaN users" (the file
+ * entries read a field that doesn't exist — user_count lives on the table row
+ * and in the payload's counts.users).
+ */
 function listBackups(limit = 20) {
-  const out = new Map();
+  const out = new Map(); // key: canonical snapshot timestamp
   try {
     for (const r of db.listBackupsPg(100)) {
-      out.set(`pg:${r.id}`, {
+      const ts = tsFromFilename(r.filename) || Number(r.created_at) || 0;
+      out.set(`ts:${ts}`, {
         id: Number(r.id),
-        ts: Number(r.created_at) || 0,
+        ts,
         filename: r.filename || '',
         userCount: Number(r.user_count) || 0,
         suspect: String(r.filename || '').includes('-suspect'),
@@ -434,17 +519,16 @@ function listBackups(limit = 20) {
     }
   } catch (e) { /* non-fatal */ }
   for (const f of [...listFiles(GOOD_RE), ...listFiles(SUSPECT_RE)]) {
-    const key = `file:${f.ts}`;
-    if (!out.has(key)) {
-      out.set(key, {
-        id: f.ts,
-        ts: f.ts,
-        filename: path.basename(f.file),
-        userCount: 0,
-        suspect: f.suspect,
-        source: 'file',
-      });
-    }
+    // The table row is canonical — never duplicate the same snapshot.
+    if (out.has(`ts:${f.ts}`)) continue;
+    out.set(`ts:${f.ts}`, {
+      id: f.ts,
+      ts: f.ts,
+      filename: path.basename(f.file),
+      userCount: countUsersInFile(f.file),
+      suspect: f.suspect,
+      source: 'file',
+    });
   }
   return [...out.values()].sort((a, b) => b.ts - a.ts).slice(0, limit);
 }

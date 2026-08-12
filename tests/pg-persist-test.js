@@ -16,6 +16,7 @@ function freshDb(dbPath) {
   delete require.cache[require.resolve('../src/config')];
   process.env.DB_PATH = dbPath;
   process.env.DATA_DIR = os.tmpdir();
+  process.env.BACKUP_DIR = path.join(os.tmpdir(), `rimuru-pgp-bk-${Date.now()}`);
   process.env.DATABASE_URL = PG_URL;
   process.env.NODE_ENV = 'test';
   return require('../src/db');

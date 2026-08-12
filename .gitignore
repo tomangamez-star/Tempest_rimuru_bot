@@ -9,3 +9,6 @@ data/
 logs/
 npm-debug.log*
 .DS_Store
+# Auto-generated backup snapshots (created at runtime by /backup & the
+# auto-backup cycle). The manual pre-fix safety snapshot is tracked on purpose.
+backups/backup-*.json

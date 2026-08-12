@@ -18,6 +18,7 @@ const fs = require('fs');
 
 process.env.DB_PATH = path.join(os.tmpdir(), `rimuru-bk-${Date.now()}.db`);
 process.env.DATA_DIR = os.tmpdir();
+process.env.BACKUP_DIR = path.join(os.tmpdir(), `rimuru-bk-files-${Date.now()}`);
 process.env.NODE_ENV = 'test';
 process.env.AUTO_BACKUP_ENABLED = 'true';
 
@@ -93,8 +94,8 @@ t('regression: suspicious snapshot is stored but does NOT advance the good chain
   assert.strictEqual(u.wallet, 1234567, 'restored from GOOD backup (pre-regression value)');
 
   // Cleanup: drop the suspect file so later runs are deterministic.
-  const suspects = fs.readdirSync(path.join(__dirname, '..', 'backups')).filter((f) => f.includes('-suspect'));
-  for (const s of suspects) { try { fs.unlinkSync(path.join(__dirname, '..', 'backups', s)); } catch (e) {} }
+  const suspects = fs.readdirSync(process.env.BACKUP_DIR).filter((f) => f.includes('-suspect'));
+  for (const s of suspects) { try { fs.unlinkSync(path.join(process.env.BACKUP_DIR, s)); } catch (e) {} }
 });
 
 t('retention: rolling window keeps the last N good backups', () => {
@@ -103,7 +104,7 @@ t('retention: rolling window keeps the last N good backups', () => {
   for (let i = 0; i < keep + 3; i++) {
     backup.backup();
   }
-  const good = fs.readdirSync(path.join(__dirname, '..', 'backups')).filter((f) => /^backup-\d+\.json$/.test(f));
+  const good = fs.readdirSync(process.env.BACKUP_DIR).filter((f) => /^backup-\d+\.json$/.test(f));
   assert.ok(good.length <= keep + 1, `good files pruned to window (have ${good.length}, keep ${keep})`);
   assert.ok(good.length >= keep - 1, 'window not over-pruned');
 });
@@ -120,6 +121,35 @@ t('restoreById: /restore <id> finds a specific backup', () => {
 t('restoreById: unknown id fails cleanly', () => {
   const r = backup.restoreById(999999999);
   assert.ok(!r.ok, 'unknown id rejected');
+});
+
+t('listing: one canonical entry per snapshot timestamp, correct user count', () => {
+  // Every snapshot is stored BOTH as a raw file AND as a table row — the
+  // listing must show each snapshot exactly ONCE (no pg/file duplicates) and
+  // every entry must carry a real user count (no NaN / '?').
+  const list = backup.listBackups(50);
+  const byTs = new Map();
+  for (const b of list) {
+    const key = b.ts;
+    assert.ok(!byTs.has(key), `duplicate entry for ts ${key} (${b.filename})`);
+    byTs.set(key, b);
+    const uc = Number(b.userCount);
+    assert.ok(Number.isFinite(uc) && uc >= 0, `userCount is a number (got ${b.userCount})`);
+    assert.ok(Number.isFinite(Number(b.id)) && Number(b.id) > 0, 'id is a valid positive number');
+  }
+  assert.ok(list.length >= 1, 'backups listed');
+  // The entries with table-row source must carry the authoritative count
+  // recorded at snapshot time (a SUSPECT snapshot may legitimately show the
+  // regressed count — the point is it's a real number, never NaN).
+  const pgEntries = list.filter((b) => b.source === 'postgres');
+  if (pgEntries.length) {
+    assert.ok(pgEntries.every((b) => Number.isFinite(Number(b.userCount)) && Number(b.userCount) >= 0), 'pg entries carry a numeric user count');
+  }
+  // And file-only entries (fallback) must parse the count from the payload.
+  const fileOnly = list.filter((b) => b.source === 'file');
+  if (fileOnly.length) {
+    assert.ok(fileOnly.every((b) => Number(b.userCount) >= 3), 'file entries parse counts.users from payload');
+  }
 });
 
 console.log(`\n${passed} backup regression tests passed.`);

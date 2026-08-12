@@ -11,6 +11,7 @@ const os = require('os');
 // Use a temp DB so we never touch the real one
 process.env.DB_PATH = path.join(os.tmpdir(), `rimuru-test-${Date.now()}.db`);
 process.env.DATA_DIR = os.tmpdir();
+process.env.BACKUP_DIR = path.join(os.tmpdir(), `rimuru-test-bk-${Date.now()}`);
 process.env.NODE_ENV = 'test';
 
 const config = require('../src/config');

@@ -1206,8 +1206,9 @@ function createBot() {
       const lines = list.map((b) => {
         const when = new Date(b.ts).toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
         const flag = b.suspect ? ' ⚠️ SUSPECT' : '';
+        const uc = Number.isFinite(Number(b.userCount)) ? Number(b.userCount) : 0;
         return `• <b>${b.source === 'postgres' ? '🗄️' : '📄'} ${b.id}</b> — ${when}${flag}\n` +
-               `  <code>${b.filename}</code> · ${fmt(b.userCount || '?')} users`;
+               `  <code>${b.filename}</code> · ${fmt(uc)} users`;
       });
       await ctx.reply(
         `<b>AVAILABLE BACKUPS</b> (${list.length})\n\n${lines.join('\n')}\n\n` +
@@ -1526,6 +1527,14 @@ function createBot() {
     const text = String(msg.text || msg.caption || '');
     const userId = msg.from.id;
     const chatId = msg.chat.id;
+    // AUTO-CREATE PROFILE: ANY message or command from a user creates their
+    // profile — /start is no longer required. getOrCreateUser is idempotent
+    // and only writes when a profile field actually changes, so this is cheap
+    // on every message. Runs BEFORE the pause gate so profiles are still
+    // created while the bot is paused for maintenance.
+    try {
+      db.getOrCreateUser(userId, { username: msg.from.username || '', first_name: msg.from.first_name || '' });
+    } catch (e) { /* non-fatal */ }
     // Maintenance pause gate — BEFORE any handling (except owner + exempt).
     if (isPausedFor(msg)) return;
     // Dashboard: log every user message (chat log for moderation).
