@@ -555,12 +555,43 @@ function loadState() {
  */
 function runScheduledBackup() {
   if (!config.autoBackup.enabled) return { ok: false, ran: false, reason: 'disabled' };
+  // Only the primary (lock-owning) instance writes backups to Postgres; a
+  // standby must never push its stale snapshot into the shared backups table.
+  if (typeof db.isSyncEnabled === 'function' && !db.isSyncEnabled()) {
+    return { ok: false, ran: false, reason: 'standby (sync disabled)' };
+  }
   const now = Date.now();
   // The 5-min interval is anchored to the last completed backup: a backup is
   // due when BACKUP_INTERVAL_MS has elapsed since the previous one. No cycle
   // state, no offsets, no restart — the schedule is flat and predictable.
-  const lastAt = Number(db.getSetting('backup_last_ts')) || 0;
-  if (!lastAt || now - lastAt < BACKUP_INTERVAL_MS) return { ok: false, ran: false };
+  //
+  // ROBUSTNESS FIX (root cause of "auto-backup stopped completely"): the
+  // persisted backup_last_ts can be missing (first boot ever) or in the
+  // FUTURE (clock skew, a restored snapshot's ts being reused as the anchor,
+  // or a stale value carried over in the settings table across builds). Both
+  // cases previously made `now - lastAt` negative-or-zero forever, so the
+  // scheduler silently NEVER fired again. Now we clamp:
+  //   - future ts  -> treat as (now - BACKUP_INTERVAL_MS): a backup is due
+  //                   immediately on the next tick, then re-anchors to now.
+  //   - missing ts -> bootstrap to (now - BACKUP_INTERVAL_MS): the first
+  //                   backup fires after one interval instead of never.
+  // After the clamp we persist the corrected anchor so a bad value can never
+  // suppress the schedule twice.
+  let lastAt = Number(db.getSetting('backup_last_ts')) || 0;
+  if (lastAt > now) {
+    console.warn(
+      `[backup] backup_last_ts is in the FUTURE (${lastAt} > now ${now}, skew ${lastAt - now}ms) — clamping to now so the schedule resumes.`
+    );
+    lastAt = now - BACKUP_INTERVAL_MS;
+    db.setSetting('backup_last_ts', String(lastAt));
+  } else if (!lastAt) {
+    // First boot: anchor to just past one interval ago so the first backup is
+    // due on the very next tick (see clampBackupAnchor for the -1 rationale).
+    lastAt = now - BACKUP_INTERVAL_MS - 1;
+    db.setSetting('backup_last_ts', String(lastAt));
+    console.log('[backup] no backup_last_ts found — bootstrapped anchor; first auto-backup due on next tick.');
+  }
+  if (now - lastAt < BACKUP_INTERVAL_MS) return { ok: false, ran: false };
   // Also ensure at most one backup per tick even if the scheduler tick is slow.
   if (lastBackupRanAt && now - lastBackupRanAt < BACKUP_INTERVAL_MS) return { ok: false, ran: false };
 
@@ -603,7 +634,37 @@ function getBackupState() {
     runCount,
     suspectCount,
     lastBackupAt: lastAt,
+    // Diagnostics for the "backups stopped" bug: is the persisted anchor
+    // valid, and how long until the next backup is due?
+    anchorValid: lastAt === 0 || lastAt <= Date.now(),
+    nextDueInMs: lastAt > 0 ? Math.max(0, lastAt + BACKUP_INTERVAL_MS - Date.now()) : BACKUP_INTERVAL_MS,
   };
+}
+
+/**
+ * Eagerly validate + repair the persisted backup_last_ts anchor at boot.
+ * A missing anchor is bootstrapped; a FUTURE anchor (clock skew / stale value
+ * carried across builds) is clamped so the scheduler can never be suppressed
+ * forever. Returns the corrected anchor. Called by index.js at boot — this is
+ * belt-and-braces on top of the same clamp inside runScheduledBackup().
+ */
+function clampBackupAnchor() {
+  if (!config.autoBackup.enabled) return 0;
+  const now = Date.now();
+  let lastAt = Number(db.getSetting('backup_last_ts')) || 0;
+  if (lastAt > now) {
+    console.warn(`[backup] boot: backup_last_ts in the FUTURE (${lastAt}) — clamping to now.`);
+    lastAt = now;
+    db.setSetting('backup_last_ts', String(lastAt));
+  } else if (!lastAt) {
+    // Anchor to just past one interval ago so the FIRST backup is due on the
+    // very next tick (the gate is `now - lastAt < INTERVAL` → with exactly
+    // INTERVAL elapsed it would NOT be due; -1 makes it strictly due).
+    lastAt = now - BACKUP_INTERVAL_MS - 1;
+    db.setSetting('backup_last_ts', String(lastAt));
+    console.log('[backup] boot: no anchor — bootstrapped; first auto-backup due on next tick.');
+  }
+  return lastAt;
 }
 
 module.exports = {
@@ -617,6 +678,7 @@ module.exports = {
   parseBackupData,
   runScheduledBackup,
   getBackupState,
+  clampBackupAnchor,
   SCHEDULE_OFFSETS,
   BACKUP_INTERVAL_MS,
   regressionCheck,

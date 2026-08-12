@@ -522,7 +522,7 @@ function recordPgFailure(err, label) {
  * NEXT write for that table can still go through.
  */
 function queuePgWrite(table, task) {
-  if (!pool || !pgReady) return Promise.resolve(false);
+  if (!pool || !pgReady || !syncEnabled) return Promise.resolve(false);
   const chain = tableChain(table);
   const run = chain.then(async () => {
     try {
@@ -616,7 +616,7 @@ const TABLE_PKS = {
  * can never wedge the pipeline. Returns the number of rows written.
  */
 function mirrorTable(table) {
-  if (!pool || !pgReady) return 0;
+  if (!pool || !pgReady || !syncEnabled) return 0;
   const rows = sqliteRows(table);
   if (!rows.length) return 0;
   queuePgWrite(table, async () => {
@@ -674,7 +674,7 @@ function mirrorTable(table) {
 
 /** Full mirror: push every SQLite table to Postgres (called on boot + periodically). */
 function mirrorAll() {
-  if (!pool || !pgReady) return;
+  if (!pool || !pgReady || !syncEnabled) return;
   for (const table of Object.keys(TABLE_COLS)) mirrorTable(table);
 }
 
@@ -1742,6 +1742,16 @@ let syncTimer = null;
 let reinitTimer = null;
 const PG_RETRY_MS = 15000; // background reconnect/hydrate retry when PG is configured but unreachable
 
+// WRITE-PIPELINE GATE (rollback root cause): the periodic mirror loop and the
+// background hydration/mirror-on-reconnect may ONLY run on the instance that
+// OWNS the Postgres advisory lock (the primary). A standby/secondary instance
+// (Render deploy overlap, stale process) must never mirror its local SQLite
+// up to Postgres — its cache may be stale, and pushing it would overwrite the
+// primary's fresh writes with older values. index.js acquires the lock and
+// calls setSyncEnabled(false) for standby BEFORE initPersistence()'s
+// hydration finishes; see db.setSyncEnabled().
+let syncEnabled = true; // default true for local dev (no lock in play)
+
 /**
  * Rollback-fix guard: while a hydration is in flight this flag is set so the
  * periodic sync loop can NEVER fire mid-hydration and push a half-merged
@@ -1775,14 +1785,39 @@ function isHydrating() {
  * pushed up to Postgres.
  */
 function startSyncLoop() {
-  if (syncTimer || hydrating) return syncTimer;
+  if (syncTimer || hydrating || !syncEnabled) return syncTimer;
   syncTimer = setInterval(() => {
-    if (hydrating) return; // belt-and-braces: never push mid-hydration
+    if (hydrating || !syncEnabled) return; // belt-and-braces: never push mid-hydration or as standby
     lastMirrorAt = Date.now();
     mirrorAll();
   }, Math.max(config.dbSyncIntervalMs, 500));
   syncTimer.unref && syncTimer.unref();
   return syncTimer;
+}
+
+/**
+ * Enable/disable the SQLite→Postgres write pipeline. index.js calls this
+ * AFTER acquiring the advisory lock: primary → setSyncEnabled(true), standby
+ * → setSyncEnabled(false) so a stale secondary instance can never push old
+ * rows up over the primary's fresh writes (the periodic rollback source).
+ * When disabled, hydration (PG→SQLite reads) still runs — reads are safe —
+ * but every mirror/write is skipped. Defaults to true (local dev).
+ */
+function setSyncEnabled(v) {
+  syncEnabled = !!v;
+  if (!syncEnabled && syncTimer) {
+    clearInterval(syncTimer);
+    syncTimer = null;
+    console.log('[db] sync loop stopped (standby instance — no SQLite→PG writes).');
+  } else if (syncEnabled && !syncTimer && pgReady) {
+    startSyncLoop();
+  }
+  return syncEnabled;
+}
+
+/** True while the write pipeline is allowed (primary instance owns the lock). */
+function isSyncEnabled() {
+  return syncEnabled;
 }
 
 /**
@@ -1960,6 +1995,9 @@ module.exports = {
   // Persistence
   initPersistence,
   hydrateFromPg,
+  startSyncLoop,
+  setSyncEnabled,
+  isSyncEnabled,
   mirrorTable,
   syncInfo,
   ping,

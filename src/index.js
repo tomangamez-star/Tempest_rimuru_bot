@@ -74,8 +74,34 @@ if (!isPrimaryInstance()) {
 async function main() {
   console.log(`🐉 Rimuru Tempest Casino — starting (env=${config.env})${INSTANCE_ID ? ` instance=${INSTANCE_ID}` : ''} commit=${COMMIT_HASH}`);
 
+  // ── HARD single-instance guard FIRST: acquire the Postgres advisory lock
+  // BEFORE initPersistence() starts any SQLite→PG write pipeline. Only the
+  // process that OWNS the lock may mirror; a standby (Render deploy overlap /
+  // stale instance) is set read-only so its stale local cache can never be
+  // pushed up over the primary's fresh writes (the periodic rollback source).
+  try {
+    if (db.acquireInstanceLock) {
+      standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
+      db.setSyncEnabled(!standby);
+      if (standby) {
+        console.warn(
+          `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
+          'Health server stays up; SQLite→PG write pipeline DISABLED (prevents dual writers / stale overwrites).'
+        );
+      } else {
+        console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner (write pipeline enabled).`);
+      }
+    } else {
+      db.setSyncEnabled(true);
+    }
+  } catch (e) {
+    console.error('[instance] advisory lock check failed (proceeding as owner):', e.message);
+    db.setSyncEnabled(true);
+  }
+
   // ── Durability: hydrate SQLite from Postgres (if DATABASE_URL set), then
-  // start the periodic mirror so every write survives redeploys.
+  // start the periodic mirror so every write survives redeploys. (Mirroring
+  // only runs when syncEnabled — i.e. this instance owns the lock.)
   const persisted = await db.initPersistence();
   if (persisted.enabled) {
     console.log(`✅ Postgres persistence ON — data survives redeploys (hydrated ${persisted.hydrated} rows).`);
@@ -91,25 +117,6 @@ async function main() {
         'Retrying in the background every 15s — check the Render env var value.'
       );
     }
-  }
-
-  // ── HARD single-instance guard: acquire the Postgres advisory lock. Only
-  // the process that OWNS the lock runs the bot + sync loop; a duplicate
-  // (Render deploy overlap / stale instance) serves /health as standby.
-  try {
-    if (db.acquireInstanceLock) {
-      standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
-      if (standby) {
-        console.warn(
-          `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
-          'Health server stays up; bot + sync loop NOT started (prevents dual writers).'
-        );
-      } else {
-        console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner.`);
-      }
-    }
-  } catch (e) {
-    console.error('[instance] advisory lock check failed (proceeding as owner):', e.message);
   }
 
   // ── Dashboard password (owner login) ─────────────────────────────────
@@ -128,6 +135,7 @@ async function main() {
         service: 'rimuru-casino',
         commit: COMMIT_HASH,
         standby,
+        syncEnabled: db.isSyncEnabled ? db.isSyncEnabled() : true,
         instance: INSTANCE_ID || null,
         persistence: db.syncInfo(),
         backups: backup.getBackupState ? backup.getBackupState() : undefined,
@@ -174,11 +182,28 @@ async function main() {
   // Let any old overlapping instance finish shutting down before polling.
   await new Promise((r) => setTimeout(r, 5000));
 
-  // Auto-backup scheduler (hidden safety net) - 40-min cycle with rolling
-  // retention + regression detection (see src/backup.js). Only the bot owner
-  // (non-standby) instance schedules backups.
+  // Auto-backup scheduler (hidden safety net) — flat 5-min interval with
+  // rolling retention + regression detection (see src/backup.js). Only the
+  // bot owner (non-standby) instance schedules backups; runScheduledBackup
+  // also self-guards on the write-pipeline flag (db.isSyncEnabled).
   if (!standby) {
     try { backup.getBackupState(); } catch (e) { /* non-fatal */ }
+    // Boot anchor repair: eagerly clamp/bootstrap backup_last_ts so a stale
+    // or future value can never suppress the 5-min schedule (root cause of
+    // "auto-backup stopped completely").
+    try { backup.clampBackupAnchor(); } catch (e) { /* non-fatal */ }
+    // Boot diagnostic: print the scheduler anchor so we can SEE it is alive
+    // and not suppressed by a stale/future backup_last_ts. The first tick
+    // after boot also clamps/bootstraps a bad anchor (see runScheduledBackup).
+    try {
+      const bs = backup.getBackupState();
+      const lastAt = Number(bs && bs.lastBackupAt) || 0;
+      const nextDue = lastAt > 0 ? Math.max(0, lastAt + bs.intervalMs - Date.now()) : bs.intervalMs;
+      console.log(
+        `[backup] state: enabled=${bs.enabled} every=${Math.round(bs.intervalMs / 60000)}min keep=${bs.keep} ` +
+        `ran=${bs.runCount} suspect=${bs.suspectCount} lastAnchor=${lastAt || 'none'} nextDueIn=${Math.round(nextDue / 1000)}s`
+      );
+    } catch (e) { /* non-fatal */ }
     setInterval(() => {
       try {
         const r = backup.runScheduledBackup();
