@@ -667,6 +667,94 @@ function clampBackupAnchor() {
   return lastAt;
 }
 
+/* ---------------- /cbackup all \u2014 clear ALL backups ---------------- */
+
+/**
+ * Count every stored backup (files + Postgres rows), both GOOD and SUSPECT.
+ * @returns { files, rows }
+ */
+function getBackupCount() {
+  let files = 0;
+  try {
+    ensureDir(BACKUP_DIR);
+    files = fs.readdirSync(BACKUP_DIR).filter((f) => GOOD_RE.test(f) || SUSPECT_RE.test(f)).length;
+  } catch (e) { /* non-fatal */ }
+  let rows = 0;
+  try {
+    rows = db.db.prepare('SELECT COUNT(*) AS c FROM backups').get().c || 0;
+  } catch (e) { /* non-fatal */ }
+  return { files, rows };
+}
+
+/**
+ * /cbackup all \u2014 delete EVERY stored backup snapshot: all local files in
+ * BACKUP_DIR (GOOD + SUSPECT) and every row in the backups table (SQLite +
+ * mirrored to Postgres/Supabase). Then reset the persisted backup_last_ts
+ * anchor so the auto-backup scheduler fires on the very next 5-min tick.
+ * Does NOT touch user/player data \u2014 only snapshots.
+ * @returns { ok, deleted: { files, rows }, message }
+ */
+function clearAllBackups() {
+  const before = getBackupCount();
+  let filesDeleted = 0;
+  let rowsDeleted = 0;
+
+  // 1) Local snapshot files (GOOD + SUSPECT).
+  try {
+    ensureDir(BACKUP_DIR);
+    for (const f of fs.readdirSync(BACKUP_DIR)) {
+      if (GOOD_RE.test(f) || SUSPECT_RE.test(f)) {
+        try {
+          fs.unlinkSync(path.join(BACKUP_DIR, f));
+          filesDeleted++;
+        } catch (e) { /* non-fatal */ }
+      }
+    }
+  } catch (e) {
+    console.error('[backup] clearAllBackups: file scan failed:', e.message);
+  }
+
+  // 2) Backup rows \u2014 SQLite (source of truth) then mirror the delete to
+  //    Postgres/Supabase so the remote store is emptied too.
+  try {
+    rowsDeleted = db.db.prepare('SELECT COUNT(*) AS c FROM backups').get().c || 0;
+    db.db.prepare('DELETE FROM backups').run();
+    try {
+      db.pgRun('backups', 'DELETE FROM backups');
+    } catch (e) { /* non-fatal */ }
+  } catch (e) {
+    console.error('[backup] clearAllBackups: table clear failed:', e.message);
+  }
+
+  // 3) Reset the schedule anchor \u2014 next auto-backup is due on the next tick.
+  //    (Same value the bootstrap path uses: exactly one interval in the past.)
+  try {
+    db.setSetting('backup_last_ts', String(Date.now() - BACKUP_INTERVAL_MS - 1));
+  } catch (e) { /* non-fatal */ }
+  try {
+    db.setSetting('backup_run_count', '0');
+    db.setSetting('backup_suspect_count', '0');
+  } catch (e) { /* non-fatal */ }
+  runCount = 0;
+  suspectCount = 0;
+  lastBackupRanAt = 0;
+
+  const detail = `cleared ${filesDeleted} file(s) and ${rowsDeleted} row(s) (before: ${before.files} files / ${before.rows} rows); anchor reset \u2014 next auto-backup on next tick`;
+  try {
+    db.logAudit(0, 'owner', 'backup_clear_all', 0, detail);
+  } catch (e) { /* non-fatal */ }
+  console.log(`[backup] /cbackup all \u2014 ${detail}`);
+  return {
+    ok: true,
+    deleted: { files: filesDeleted, rows: rowsDeleted },
+    message:
+      `\ud83e\uddf9 <b>ALL BACKUPS CLEARED</b>\n\n` +
+      `Deleted <b>${filesDeleted}</b> backup file(s) and <b>${rowsDeleted}</b> database row(s).\n` +
+      `The schedule anchor was reset \u2014 the next auto-backup fires on the next 5-minute tick.\n\n` +
+      `\u26a0\ufe0f Player balances were <b>not</b> touched \u2014 only snapshots were removed.`,
+  };
+}
+
 module.exports = {
   backup,
   restore,
@@ -679,6 +767,8 @@ module.exports = {
   runScheduledBackup,
   getBackupState,
   clampBackupAnchor,
+  clearAllBackups,
+  getBackupCount,
   SCHEDULE_OFFSETS,
   BACKUP_INTERVAL_MS,
   regressionCheck,

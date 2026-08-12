@@ -1999,6 +1999,7 @@ module.exports = {
   setSyncEnabled,
   isSyncEnabled,
   mirrorTable,
+  pgRun,
   syncInfo,
   ping,
   close,

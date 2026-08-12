@@ -1240,6 +1240,74 @@ function createBot() {
       await ctx.reply(r.message, { title: r.ok ? '♻️ RESTORE' : '❌ RESTORE', color: r.ok ? THEME.gold : THEME.red, html: true });
     },
 
+    // ----- /ccache — clear in-memory runtime caches (owner only) -----
+    // Wipes ONLY in-memory caches (membership gate, sticker pack, game
+    // sessions, pause notices, heist timers). NEVER touches SQLite/Postgres
+    // player data. Safe to run live — caches rebuild lazily on next use.
+    ccache: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      const cleared = [];
+
+      // 1) Group-membership gate cache (userId -> { ok, at })
+      const memBefore = membershipCache.size;
+      membershipCache.clear();
+      cleared.push(`membershipCache ${memBefore} → 0`);
+
+      // 2) Sticker pack cache (file_id list) + disabled flag
+      if (stickerCache) { stickerCache = null; cleared.push('stickerCache'); }
+      if (stickerDisabled) { stickerDisabled = false; cleared.push('stickerDisabled'); }
+
+      // 3) Active game sessions (in-memory only — bets already settled are
+      //    persisted; unfinished sessions are dropped, mirroring /restart)
+      for (const [userId, s] of mines.sessions) { s.alive = false; }
+      const minesBefore = mines.sessions.size; mines.sessions.clear(); cleared.push(`mines ${minesBefore} → 0`);
+      for (const [userId, s] of blackjack.sessions) { s.done = true; }
+      const bjBefore = blackjack.sessions.size; blackjack.sessions.clear(); cleared.push(`blackjack ${bjBefore} → 0`);
+      for (const [userId, s] of higherlower.sessions) { s.alive = false; }
+      const hlBefore = higherlower.sessions.size; higherlower.sessions.clear(); cleared.push(`higherlower ${hlBefore} → 0`);
+      if (race.sessions) { for (const userId of race.sessions.keys()) {} const rBefore = race.sessions.size; race.sessions.clear(); cleared.push(`race ${rBefore} → 0`); }
+      if (guess.sessions) { const gBefore = guess.sessions.size; guess.sessions.clear(); cleared.push(`guess ${gBefore} → 0`); }
+
+      // 4) Pause-notice dedupe set (chatId:userId)
+      const pnBefore = pausedNotified.size;
+      pausedNotified.clear();
+      cleared.push(`pausedNotified ${pnBefore} → 0`);
+
+      // 5) Heist completion timers (leaderId -> timeout) — DB heists kept
+      const htBefore = heistTimers.size;
+      for (const t of heistTimers.values()) { try { clearTimeout(t); } catch (e) { /* non-fatal */ } }
+      heistTimers.clear();
+      cleared.push(`heistTimers ${htBefore} → 0`);
+
+      db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'ccache', 0, `cleared ${cleared.length} caches: ${cleared.join(', ')}`);
+      await ctx.reply(
+        `🧹 <b>CACHE CLEARED</b>\n\n` +
+        `${cleared.map((c) => `• ${c}`).join('\n')}\n\n` +
+        `In-memory caches are empty — they rebuild lazily on next use.\n` +
+        `Player data in SQLite/Postgres was <b>not</b> touched.`,
+        { title: '🧹 CACHE', color: THEME.cyan, html: true }
+      );
+    },
+
+    // ----- /cbackup all — clear ALL stored backups (owner only) -----
+    // Deletes every backup snapshot (local files + Postgres/Supabase rows),
+    // resets the schedule anchor, and replies with the count deleted.
+    cbackup: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can do that. 👑', { title: '👑 ADMIN', color: THEME.red });
+      const sub = String((ctx.args && ctx.args[0]) || '').toLowerCase();
+      if (sub !== 'all') {
+        return ctx.reply(
+          `Usage: <code>/cbackup all</code>\n\n` +
+          `Deletes <b>ALL</b> backup snapshots (files + database rows) and resets the schedule so the next auto-backup fires on the next 5-minute tick.\n` +
+          `Player balances are <b>not</b> touched.`,
+          { title: '🧹 CLEAR BACKUPS', color: THEME.cyan, html: true }
+        );
+      }
+      const r = backup.clearAllBackups();
+      db.logAudit(ctx.userId, metaOf(ctx.msg).username || String(ctx.userId), 'cbackup', 0, `clear all backups: ${r.deleted.files} files, ${r.deleted.rows} rows`);
+      await ctx.reply(r.message, { title: r.ok ? '🧹 BACKUPS CLEARED' : '❌ BACKUPS CLEAR', color: r.ok ? THEME.gold : THEME.red, html: true });
+    },
+
     // ----- redeem codes: /redeem [CODE] (user) · create/list/delete (staff) -----
     redeem: async (ctx) => {
       const args = ctx.args || [];

@@ -147,5 +147,28 @@ t('listing: one canonical entry per snapshot timestamp, correct user count', () 
   }
 });
 
+t('clearAllBackups: wipes files + rows, resets anchor, next backup due', () => {
+  const before = backup.getBackupCount();
+  assert.ok(before.files >= 1, `expect files on disk, got ${before.files}`);
+  assert.ok(before.rows >= 1, `expect table rows, got ${before.rows}`);
+  const r = backup.clearAllBackups();
+  assert.ok(r.ok, 'clearAllBackups ok');
+  const after = backup.getBackupCount();
+  assert.strictEqual(after.files, 0, `all backup files deleted (left ${after.files})`);
+  assert.strictEqual(after.rows, 0, `all backup rows deleted (left ${after.rows})`);
+  // Anchor reset -> the scheduler is due immediately (next tick).
+  const st = backup.getBackupState();
+  assert.strictEqual(st.anchorValid, true, 'anchor valid after reset');
+  assert.ok(st.nextDueInMs <= backup.BACKUP_INTERVAL_MS, 'next backup due within one interval');
+  // The scheduler actually fires again after the wipe (5-min interval bypassed
+  // via a fresh anchor): a new snapshot is created and stored.
+  const now = Date.now();
+  db.setSetting('backup_last_ts', String(now - backup.BACKUP_INTERVAL_MS - 1));
+  const r2 = backup.runScheduledBackup();
+  assert.ok(r2.ok, 'scheduler resumes after clear');
+  assert.strictEqual(r2.ran, true, 'backup ran on next tick after clear');
+  assert.ok(backup.getBackupCount().files >= 1, 'new snapshot stored after clear');
+});
+
 console.log(`\n${passed} backup regression tests passed.`);
 process.exit(process.exitCode || 0);
