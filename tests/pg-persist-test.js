@@ -26,6 +26,9 @@ async function main() {
   console.log('🧪 PG persistence integration test (backups + redeem codes)\n');
   const db = freshDb(DB1);
   await db.initPersistence();
+  // New boot order: primary acquires the lock + enables the write pipeline.
+  await db.acquireInstanceLock(0x52494d55);
+  db.setSyncEnabled(true);
   const backup = require('../src/backup');
   const redeem = require('../src/redeem');
   const config = require('../src/config');

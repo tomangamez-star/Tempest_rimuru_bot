@@ -62,6 +62,8 @@ async function main() {
   console.log(`🔄 Boot-cycle regression test (${CYCLES} cycles — newest updated_at must always win, both directions)\n`);
   const db1 = freshDb(path.join(os.tmpdir(), `rimuru-boot-${Date.now()}-1.db`));
   await db1.initPersistence();
+  await db1.acquireInstanceLock(0x52494d55);
+  db1.setSyncEnabled(true);
   db1.getOrCreateUser(USER, { first_name: 'Boot', username: 'bootcycle' });
   db1.setWallet(USER, 100000);
   db1.setBank(USER, 50000);

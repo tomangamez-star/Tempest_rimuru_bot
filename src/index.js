@@ -79,29 +79,11 @@ async function main() {
   // process that OWNS the lock may mirror; a standby (Render deploy overlap /
   // stale instance) is set read-only so its stale local cache can never be
   // pushed up over the primary's fresh writes (the periodic rollback source).
-  try {
-    if (db.acquireInstanceLock) {
-      standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
-      db.setSyncEnabled(!standby);
-      if (standby) {
-        console.warn(
-          `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
-          'Health server stays up; SQLite→PG write pipeline DISABLED (prevents dual writers / stale overwrites).'
-        );
-      } else {
-        console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner (write pipeline enabled).`);
-      }
-    } else {
-      db.setSyncEnabled(true);
-    }
-  } catch (e) {
-    console.error('[instance] advisory lock check failed (proceeding as owner):', e.message);
-    db.setSyncEnabled(true);
-  }
-
-  // ── Durability: hydrate SQLite from Postgres (if DATABASE_URL set), then
-  // start the periodic mirror so every write survives redeploys. (Mirroring
-  // only runs when syncEnabled — i.e. this instance owns the lock.)
+  // ── Durability: hydrate SQLite from Postgres FIRST ────────────────────
+  // initPersistence() connects to Postgres, creates/migrates tables, sets
+  // pgReady=true, and hydrates the local SQLite cache from the durable store.
+  // It does NOT start the SQLite→PG write pipeline (syncEnabled defaults to
+  // false / fail-closed) — the advisory lock below decides who may write.
   const persisted = await db.initPersistence();
   if (persisted.enabled) {
     console.log(`✅ Postgres persistence ON — data survives redeploys (hydrated ${persisted.hydrated} rows).`);
@@ -117,6 +99,33 @@ async function main() {
         'Retrying in the background every 15s — check the Render env var value.'
       );
     }
+  }
+
+  // ── HARD single-instance guard: acquire the Postgres advisory lock AFTER ─
+  // hydration (so pgReady is true and the lock query can actually run). Only
+  // the process that OWNS the lock may mirror SQLite→PG. A standby stays
+  // read-only so its stale local cache can never be pushed up over the
+  // primary's fresh writes (the periodic rollback source).
+  try {
+    if (db.acquireInstanceLock) {
+      standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
+      db.setSyncEnabled(!standby);
+      if (standby) {
+        console.warn(
+          `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
+          'Health server stays up; SQLite→PG write pipeline DISABLED (prevents dual writers / stale overwrites).'
+        );
+      } else {
+        console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner (write pipeline enabled).`);
+      }
+    } else {
+      // No lock support (SQLite-only dev): enable writes for the sole instance.
+      db.setSyncEnabled(true);
+    }
+  } catch (e) {
+    console.error('[instance] advisory lock check failed — treating as STANDBY (writes disabled) to prevent stale overwrites:', e.message);
+    standby = true;
+    db.setSyncEnabled(false);
   }
 
   // ── Dashboard password (owner login) ─────────────────────────────────

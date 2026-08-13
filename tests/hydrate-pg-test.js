@@ -37,6 +37,10 @@ async function main() {
   // ---- Boot 1: create user with balance 111111, mirror to PG ----
   const db1 = freshDb(DB1);
   await db1.initPersistence();
+  // New boot order: this instance is the primary — acquire the advisory lock
+  // and enable the write pipeline (matches src/index.js).
+  await db1.acquireInstanceLock(0x52494d55);
+  db1.setSyncEnabled(true);
   const user = db1.getOrCreateUser(999001, { first_name: 'Hydrate', username: 'hydrate' });
   db1.setWallet(999001, 111111);
   db1.setBank(999001, 222222);
@@ -56,7 +60,7 @@ async function main() {
 
   // ---- "Restart": fresh SQLite cache, fresh db.js — hydrate from PG ----
   const db2 = freshDb(DB2);
-  await db2.initPersistence(); // hydrates from PG
+  await db2.initPersistence(); // hydrates from PG (reads are safe for any instance)
   const after = db2.getUser(999001);
   console.log(`  boot2: hydrated wallet=${after.wallet} bank=${after.bank}`);
 

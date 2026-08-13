@@ -8,7 +8,7 @@
     "start": "node --max-old-space-size=512 src/index.js",
     "dev": "node --max-old-space-size=512 src/index.js",
     "test": "node tests/smoke.js && node tests/dashboard-test.js && node tests/backup-regression-test.js",
-    "test:pg": "node tests/hydrate-pg-test.js && node tests/pg-persist-test.js && node tests/boot-cycle-test.js",
+    "test:pg": "node tests/hydrate-pg-test.js && node tests/pg-persist-test.js && node tests/boot-cycle-test.js && node tests/regression-lock-race-test.js",
     "migrate": "node scripts/migrate-sqlite-to-pg.js",
     "migrate:dry": "node scripts/migrate-sqlite-to-pg.js --dry-run",
     "check": "node --check src/index.js && for f in src/*.js src/dashboard/*.js src/games/*.js src/crimes/*.js tests/*.js scripts/*.js; do node --check \"$f\" || exit 1; done && echo 'ALL SYNTAX OK'"

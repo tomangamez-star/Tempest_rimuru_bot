@@ -496,6 +496,20 @@ async function pgQueryWithTimeout(sql, params = []) {
 }
 
 /**
+ * Wait for the Postgres pool to be READY (pgReady true) and the schema/hydration
+ * to complete. Used by the advisory-lock path so it can never fire before
+ * initPersistence() has flipped pgReady. Returns true when PG is ready.
+ */
+async function ensurePgReady() {
+  if (!pgEnabled || !pool) return false;
+  if (pgReady) return true;
+  if (pgInitPromise) {
+    try { await pgInitPromise; } catch (e) { /* init failures leave pgReady false */ }
+  }
+  return pgReady === true;
+}
+
+/**
  * Record a pg failure (shared by all write paths). Sets connectivity to
  * 'degraded' and surfaces the EXACT reason in /debug + /health.
  */
@@ -635,7 +649,7 @@ function mirrorTable(table) {
         // newer write — the periodic full-sync loop is now safe to run forever.
         const versioned = VERSIONED_TABLES.has(table) && cols.includes('updated_at');
         const whereClause = versioned
-          ? ` WHERE ${table}.updated_at <= EXCLUDED.updated_at`
+          ? ` WHERE ${table}.updated_at < EXCLUDED.updated_at`
           : '';
         await client.query(
           `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
@@ -710,8 +724,15 @@ function mapUser(row) {
  */
 const VERSIONED_TABLES = new Set(['users', 'inventory', 'settings']);
 
+// Monotonic version clock: every call returns a timestamp STRICTLY greater
+// than every previous call, so a rapid sequence of writes can never share the
+// same updated_at and make the versioned merge ambiguous. (Date.now() can
+// return the same millisecond for two writes in the same tick.)
+let lastStamp = 0;
 function nowStamp() {
-  return Date.now();
+  const now = Date.now();
+  lastStamp = now > lastStamp ? now : lastStamp + 1;
+  return lastStamp;
 }
 
 /** Stamp `updated_at` on a user row — always NEWER than any previous write. */
@@ -824,7 +845,7 @@ function setHidden(userId, untilTs) {
   // newer row written by another instance in between.
   pgRun(
     'users',
-    'UPDATE users SET hidden_until = $1, updated_at = $2 WHERE user_id = $3 AND updated_at <= $2',
+    'UPDATE users SET hidden_until = $1, updated_at = $2 WHERE user_id = $3 AND updated_at < $2',
     [untilTs || 0, stamp, userId]
   );
 }
@@ -1601,8 +1622,27 @@ function expirePenalties() {
  * @returns {Promise<boolean>} true = this process owns the lock
  */
 async function acquireInstanceLock(key) {
-  if (!pool || !pgReady) {
-    console.warn('[db] advisory lock skipped — Postgres not ready (running as owner).');
+  if (!pgEnabled || !pool) {
+    console.warn('[db] advisory lock skipped — Postgres not configured (running as sole local owner).');
+    return true;
+  }
+  // FAIL-CLOSED: wait until the pool is actually READY (pgReady flipped by
+  // initPersistence()). The old code checked `!pgReady` at call time, but
+  // index.js used to call this BEFORE initPersistence(), so pgReady was always
+  // false and this returned true immediately — EVERY instance believed it was
+  // the primary and enabled the SQLite→PG write pipeline. Two instances then
+  // wrote concurrently, and the stale one reverted fresh state on every
+  // deploy. index.js now calls initPersistence() FIRST (so pgReady is true
+  // here); this await is belt-and-braces for any other caller ordering.
+  const ready = await ensurePgReady();
+  if (!ready) {
+    // PG is configured but genuinely unreachable (init failed after awaiting).
+    // There is no lock to fight over and no dual-writer risk because nobody
+    // can write to a down PG — run as the sole instance on SQLite, exactly as
+    // the original fail-open intent required ("better a single instance with
+    // SQLite than no bot at all"). Writes stay harmless no-ops while pgReady
+    // is false; the background retry re-hydrates once PG recovers.
+    console.error('[db] advisory lock unavailable — Postgres not ready after init; running as sole SQLite owner (no dual-writer risk).');
     return true;
   }
   try {
@@ -1616,7 +1656,10 @@ async function acquireInstanceLock(key) {
     return locked;
   } catch (e) {
     console.error('[db] advisory lock check failed:', e.message);
-    return true; // fail open — env guard still applies
+    // FAIL CLOSED — never assume primary on a query error. A lock failure must
+    // disable writes so a stale/duplicate instance can never overwrite fresh
+    // data (the rollback source).
+    return false;
   }
 }
 
@@ -1750,7 +1793,11 @@ const PG_RETRY_MS = 15000; // background reconnect/hydrate retry when PG is conf
 // primary's fresh writes with older values. index.js acquires the lock and
 // calls setSyncEnabled(false) for standby BEFORE initPersistence()'s
 // hydration finishes; see db.setSyncEnabled().
-let syncEnabled = true; // default true for local dev (no lock in play)
+// FAIL-CLOSED when Postgres is configured: writes stay OFF until index.js
+// confirms this instance owns the advisory lock. SQLite-only mode (no
+// DATABASE_URL) has no dual-writer risk, so a single local instance is the
+// sole owner and writes are enabled by default.
+let syncEnabled = !pgEnabled;
 
 /**
  * Rollback-fix guard: while a hydration is in flight this flag is set so the
@@ -1811,6 +1858,9 @@ function setSyncEnabled(v) {
     console.log('[db] sync loop stopped (standby instance — no SQLite→PG writes).');
   } else if (syncEnabled && !syncTimer && pgReady) {
     startSyncLoop();
+    // Push any local-only rows up immediately (rather than waiting for the
+    // first periodic tick) so a freshly-promoted primary converges at once.
+    mirrorAll();
   }
   return syncEnabled;
 }
