@@ -1,0 +1,73 @@
+RIMURU PERSISTENCE FIX — HANDOFF TO TEAMILY
+
+This source tree contains a targeted persistence/concurrency fix based on an independent code audit.
+
+IMPORTANT:
+- Do NOT discard these changes and re-implement the old advisory-lock design.
+- Do NOT add another broad backup patch first.
+- Review the diffs, then commit and push this version.
+- After pushing, deploy this exact commit to Render and run the production-style tests.
+
+MAIN CHANGES
+
+1. PostgreSQL advisory lock is now session-pinned.
+   - The process acquires a dedicated PoolClient.
+   - The client stays checked out for the lifetime of the primary process.
+   - The same client owns the advisory lock and performs the unlock.
+   - A 10-second heartbeat checks that the session remains alive.
+   - Losing the heartbeat disables the write pipeline and terminates the process so a stale SQLite cache cannot continue as a writer.
+
+2. Persistence is fail-closed when Postgres is configured but unavailable.
+   - The application does not treat an unreachable Postgres service as a safe SQLite-only primary.
+   - The bot remains health/maintenance oriented until durable persistence is available.
+   - Repeated PG write failures disable the write pipeline and terminate the process instead of continuing to mutate ephemeral local state.
+
+3. SQLite snapshots for mirrorTable() are captured INSIDE the serialized write task.
+   - A stale full-table snapshot can no longer sit in the queue for seconds and then overwrite newer data.
+
+4. Mirror/read-back verification uses the same transaction/client where practical.
+   - The mirror transaction has a server-side PostgreSQL statement timeout.
+   - PostgreSQL itself stops long-running statements instead of relying only on Promise.race().
+
+5. All PG writes are fenced by the primary lock.
+   - queuePgWrite() refuses writes when the configured PG instance-lock is not currently held.
+
+6. Boot sequencing is stricter.
+   - initPersistence() hydrates but does NOT start the mirror loop before the writer lock is acquired.
+   - index.js acquires the dedicated PG lock first, then enables synchronization.
+
+7. Reconnect/hydration is fenced.
+   - When Postgres reconnects, the write pipeline is temporarily disabled while reconciliation runs.
+   - Sync resumes only if this process still owns the primary lock.
+
+8. Health output exposes lock state.
+   - /health returns 503 when configured Postgres persistence is not ready/connected or when the primary lock is not held.
+
+FILES CHANGED
+
+- src/db.js
+- src/index.js
+
+VERIFICATION PERFORMED HERE
+
+- node --check src/db.js
+- node --check src/index.js
+- npm run check
+
+The full live Render + Supabase integration cannot be reproduced from this local workspace. After push, run the real production-style tests:
+
+- normal write
+- valid balance decrease
+- restart
+- 20 repeated boot cycles
+- overlapping instances
+- lock loss
+- PG outage
+- PG recovery
+- delayed PG query
+- real Render redeploy
+- 30–60 minute observation window
+
+IMPORTANT SECURITY NOTE
+
+Do not commit Telegram tokens, GitHub PATs, Supabase service-role keys, DATABASE_URL passwords, or other secrets.

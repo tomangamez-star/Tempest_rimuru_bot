@@ -50,8 +50,11 @@ let standby = false;
 // If RENDER_INSTANCE_ID is set AND a primary is defined, only the primary
 // runs the bot. When the vars are unset (local dev), we run normally.
 function isPrimaryInstance() {
-  if (!INSTANCE_ID) return true;            // not on Render / no instance id → run
-  if (!PRIMARY_ID) return true;             // instance id set but no primary → run (Render 0.9+ sets both; be lenient)
+  // Environment IDs are only a hint. Postgres advisory locking below is the
+  // authoritative single-writer fence. Missing PRIMARY_ID must NEVER grant
+  // extra write authority during a deploy overlap.
+  if (!INSTANCE_ID) return true;
+  if (!PRIMARY_ID) return true;
   return INSTANCE_ID === PRIMARY_ID;
 }
 
@@ -90,6 +93,10 @@ async function main() {
   } else {
     const info = db.syncInfo();
     if (info.configured && !info.ready) {
+      // Durable persistence is mandatory in production. Keep HTTP health alive
+      // but do not start the bot or accept economy writes until PG is ready.
+      standby = true;
+      db.setSyncEnabled(false);
       // DATABASE_URL is set but Postgres is not connected yet — say it LOUDLY.
       console.error(
         '❌❌❌ POSTGRES PERSISTENCE IS DOWN ❌❌❌\n' +
@@ -107,7 +114,7 @@ async function main() {
   // read-only so its stale local cache can never be pushed up over the
   // primary's fresh writes (the periodic rollback source).
   try {
-    if (db.acquireInstanceLock) {
+    if (!standby && db.acquireInstanceLock) {
       standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
       db.setSyncEnabled(!standby);
       if (standby) {
@@ -138,7 +145,10 @@ async function main() {
   const server = http.createServer((req, res) => {
     // Health route always answers first; everything else goes to Express.
     if (req.url === '/health') {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
+      const persistence = db.syncInfo();
+      const healthy = !persistence.configured ||
+        (persistence.ready && persistence.connected && persistence.instanceLockHeld);
+      res.writeHead(healthy ? 200 : 503, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         ok: true,
         service: 'rimuru-casino',
@@ -146,7 +156,7 @@ async function main() {
         standby,
         syncEnabled: db.isSyncEnabled ? db.isSyncEnabled() : true,
         instance: INSTANCE_ID || null,
-        persistence: db.syncInfo(),
+        persistence,
         backups: backup.getBackupState ? backup.getBackupState() : undefined,
         time: Date.now(),
       }));
@@ -243,14 +253,15 @@ async function main() {
   }
 
   // Graceful shutdown
-  function shutdown(signal) {
+  async function shutdown(signal) {
     console.log(`\n[${signal}] Shutting down…`);
     try {
       server.close();
       if (bot) bot.stopPolling();
-      if (db.releaseInstanceLock) db.releaseInstanceLock(PG_LOCK_KEY).catch(() => {});
+      if (db.releaseInstanceLock) await db.releaseInstanceLock(PG_LOCK_KEY);
+      if (db.close) await db.close();
     } catch (e) {
-      /* ignore */
+      console.warn('[shutdown] cleanup error:', e.message);
     }
     process.exit(0);
   }

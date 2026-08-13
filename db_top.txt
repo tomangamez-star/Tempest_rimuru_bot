@@ -1,0 +1,260 @@
+'use strict';
+/**
+ * Rimuru Tempest Casino — hybrid data layer.
+ *
+ * SQLite (better-sqlite3) stays the hot synchronous cache — every game,
+ * economy and dashboard module calls these functions synchronously, so we
+ * keep that exact API. When DATABASE_URL (Supabase/Postgres) is configured,
+ * every mutation is ALSO mirrored to Postgres (async, batched), and on boot
+ * the SQLite cache is rehydrated from Postgres — so balances, leaderboard,
+ * moderators and the economy SURVIVE every redeploy/restart on Render.
+ *
+ * Tables (same schema in SQLite and Postgres): users, cooldowns, lottery,
+ * heists, chat_logs, game_history, admin_users, bot_events, broadcasts,
+ * activity_feed, audit_log.
+ */
+const fs = require('fs');
+const path = require('path');
+const { Pool } = require('pg');
+const config = require('./config');
+const { ensureDir } = require('./utils');
+
+/* ================= SQLite (hot cache) ================= */
+
+ensureDir(path.dirname(config.dbPath));
+
+let Database;
+try {
+  Database = require('better-sqlite3');
+} catch (e) {
+  console.error('[db] better-sqlite3 failed to load:', e.message);
+  console.error('[db] Run: npm install');
+  process.exit(1);
+}
+
+const db = new Database(config.dbPath);
+db.pragma('journal_mode = WAL');
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS users (
+  user_id    INTEGER PRIMARY KEY,
+  username   TEXT DEFAULT '',
+  first_name TEXT DEFAULT '',
+  wallet     INTEGER NOT NULL DEFAULT 0,
+  bank       INTEGER NOT NULL DEFAULT 0,
+  status     TEXT DEFAULT 'active',      -- active | muted | suspected | banned
+  status_reason TEXT DEFAULT '',
+  status_until INTEGER DEFAULT 0,         -- 0 = permanent
+  hidden_until INTEGER DEFAULT 0,         -- hide-in-shadows expiry (ms epoch)
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT 0  -- version stamp: ONLY timestamp ordering decides which state wins
+);
+
+CREATE TABLE IF NOT EXISTS cooldowns (
+  user_id  INTEGER NOT NULL,
+  action   TEXT NOT NULL,
+  until    INTEGER NOT NULL,
+  PRIMARY KEY (user_id, action)
+);
+
+CREATE TABLE IF NOT EXISTS lottery (
+  id         INTEGER PRIMARY KEY CHECK (id = 1),
+  pot        INTEGER NOT NULL DEFAULT 0,
+  ticket_count INTEGER NOT NULL DEFAULT 0,
+  tickets    TEXT NOT NULL DEFAULT '[]'   -- JSON array of {user_id, count}
+);
+
+CREATE TABLE IF NOT EXISTS heists (
+  leader_id    INTEGER PRIMARY KEY,
+  leader_name  TEXT DEFAULT '',
+  target_id    INTEGER NOT NULL,
+  target_name  TEXT DEFAULT '',
+  members      TEXT NOT NULL DEFAULT '[]',   -- JSON [{user_id, name}]
+  started_at   INTEGER NOT NULL,
+  status       TEXT DEFAULT 'open'            -- open | running
+);
+
+-- ===================== DASHBOARD TABLES =====================
+CREATE TABLE IF NOT EXISTS chat_logs (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id    INTEGER NOT NULL,
+  username   TEXT DEFAULT '',
+  first_name TEXT DEFAULT '',
+  chat_id    INTEGER NOT NULL,
+  chat_title TEXT DEFAULT '',
+  text       TEXT DEFAULT '',
+  is_command INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS game_history (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  user_id     INTEGER NOT NULL,
+  username    TEXT DEFAULT '',
+  game        TEXT NOT NULL,        -- slots, dice, bj, mines, race, rob, ...
+  bet         INTEGER DEFAULT 0,
+  result      TEXT DEFAULT '',      -- win | lose | push | success | fail | ...
+  amount      INTEGER DEFAULT 0,    -- net change (+/-)
+  meta        TEXT DEFAULT '{}',    -- JSON extra (reels, multiplier, ...)
+  created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS admin_users (
+  user_id     INTEGER PRIMARY KEY,  -- Telegram user ID
+  username    TEXT DEFAULT '',
+  role        TEXT DEFAULT 'mod',   -- owner | mod
+  password    TEXT DEFAULT '',      -- dashboard login password (owner + mods)
+  created_at  INTEGER NOT NULL,
+  last_login  INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS bot_events (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  title       TEXT NOT NULL,
+  description TEXT DEFAULT '',
+  type        TEXT DEFAULT 'mission',  -- mission | event | giveaway | trivia
+  reward      INTEGER DEFAULT 0,       -- coin reward on completion
+  starts_at   INTEGER DEFAULT 0,
+  ends_at     INTEGER DEFAULT 0,       -- 0 = forever
+  active      INTEGER DEFAULT 1,
+  created_by  INTEGER DEFAULT 0,
+  created_at  INTEGER NOT NULL,
+  completions INTEGER DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  message     TEXT NOT NULL,
+  target      TEXT DEFAULT 'all',    -- all | users | groups
+  sent_count  INTEGER DEFAULT 0,
+  created_by  INTEGER DEFAULT 0,
+  created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS activity_feed (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  type        TEXT DEFAULT 'event',  -- event | user | game | mod | broadcast
+  text        TEXT NOT NULL,
+  meta        TEXT DEFAULT '{}',
+  created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS audit_log (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  actor_id    INTEGER NOT NULL,
+  actor_name  TEXT DEFAULT '',
+  action      TEXT NOT NULL,         -- give | deduct | ban | unban | ...
+  target_id   INTEGER DEFAULT 0,
+  detail      TEXT DEFAULT '',
+  created_at  INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS inventory (
+  user_id  INTEGER NOT NULL,
+  item_id  TEXT NOT NULL,
+  quantity INTEGER NOT NULL DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (user_id, item_id)
+);
+
+CREATE TABLE IF NOT EXISTS redeem_codes (
+  code       TEXT PRIMARY KEY,
+  amount     INTEGER NOT NULL,
+  max_uses   INTEGER NOT NULL,
+  used_count INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER NOT NULL,           -- Telegram user ID of the creator
+  creator_role TEXT DEFAULT 'owner',     -- owner | mod (mods are capped at 50M)
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS redeem_redemptions (
+  code       TEXT NOT NULL,
+  user_id    INTEGER NOT NULL,
+  redeemed_at INTEGER NOT NULL,
+  PRIMARY KEY (code, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS backups (
+  id         INTEGER PRIMARY KEY AUTOINCREMENT,
+  filename   TEXT NOT NULL,
+  data       TEXT NOT NULL,              -- full JSON snapshot (users + inventory)
+  user_count INTEGER NOT NULL DEFAULT 0,
+  created_by INTEGER DEFAULT 0,
+  created_at INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS settings (
+  key   TEXT PRIMARY KEY,
+  value TEXT NOT NULL,
+  updated_at INTEGER NOT NULL
+);
+`);
+
+// ---- Safe migration for EXISTING SQLite DBs (CREATE IF NOT EXISTS won't add the column) ----
+// Every user-data write now stamps updated_at, so stale snapshots can NEVER
+// overwrite newer data in either direction (SQLite <-> Postgres).
+const USER_COLS = db.prepare('PRAGMA table_info(users)').all().map((c) => c.name);
+if (!USER_COLS.includes('updated_at')) {
+  db.exec('ALTER TABLE users ADD COLUMN updated_at INTEGER NOT NULL DEFAULT 0');
+  // Backfill legacy rows with a sensible timestamp (their creation time).
+  db.exec("UPDATE users SET updated_at = created_at WHERE updated_at = 0");
+}
+
+/* ================= Postgres (durable store) ================= */
+
+const DATABASE_URL = (config.databaseUrl || '').trim();
+const pgEnabled = DATABASE_URL.length > 0;
+let pool = null;
+
+// Derived connection info for health/logging (password always redacted).
+let pgHost = '';
+let pgPort = 0;
+try {
+  if (pgEnabled) {
+    const u = new URL(DATABASE_URL.replace(/^postgres:\/\//i, 'postgresql://'));
+    pgHost = u.hostname || '';
+    pgPort = Number(u.port) || 5432;
+  }
+} catch (e) {
+  console.error('[db] Could not parse DATABASE_URL:', e.message);
+}
+
+if (pgEnabled) {
+  try {
+    pool = new Pool({
+      connectionString: DATABASE_URL,
+      max: 5,
+      connectionTimeoutMillis: 15000,
+      idleTimeoutMillis: 30000,
+      // Supabase requires SSL for its Postgres (direct :5432 AND pooler :6543).
+      // Use sslmode=require (present in pooler URLs) when available, otherwise
+      // default to TLS with cert validation relaxed for supabase.co hosts.
+      ssl:
+        /\bsslmode=require\b/i.test(DATABASE_URL)
+          ? { rejectUnauthorized: false }
+          : /supabase\.co/i.test(DATABASE_URL)
+            ? { rejectUnauthorized: false }
+            : undefined,
+    });
+  } catch (e) {
+    console.error('[db] Invalid DATABASE_URL — falling back to SQLite-only:', e.message);
+    pool = null;
+    pgLastError = `bad DATABASE_URL: ${(e.message || String(e)).slice(0, 300)}`;
+    pgLastErrorAt = Date.now();
+    pgConnectivity = 'degraded';
+  }
+}
+
+if (!pgEnabled) {
+  console.warn(
+    '[db] ⚠ DATABASE_URL not set — running SQLite-only (ephemeral). ' +
+    'Balances will RESET on redeploy. Set DATABASE_URL (Supabase/Postgres) for durable persistence.'
+  );
+} else {
+  console.log(`[db] Postgres mirror CONFIGURED (${pgHost}:${pgPort}) — waiting for connection…`);
+}
+
+const PG_SCHEMA = `
+CREATE TABLE IF NOT EXISTS users (
+  user_id       BIGINT PRIMARY KEY,
+  username      TEXT DEFAULT '',
