@@ -77,6 +77,47 @@ if (!isPrimaryInstance()) {
 async function main() {
   console.log(`🐉 Rimuru Tempest Casino — starting (env=${config.env})${INSTANCE_ID ? ` instance=${INSTANCE_ID}` : ''} commit=${COMMIT_HASH}`);
 
+  // IMPORTANT: Render health is a liveness check, not the persistence readiness check.
+  // Start the HTTP listener BEFORE Postgres initialization/locking so Render never
+  // waits on a slow database connection or receives 503 just because this process
+  // is temporarily a standby during a deploy overlap. The JSON reports readiness.
+  let dashboard = null;
+  let bot;
+  let server;
+  server = http.createServer((req, res) => {
+    if (req.url === '/health') {
+      const persistence = db.syncInfo();
+      const ready = !persistence.configured ||
+        (persistence.ready && persistence.connected && persistence.instanceLockHeld && !standby);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({
+        ok: true,
+        ready,
+        service: 'rimuru-casino',
+        commit: COMMIT_HASH,
+        standby,
+        syncEnabled: db.isSyncEnabled ? db.isSyncEnabled() : true,
+        instance: INSTANCE_ID || null,
+        persistence,
+        backups: backup.getBackupState ? backup.getBackupState() : undefined,
+        time: Date.now(),
+      }));
+      return;
+    }
+    if (dashboard && typeof dashboard.app === 'function') {
+      dashboard.app(req, res);
+      return;
+    }
+    res.writeHead(404, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false }));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(config.port, '0.0.0.0', resolve);
+  });
+  console.log(`🩺 Health server listening on :${config.port} (GET /health)`);
+
+
   // ── HARD single-instance guard FIRST: acquire the Postgres advisory lock
   // BEFORE initPersistence() starts any SQLite→PG write pipeline. Only the
   // process that OWNS the lock may mirror; a standby (Render deploy overlap /
@@ -135,53 +176,20 @@ async function main() {
     db.setSyncEnabled(false);
   }
 
-  // ── Dashboard password (owner login) ─────────────────────────────────
-  ensureOwnerPassword();
 
-  // ── Health server for Render ─────────────────────────────────────────
-  // We attach the Express dashboard app + Socket.IO to the SAME server, so
-  // there is exactly ONE HTTP listener on :PORT (health + dashboard + API).
-  let dashboard = null;
-  const server = http.createServer((req, res) => {
-    // Health route always answers first; everything else goes to Express.
-    if (req.url === '/health') {
-      const persistence = db.syncInfo();
-      const healthy = !persistence.configured ||
-        (persistence.ready && persistence.connected && persistence.instanceLockHeld);
-      res.writeHead(healthy ? 200 : 503, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({
-        ok: true,
-        service: 'rimuru-casino',
-        commit: COMMIT_HASH,
-        standby,
-        syncEnabled: db.isSyncEnabled ? db.isSyncEnabled() : true,
-        instance: INSTANCE_ID || null,
-        persistence,
-        backups: backup.getBackupState ? backup.getBackupState() : undefined,
-        time: Date.now(),
-      }));
-      return;
-    }
-    // Dashboard mounted? Route to Express. Otherwise 404.
-    if (dashboard && typeof dashboard.app === 'function') {
-      dashboard.app(req, res);
-      return;
-    }
-    res.writeHead(404, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ ok: false }));
-  });
-
+  // Dashboard can be mounted after the health listener is already live.
   // Create the dashboard (Express app + Socket.IO bound to this server).
   if (config.dashboard.enabled) {
     dashboard = createDashboard(server, null);
     console.log(`🖥️  Admin dashboard mounted (login: owner Telegram ID ${config.ownerId})`);
   }
 
-  server.listen(config.port, '0.0.0.0', () => {
-    console.log(`🩺 Health server listening on :${config.port} (GET /health)`);
-  });
 
-  // ── Stale-instance cleanup ────────────────────────────────────────────
+
+  async function startPrimaryServices() {
+    if (bot || standby) return;
+
+    // ── Stale-instance cleanup ────────────────────────────────────────────
   // Clear any leftover webhook so getUpdates polling owns the update stream.
   // (node-telegram-bot-api with polling:true calls deleteWebhook internally,
   // but we do it explicitly with a guard so an overlapping old instance can
@@ -201,7 +209,7 @@ async function main() {
   // Let any old overlapping instance finish shutting down before polling.
   await new Promise((r) => setTimeout(r, 5000));
 
-  // Auto-backup scheduler (hidden safety net) — flat 5-min interval with
+    // Auto-backup scheduler (hidden safety net) — flat 5-min interval with
   // rolling retention + regression detection (see src/backup.js). Only the
   // bot owner (non-standby) instance schedules backups; runScheduledBackup
   // also self-guards on the write-pipeline flag (db.isSyncEnabled).
@@ -238,24 +246,52 @@ async function main() {
     console.log('[backup] scheduler SKIPPED (standby instance).');
   }
 
-  // ── Bot ───────────────────────────────────────────────────────────────
-  let bot;
-  try {
-    if (standby) {
-      console.warn('[instance] standby — bot NOT started (another instance owns the lock).');
-    } else {
+
+    try {
       bot = createBot();
       console.log('🤖 Rimuru Tempest is awake. The house is open.');
+    } catch (e) {
+      console.error('💥 Failed to start bot:', e.message);
+      process.exit(1);
     }
-  } catch (e) {
-    console.error('💥 Failed to start bot:', e.message);
-    process.exit(1);
+  }
+
+  // If another Render instance currently owns the advisory lock, do not stay
+  // permanently dead. Keep the health endpoint live and retry ownership until
+  // the old instance exits. This is essential during Render deploy overlap.
+  let primaryRetryTimer = null;
+  const tryBecomePrimary = async () => {
+    if (!standby || bot || !db.acquireInstanceLock) return;
+    try {
+      const acquired = await db.acquireInstanceLock(PG_LOCK_KEY);
+      if (acquired) {
+        standby = false;
+        db.setSyncEnabled(true);
+        if (primaryRetryTimer) {
+          clearInterval(primaryRetryTimer);
+          primaryRetryTimer = null;
+        }
+        console.log('[instance] advisory lock acquired after standby retry — becoming PRIMARY.');
+        await startPrimaryServices();
+      }
+    } catch (e) {
+      console.warn('[instance] primary retry failed:', e.message);
+    }
+  };
+
+  if (!standby) {
+    await startPrimaryServices();
+  } else {
+    console.warn('[instance] standby — health remains 200; retrying primary ownership every 5s.');
+    primaryRetryTimer = setInterval(tryBecomePrimary, 5000);
+    primaryRetryTimer.unref && primaryRetryTimer.unref();
   }
 
   // Graceful shutdown
   async function shutdown(signal) {
     console.log(`\n[${signal}] Shutting down…`);
     try {
+      if (primaryRetryTimer) clearInterval(primaryRetryTimer);
       server.close();
       if (bot) bot.stopPolling();
       if (db.releaseInstanceLock) await db.releaseInstanceLock(PG_LOCK_KEY);
