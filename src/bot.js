@@ -1145,6 +1145,9 @@ function createBot() {
           : 'n/a';
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
+          `🆔 <b>Boot</b>: ${pInfo.bootId || 'n/a'}`,
+          `📍 <b>Instance</b>: ${pInfo.instanceId || 'local'} (pid ${pInfo.pid || process.pid} · ${pInfo.hostname || 'n/a'})`,
+          `🗄 <b>DB target</b>: ${pInfo.dbTarget || 'n/a'}${pInfo.lockHeld ? ' · 🔒 lock HELD' : ''}`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
           `🏓 <b>Ping</b>: ${db.ping()}ms`,
           `👥 <b>Users</b>: ${fmt(stats.totalUsers)} (${fmt(stats.activeUsers)} active)`,
@@ -1183,6 +1186,9 @@ function createBot() {
           : 'n/a';
         const lines = [
           `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${commitHash || 'n/a'})`,
+          `🆔 <b>Boot</b>: ${pInfo.bootId || 'n/a'}`,
+          `📍 <b>Instance</b>: ${pInfo.instanceId || 'local'} (pid ${pInfo.pid || process.pid} · ${pInfo.hostname || 'n/a'})`,
+          `🗄 <b>DB target</b>: ${pInfo.dbTarget || 'n/a'}${pInfo.lockHeld ? ' · 🔒 lock HELD' : ''}`,
           `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
           `🏓 <b>Ping</b>: ${db.ping()}ms`,
           `👥 <b>Users</b>: ${fmt(stats.totalUsers)}`,

@@ -15,9 +15,38 @@
  */
 const fs = require('fs');
 const path = require('path');
-const { Pool } = require('pg');
+const os = require('os');
+const crypto = require('crypto');
+const { Pool, Client } = require('pg');
 const config = require('./config');
 const { ensureDir } = require('./utils');
+
+/* ================= Runtime identity (persistence instrumentation) =================
+ * Every write/hydrate/lock/backup log line now carries a stable BOOT_ID plus
+ * pid/hostname/instance so a production log can be attributed to the EXACT
+ * process that produced it (the programmer's audit asked for boot_id, pid,
+ * hostname, instance_id and DB target on every line). BOOT_ID is generated once
+ * per process (crypto.randomUUID) and never changes for the process lifetime.
+ */
+const BOOT_ID = crypto.randomUUID();
+const RUNTIME_PID = process.pid;
+const RUNTIME_HOST = os.hostname();
+const RUNTIME_INSTANCE = process.env.RENDER_INSTANCE_ID || '';
+
+/** Compact attribution suffix for log lines (boot=… pid=… host=… inst=… db=…). */
+function runtimeTag() {
+  return `boot=${BOOT_ID} pid=${RUNTIME_PID} host=${RUNTIME_HOST} inst=${RUNTIME_INSTANCE || '-'} db=${pgHost || 'none'}${pgPort ? ':' + pgPort : ''}`;
+}
+
+/** Exposed via syncInfo() so /health and /debug can prove WHICH process is running. */
+function runtimeInfo() {
+  return {
+    bootId: BOOT_ID,
+    pid: RUNTIME_PID,
+    hostname: RUNTIME_HOST,
+    instanceId: RUNTIME_INSTANCE || null,
+  };
+}
 
 /* ================= SQLite (hot cache) ================= */
 
@@ -219,26 +248,56 @@ try {
   console.error('[db] Could not parse DATABASE_URL:', e.message);
 }
 
+// Shared TLS config for every Postgres connection (pool AND the dedicated
+// advisory-lock client). Supabase requires SSL for its Postgres (direct :5432
+// AND pooler :6543). Use sslmode=require when present, otherwise relax cert
+// validation for supabase.co hosts.
+function pgClientConfig() {
+  return {
+    connectionString: DATABASE_URL,
+    ssl:
+      /\bsslmode=require\b/i.test(DATABASE_URL)
+        ? { rejectUnauthorized: false }
+        : /supabase\.co/i.test(DATABASE_URL)
+          ? { rejectUnauthorized: false }
+          : undefined,
+  };
+}
+
+// Dedicated advisory-lock client — a SINGLE long-lived pg.Client, NOT a pooled
+// connection. `pg_try_advisory_lock` / `pg_advisory_unlock` are SESSION-scoped:
+// they bind to whichever connection executed them. On a Pool the release could
+// run on a DIFFERENT connection and silently no-op, and the pool can recycle
+// the session at idleTimeout. A dedicated client that stays connected for the
+// process lifetime makes the lock deterministic and lets the heartbeat actually
+// re-affirm the SAME session.
+let lockClient = null;
+
 if (pgEnabled) {
   try {
     pool = new Pool({
-      connectionString: DATABASE_URL,
+      ...pgClientConfig(),
       max: 5,
       connectionTimeoutMillis: 15000,
       idleTimeoutMillis: 30000,
-      // Supabase requires SSL for its Postgres (direct :5432 AND pooler :6543).
-      // Use sslmode=require (present in pooler URLs) when available, otherwise
-      // default to TLS with cert validation relaxed for supabase.co hosts.
-      ssl:
-        /\bsslmode=require\b/i.test(DATABASE_URL)
-          ? { rejectUnauthorized: false }
-          : /supabase\.co/i.test(DATABASE_URL)
-            ? { rejectUnauthorized: false }
-            : undefined,
+    });
+    lockClient = new Client(pgClientConfig());
+    // Fail-closed IMMEDIATELY on lock-session loss: pg emits 'error'/'end' the
+    // instant the dedicated lock connection drops (e.g. network blip, pooler
+    // recycle, pg_terminate_backend). We must not wait for the 15s heartbeat —
+    // the moment the lock session is gone we disable SQLite→PG writes so a
+    // stale process can never keep mirroring old data. (onLockLost is a hoisted
+    // function declaration below, so it is safe to reference here.)
+    lockClient.on('error', (e) => {
+      if (lockHeld) onLockLost(`lock client error: ${(e && e.message) || e}`);
+    });
+    lockClient.on('end', () => {
+      if (lockHeld) onLockLost('lock client connection ended');
     });
   } catch (e) {
     console.error('[db] Invalid DATABASE_URL — falling back to SQLite-only:', e.message);
     pool = null;
+    lockClient = null;
     pgLastError = `bad DATABASE_URL: ${(e.message || String(e)).slice(0, 300)}`;
     pgLastErrorAt = Date.now();
     pgConnectivity = 'degraded';
@@ -648,14 +707,46 @@ function mirrorTable(table) {
         // Postgres already has. A stale snapshot can therefore never clobber a
         // newer write — the periodic full-sync loop is now safe to run forever.
         const versioned = VERSIONED_TABLES.has(table) && cols.includes('updated_at');
-        const whereClause = versioned
-          ? ` WHERE ${table}.updated_at < EXCLUDED.updated_at`
-          : '';
-        await client.query(
-          `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
-           ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols}${whereClause}`,
-          cols.map((c) => row[c])
-        );
+        if (versioned) {
+          // VERSIONED MERGE (DB as the ordering authority): the SQLite copy may
+          // only overwrite the PG row when its updated_at is STRICTLY NEWER than
+          // what PG already has. The version itself is DB-GROUNDED: every boot
+          // hydrates from PG and notePgVersion() records the DB's high-water
+          // mark, so a process's local monotonic clock can never stamp a value
+          // LOWER than what the DB already holds (cross-process clock skew can
+          // no longer make a stale write appear "newer"). GREATEST() keeps the
+          // row's version monotonic (it can never move backwards).
+          // NOTE: drop `updated_at` from the generic update list — it is assigned
+          // separately via GREATEST() below (a duplicate assignment is a PG error).
+          const versionedUpdateCols = updateCols
+            .split(', ')
+            .filter((c) => !c.startsWith('updated_at'))
+            .join(', ');
+          const versionedSet = versionedUpdateCols
+            ? `${versionedUpdateCols}, updated_at = GREATEST(${table}.updated_at, EXCLUDED.updated_at)`
+            : `updated_at = GREATEST(${table}.updated_at, EXCLUDED.updated_at)`;
+          await client.query(
+            `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
+             ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${versionedSet}
+             WHERE ${table}.updated_at < EXCLUDED.updated_at`,
+            cols.map((c) => row[c])
+          );
+          // Read back the DB-assigned version so the local clock can never
+          // fall behind the database authority.
+          const pkWhere = pkCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ');
+          const pkVals = pkCols.map((c) => row[c]);
+          const vRow = await client.query(
+            `SELECT updated_at FROM ${table} WHERE ${pkWhere}`,
+            pkVals
+          );
+          if (vRow.rows && vRow.rows[0]) notePgVersion(vRow.rows[0].updated_at);
+        } else {
+          await client.query(
+            `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
+             ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols}`,
+            cols.map((c) => row[c])
+          );
+        }
       }
       await client.query('COMMIT');
     } catch (e) {
@@ -728,11 +819,30 @@ const VERSIONED_TABLES = new Set(['users', 'inventory', 'settings']);
 // than every previous call, so a rapid sequence of writes can never share the
 // same updated_at and make the versioned merge ambiguous. (Date.now() can
 // return the same millisecond for two writes in the same tick.)
+//
+// DATABASE-GLOBAL VERSION AUTHORITY: the local stamp is ANCHORED to the highest
+// version we have ever observed from Postgres (`lastPgVersion`, updated on
+// hydration and on every mirror read-back). This means a process can NEVER
+// fabricate a "newer" timestamp just because its own wall clock is ahead of
+// the DB's clock (the cross-process clock-skew rollback the audit flagged).
+// Once the DB hands out version V, every subsequent local write gets a stamp
+// STRICTLY GREATER than V, so the versioned merge `updated_at < EXCLUDED.updated_at`
+// is ordered by a single authority: Postgres.
 let lastStamp = 0;
+let lastPgVersion = 0;
+
+/** Record the highest DB-assigned version we have seen (hydrate + mirror read-back). */
+function notePgVersion(v) {
+  const n = Number(v) || 0;
+  if (n > lastPgVersion) lastPgVersion = n;
+}
+
 function nowStamp() {
-  const now = Date.now();
-  lastStamp = now > lastStamp ? now : lastStamp + 1;
-  return lastStamp;
+  let v = Date.now();
+  if (lastPgVersion >= v) v = lastPgVersion + 1; // never fall behind the DB authority
+  if (lastStamp >= v) v = lastStamp + 1;          // strictly monotonic within this process
+  lastStamp = v;
+  return v;
 }
 
 /** Stamp `updated_at` on a user row — always NEWER than any previous write. */
@@ -748,7 +858,7 @@ function touchUser(userId, stamp = nowStamp()) {
  */
 function logDbWrite(userId, op, prevVal, newVal, src) {
   try {
-    console.log(`[db-write] t=${Date.now()} user=${userId} op=${op} prev=${prevVal} new=${newVal} src=${src}`);
+    console.log(`[db-write] t=${Date.now()} user=${userId} op=${op} prev=${prevVal} new=${newVal} src=${src} ${runtimeTag()}`);
   } catch (e) { /* logging must never break a write */ }
 }
 
@@ -1609,15 +1719,63 @@ function expirePenalties() {
 
 /* ---------------- Single-instance advisory lock ---------------- */
 
+const LOCK_HEARTBEAT_MS = 15000; // re-affirm the lock session every 15s
+
+// Lock state — exposed via syncInfo() so /health + /debug prove WHICH process
+// (if any) currently owns the advisory lock.
+let lockHeld = false;
+let lockKey = 0;
+let lockHeartbeatTimer = null;
+
+/** Stop the heartbeat and mark the lock as no-longer-held (does NOT release PG). */
+function stopLockHeartbeat() {
+  if (lockHeartbeatTimer) {
+    clearInterval(lockHeartbeatTimer);
+    lockHeartbeatTimer = null;
+  }
+  lockHeld = false;
+}
+
 /**
- * HARD single-instance guard: acquire a Postgres advisory lock. Only ONE
- * process (across all Render instances) can hold it; the holder runs the bot
- * + sync loop, any duplicate serves health-only. This kills the two-writers
- * race that periodic rollbacks were blamed on (Render can briefly run 2
- * processes during a deploy, and a stale instance may linger). If Postgres
- * is unavailable we log loudly and let the caller decide (default: run —
- * better a single instance with SQLite than no bot at all; the env-based
- * RENDER_INSTANCE_ID guard in index.js still applies).
+ * Fail-closed lock-loss handling: if the heartbeat detects the dedicated lock
+ * session dropped, we IMMEDIATELY disable the SQLite→PG write pipeline so a
+ * stale process can never keep mirroring old data once it has lost the lock.
+ * The programmer's audit explicitly called this out — a dropped lock must not
+ * leave writes enabled.
+ */
+function onLockLost(reason) {
+  if (!lockHeld) return;
+  stopLockHeartbeat();
+  console.error(
+    `[db] ❌ ADVISORY LOCK LOST (${reason}) — disabling SQLite→PG writes to prevent stale overwrites. ${runtimeTag()}`
+  );
+  if (typeof setSyncEnabled === 'function') setSyncEnabled(false);
+}
+
+/** Re-affirm the lock session with a lightweight SELECT 1 on the SAME client. */
+async function lockHeartbeat() {
+  if (!lockClient || !lockHeld) return;
+  try {
+    await lockClient.query('SELECT 1');
+  } catch (e) {
+    onLockLost(`heartbeat query failed: ${(e && e.message) || e}`);
+  }
+}
+
+/**
+ * HARD single-instance guard: acquire a Postgres advisory lock on a DEDICATED,
+ * long-lived client (lockClient) — NOT the shared Pool. `pg_try_advisory_lock`
+ * is SESSION-scoped, so a pooled connection could be recycled/released and the
+ * lock silently dropped; a dedicated client stays connected for the whole
+ * process lifetime and lets the heartbeat re-affirm the SAME session. Only ONE
+ * process (across all Render instances) can hold it; the holder runs the bot +
+ * sync loop, any duplicate serves health-only.
+ *
+ * FAIL-CLOSED: waits for Postgres readiness first; any error returns false (never
+ * "assume primary"). If Postgres is genuinely unreachable there is no lock to
+ * fight over and no dual-writer risk (nobody can write to a down PG), so we run
+ * as the sole SQLite owner — the original fail-open intent for a down PG.
+ *
  * @param {number} key  fixed app-specific lock key (must match index.js)
  * @returns {Promise<boolean>} true = this process owns the lock
  */
@@ -1626,48 +1784,53 @@ async function acquireInstanceLock(key) {
     console.warn('[db] advisory lock skipped — Postgres not configured (running as sole local owner).');
     return true;
   }
-  // FAIL-CLOSED: wait until the pool is actually READY (pgReady flipped by
-  // initPersistence()). The old code checked `!pgReady` at call time, but
-  // index.js used to call this BEFORE initPersistence(), so pgReady was always
-  // false and this returned true immediately — EVERY instance believed it was
-  // the primary and enabled the SQLite→PG write pipeline. Two instances then
-  // wrote concurrently, and the stale one reverted fresh state on every
-  // deploy. index.js now calls initPersistence() FIRST (so pgReady is true
-  // here); this await is belt-and-braces for any other caller ordering.
   const ready = await ensurePgReady();
   if (!ready) {
-    // PG is configured but genuinely unreachable (init failed after awaiting).
-    // There is no lock to fight over and no dual-writer risk because nobody
-    // can write to a down PG — run as the sole instance on SQLite, exactly as
-    // the original fail-open intent required ("better a single instance with
-    // SQLite than no bot at all"). Writes stay harmless no-ops while pgReady
-    // is false; the background retry re-hydrates once PG recovers.
     console.error('[db] advisory lock unavailable — Postgres not ready after init; running as sole SQLite owner (no dual-writer risk).');
     return true;
   }
   try {
-    const r = await pgQueryWithTimeout('SELECT pg_try_advisory_lock($1) AS locked', [Number(key)]);
+    // Connect the dedicated lock client (idempotent — reconnects if dropped).
+    if (!lockClient._connected) await lockClient.connect();
+    const r = await lockClient.query('SELECT pg_try_advisory_lock($1) AS locked', [Number(key)]);
     const locked = r.rows && r.rows[0] && r.rows[0].locked === true;
     if (locked) {
-      // Heartbeat: keep the lock alive while this process lives (advisory
-      // locks are session-scoped; the pool keeps the session open).
-      console.log(`[db] advisory lock ${Number(key)} acquired.`);
+      lockHeld = true;
+      lockKey = Number(key);
+      // REAL heartbeat (previously a comment claimed one but none existed):
+      // re-affirm the SAME dedicated session every 15s so the lock can never be
+      // silently dropped by a pooled connection recycle.
+      lockHeartbeatTimer = setInterval(lockHeartbeat, LOCK_HEARTBEAT_MS);
+      lockHeartbeatTimer.unref && lockHeartbeatTimer.unref();
+      console.log(`[db] advisory lock ${Number(key)} acquired on dedicated session. ${runtimeTag()}`);
     }
     return locked;
   } catch (e) {
-    console.error('[db] advisory lock check failed:', e.message);
-    // FAIL CLOSED — never assume primary on a query error. A lock failure must
-    // disable writes so a stale/duplicate instance can never overwrite fresh
-    // data (the rollback source).
+    // Fail closed — a lock failure must disable writes so a stale/duplicate
+    // instance can never overwrite fresh data.
+    console.error(`[db] advisory lock check failed: ${e.message} ${runtimeTag()}`);
+    stopLockHeartbeat();
     return false;
   }
 }
 
-/** Release the advisory lock (called on graceful shutdown). */
+/** Release the advisory lock on the SAME dedicated client (session-scoped unlock). */
 async function releaseInstanceLock(key) {
+  stopLockHeartbeat();
   try {
-    if (pool) await pgQueryWithTimeout('SELECT pg_advisory_unlock($1)', [Number(key)]);
-  } catch (e) { /* non-fatal */ }
+    if (lockClient && lockHeld) {
+      await lockClient.query('SELECT pg_advisory_unlock($1)', [Number(key)]);
+      console.log(`[db] advisory lock ${Number(key)} released on dedicated session. ${runtimeTag()}`);
+    }
+  } catch (e) {
+    // non-fatal on shutdown
+    console.warn(`[db] advisory lock release failed (non-fatal): ${e.message} ${runtimeTag()}`);
+  } finally {
+    try {
+      if (lockClient) await lockClient.end();
+    } catch (e) { /* ignore */ }
+    lockClient = null;
+  }
 }
 
 /* ================= Postgres → SQLite rehydration ================= */
@@ -1727,6 +1890,8 @@ async function hydrateFromPg() {
             // local row. Never overwrite newer local data with older PG data.
             const pgStamp = Number(r.updated_at) || 0;
             const localStamp = Number(local.updated_at) || 0;
+            // Track the DB's highest version so the local clock never falls behind.
+            notePgVersion(pgStamp);
             if (pgStamp <= localStamp) {
               continue; // local copy is newer/equal — keep it (mirror will push it up)
             }
@@ -1767,6 +1932,15 @@ function syncInfo() {
     writesOk: pgWritesOk || 0,
     writesFailed: pgWritesFailed || 0,
     dbSyncIntervalMs: config.dbSyncIntervalMs,
+    // Runtime identity — which process is THIS instance? (audit §25)
+    bootId: BOOT_ID,
+    pid: RUNTIME_PID,
+    hostname: RUNTIME_HOST,
+    instanceId: RUNTIME_INSTANCE || null,
+    dbTarget: pgEnabled ? `${pgHost}:${pgPort}` : null,
+    // Advisory-lock state — proves WHO (if anyone) owns the single-writer lock.
+    lockHeld,
+    lockKey: lockHeld ? lockKey : 0,
   };
 }
 
@@ -1959,6 +2133,10 @@ function schedulePgRetry() {
 function close() {
   if (syncTimer) clearInterval(syncTimer);
   if (reinitTimer) clearTimeout(reinitTimer);
+  stopLockHeartbeat();
+  try {
+    if (lockClient) lockClient.end().catch(() => {});
+  } catch (e) { /* ignore */ }
   db.close();
 }
 
