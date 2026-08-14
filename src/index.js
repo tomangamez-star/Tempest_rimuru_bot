@@ -209,41 +209,17 @@ async function main() {
   // Let any old overlapping instance finish shutting down before polling.
   await new Promise((r) => setTimeout(r, 5000));
 
-    // Auto-backup scheduler (hidden safety net) — flat 5-min interval with
-  // rolling retention + regression detection (see src/backup.js). Only the
-  // bot owner (non-standby) instance schedules backups; runScheduledBackup
-  // also self-guards on the write-pipeline flag (db.isSyncEnabled).
-  if (!standby) {
-    try { backup.getBackupState(); } catch (e) { /* non-fatal */ }
-    // Boot anchor repair: eagerly clamp/bootstrap backup_last_ts so a stale
-    // or future value can never suppress the 5-min schedule (root cause of
-    // "auto-backup stopped completely").
-    try { backup.clampBackupAnchor(); } catch (e) { /* non-fatal */ }
-    // Boot diagnostic: print the scheduler anchor so we can SEE it is alive
-    // and not suppressed by a stale/future backup_last_ts. The first tick
-    // after boot also clamps/bootstraps a bad anchor (see runScheduledBackup).
-    try {
-      const bs = backup.getBackupState();
-      const lastAt = Number(bs && bs.lastBackupAt) || 0;
-      const nextDue = lastAt > 0 ? Math.max(0, lastAt + bs.intervalMs - Date.now()) : bs.intervalMs;
-      console.log(
-        `[backup] state: enabled=${bs.enabled} every=${Math.round(bs.intervalMs / 60000)}min keep=${bs.keep} ` +
-        `ran=${bs.runCount} suspect=${bs.suspectCount} lastAnchor=${lastAt || 'none'} nextDueIn=${Math.round(nextDue / 1000)}s`
-      );
-    } catch (e) { /* non-fatal */ }
-    setInterval(() => {
-      try {
-        const r = backup.runScheduledBackup();
-        if (r && r.ran && r.suspect) {
-          db.logActivity('backup', `Auto-backup flagged SUSPECT (${r.reason || 'regression'}) - good chain kept`, {});
-        }
-      } catch (e) {
-        console.error('[backup] scheduler tick error:', e.message);
-      }
-    }, config.autoBackup.checkMs);
-    console.log(`[backup] scheduler ON - every ${config.autoBackup.intervalMs / 60000} min, keep ${config.autoBackup.keep}, regression threshold ${Math.round(config.autoBackup.regressionPct * 100)}%`);
-  } else {
-    console.log('[backup] scheduler SKIPPED (standby instance).');
+    // AUTO-BACKUP SCHEDULER — PERMANENTLY DISABLED (bandwidth fix).
+  // The automatic 5-minute backup timer is OFF: it no longer creates or
+  // uploads snapshots on any background timer, so it contributes zero idle
+  // DB/network writes. Manual backup/restore functionality (/backup, /restore,
+  // /backups) is fully retained and unaffected — those are user-triggered and
+  // write a snapshot on demand only. The 15-min reconcile + mirrorAll never
+  // invoke any backup function (backups table is excluded from mirror sync),
+  // so no other timer re-enables automatic backups.
+  console.log('[backup] auto-backup scheduler DISABLED');
+  if (standby) {
+    console.log('[backup] standby instance — scheduler already off (standby is read-only).');
   }
 
 
