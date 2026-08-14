@@ -57,6 +57,7 @@ const backup = require('./backup');
 const redeem = require('./redeem');
 const profile = require('./profile');
 const broadcastMod = require('./broadcast');
+const attack = require('./attack');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -697,6 +698,7 @@ function createBot() {
         `• /broadcast [message] (alias /bd) — announce to all users & groups\n` +
         `  · owner: any message · mods: must be relevant to the bot\n` +
         `• /set [type] [title] | [desc] | [reward] (alias /s) — create an event / mission / giveaway\n` +
+        `• /attack — Rimuru deploys attackers against a wealthy player (owner/Rimuru only)\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
@@ -1143,6 +1145,11 @@ function createBot() {
       await handleSet(ctx);
     },
 
+    // ----- /attack — Rimuru attack/security event (owner/Rimuru only) -----
+    attack: async (ctx) => {
+      await handleAttack(ctx);
+    },
+
     // ----- group gate -----
     verify: async (ctx) => verifyCommand(ctx),
 
@@ -1535,6 +1542,25 @@ function createBot() {
     );
   }
 
+  /**
+   * /attack — manually trigger Rimuru's attack/security event.
+   * Only the owner (Rimuru) may use it. The random hourly scheduler runs
+   * automatically; this gives the King a manual lever for events/testing.
+   */
+  async function handleAttack(ctx) {
+    if (!ctx.isOwner) {
+      return ctx.reply('Only Rimuru (the King) can trigger an attack. 🐉👑', { title: '🐉 ATTACK', color: THEME.red });
+    }
+    const r = await attack.trigger({ manual: true, force: true, chatId: ctx.chatId, actorId: ctx.userId });
+    if (r && r.message && !r.targetId) {
+      // "No eligible target" result already printed by the trigger.
+      return;
+    }
+    if (r && !r.ok) {
+      await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
+    }
+  }
+
   /** Schedule heist execution after the 60s open window. */
   function scheduleHeist(ctx, heistRow) {
     const timer = heistTimers.get(heistRow.leader_id);
@@ -1631,7 +1657,7 @@ function createBot() {
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health\n` +
-            `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /backup · /stop\n` +
+            `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
           await answerCb('');
@@ -1759,6 +1785,9 @@ function createBot() {
     const text = String(msg.text || msg.caption || '');
     const userId = msg.from.id;
     const chatId = msg.chat.id;
+    // Attack/Security: any message marks the user "online" (they can respond
+    // to breach challenges and get the online defense advantage).
+    try { attack.markSeen(userId); } catch (e) { /* non-fatal */ }
     // IMPORTANT: once durable persistence is degraded, stop all state-changing
     // interaction before touching SQLite. This prevents offline mutations from
     // accumulating in Render's ephemeral cache and later overwriting durable data.
@@ -1866,6 +1895,13 @@ function createBot() {
         return;
       }
     }
+
+    // Attack/Security: a pending breach challenge consumes ANY text input from
+    // the target. Check this before the Rimuru AI trigger so a challenge code
+    // (e.g. "911" or "RIMURU-742") is treated as an answer, not chat.
+    try {
+      if (await attack.handleInput(userId, chatId, text)) return;
+    } catch (e) { console.error('[attack] handleInput error:', e.message); }
 
     // Rimuru AI triggers:
     //  1) message contains "rimuru" (no command needed)
@@ -1981,6 +2017,22 @@ function createBot() {
     };
   }
 
+  // Attack/Security: attach the live bot so the module can send DMs and
+  // broadcast random-event announcements through the existing pipeline.
+  try {
+    attack.attach({
+      reply: (chatId, text, opts) => reply(chatId, text, opts),
+      announce: (text) => {
+        const rec = db.createBroadcast(text, 'all', Number(config.ownerId));
+        dashboard.queueBroadcast(rec.id, rec.message, 'all');
+        return Promise.resolve();
+      },
+    });
+    attack.startRandomScheduler();
+  } catch (e) {
+    console.error('[attack] wiring failed:', e.message);
+  }
+
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);
 
@@ -1991,6 +2043,11 @@ function createBot() {
       console.log(`[admin] ${u.status} expired for user ${u.user_id}`);
     }
   }, 30000);
+
+  // Periodic: expire any stale attack breach challenges (safety sweep).
+  setInterval(() => {
+    try { attack.sweep(); } catch (e) { console.error('[attack] sweep error:', e.message); }
+  }, 5000);
 
   bot.on('polling_error', (err) => {
     console.error('[polling] error:', err.message);

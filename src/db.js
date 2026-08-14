@@ -1158,6 +1158,28 @@ function listUsersByNetWorth(limit = 50, offset = 0) {
     .map((r) => ({ ...r, user_id: Number(r.user_id), wallet: Number(r.wallet), bank: Number(r.bank) }));
 }
 
+/**
+ * Read-only targeting helper for the attack/security system. Returns users
+ * with net worth >= minNetWorth as { user_id, username, first_name, wallet,
+ * bank, networth }. Sorted ascending so weighted selection is stable & testable.
+ * Deliberately READ-ONLY \u2014 it never mutates state or touches the mirror layer.
+ */
+function getAttackEligibleUsers(minNetWorth = 250000000000) {
+  return db.prepare(`
+    SELECT user_id, username, first_name, wallet, bank, (wallet + bank) AS networth
+    FROM users
+    WHERE (wallet + bank) >= ?
+    ORDER BY networth ASC
+  `).all(minNetWorth).map((r) => ({
+    user_id: Number(r.user_id),
+    username: r.username || '',
+    first_name: r.first_name || '',
+    wallet: Number(r.wallet) || 0,
+    bank: Number(r.bank) || 0,
+    networth: Number(r.networth) || 0,
+  }));
+}
+
 /** Dashboard users search (id/username/first_name, ordered by net worth). */
 function searchUsers(q, limit = 50, offset = 0) {
   const like = `%${q}%`;
@@ -2277,6 +2299,7 @@ module.exports = {
   getCooldownCount,
   listUsersByNetWorth,
   searchUsers,
+  getAttackEligibleUsers,
   getUserCooldowns,
   getLottery,
   saveLottery,

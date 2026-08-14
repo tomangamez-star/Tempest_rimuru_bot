@@ -193,6 +193,40 @@ const config = {
     finePct: 0.05,               // fine = 5% of robber's wallet on fail
   },
 
+  // ===================== ATTACK / SECURITY EVENT SYSTEM =====================
+  // Rimuru randomly spawns attackers against wealthy players (networth-based
+  // targeting). Purchased Security (inventory item) fights the attackers first;
+  // if the security loses, the player faces timed code challenges. Online
+  // players can defend; offline players rely on security alone. See src/attack.js.
+  attack: {
+    enabled: String(process.env.ATTACK_ENABLED || 'true').toLowerCase() !== 'false',
+    minNetWorth: 250000000000,            // 250B \u2014 below this cannot be targeted
+    spawnIntervalMs: 60 * 60 * 1000,      // base cadence: 1 spawn/hour
+    // Spawn rate requirement: AT LEAST once/hour, sometimes twice, at most
+    // three times/hour. The scheduler adds an in-window jitter tick so the
+    // effective rate is 1\u20133/hour (see attack.js nextSpawnDelayMs()).
+    jitterMaxMs: 40 * 60 * 1000,          // up to +40m random delay within the hour
+    // Attackers scale with target wealth.
+    minAttackers: 3,
+    maxAttackers: 30,
+    // Interactive breach challenges \u2014 harder each round (4 rounds max).
+    challengeWindowMs: 5 * 1000,          // 5s reaction window per challenge
+    challengeRounds: 4,
+    challengeGraceMs: 3 * 1000,           // online advantage: grace padding vs offline
+    // Consequence: steal a controlled % of the target's wallet (never all).
+    breachPct: 0.10,                      // 10% of wallet on full breach
+    breachMin: 1000,
+    breachMax: 1000000000000,             // hard ceiling (sane cap)
+    // Anti-spam: per-target protection + global cooldown.
+    targetCooldownMs: 2 * 60 * 60 * 1000, // 2h protection after being attacked
+    globalCooldownMs: 10 * 60 * 1000,     // 10m between manual /attack triggers
+    // Offline fallback: offline targets cannot respond to challenges and must
+    // rely entirely on their purchased security.
+    onlineWindowMs: 5 * 60 * 1000,        // "online" = messaged within last 5m
+    onlineSecurityBonus: 1,               // small defense bonus for being online
+    offlineSecurityAdvantage: 0,          // offline gets NO security advantage
+  },
+
   // Mines
   mines: {
     grid: 5,
