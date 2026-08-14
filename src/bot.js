@@ -741,20 +741,21 @@ function createBot() {
     },
 
     dep: async (ctx) => {
-      const r = eco.deposit(ctx.userId, ctx.args[0]);
+      // No amount → "all" (withdraw/deposit the full balance by default).
+      const r = eco.deposit(ctx.userId, ctx.args[0] || 'all');
       await ctx.reply(r.message, { title: '🏦 DEPOSIT', color: THEME.cyan });
     },
     deposit: async (ctx) => {
-      const r = eco.deposit(ctx.userId, ctx.args[0]);
+      const r = eco.deposit(ctx.userId, ctx.args[0] || 'all');
       await ctx.reply(r.message, { title: '🏦 DEPOSIT', color: THEME.cyan });
     },
     wd: async (ctx) => {
-      const r = eco.withdraw(ctx.userId, ctx.args[0]);
-      await ctx.reply(r.message, { title: '👛 WITHDRAW', color: THEME.cyan });
+      const r = eco.withdraw(ctx.userId, ctx.args[0] || 'all');
+      await ctx.reply(r.message, { title: '💵 WITHDRAW', color: THEME.cyan });
     },
     withdraw: async (ctx) => {
-      const r = eco.withdraw(ctx.userId, ctx.args[0]);
-      await ctx.reply(r.message, { title: '👛 WITHDRAW', color: THEME.cyan });
+      const r = eco.withdraw(ctx.userId, ctx.args[0] || 'all');
+      await ctx.reply(r.message, { title: '💵 WITHDRAW', color: THEME.cyan });
     },
 
     donate: async (ctx) => {
@@ -1930,7 +1931,13 @@ function createBot() {
       // Drain the WHOLE queue each tick. Delivery is async (per item) so the
       // next item starts immediately instead of waiting 10s for the first.
       let drained = 0;
-      for (let item = dashboard.drainBroadcastQueue(makeBroadcastSender); item; item = dashboard.drainBroadcastQueue(makeBroadcastSender)) {
+      // IMPORTANT: makeBroadcastSender() is a FACTORY that returns the real
+      // (item, done) sender. Passing the factory itself to drainBroadcastQueue
+      // made it call the factory with (item, done) and then DISCARD the returned
+      // sender — so nothing was ever sent and every queued broadcast was
+      // silently dropped. Invoke it ONCE and reuse the same sender instance.
+      const sender = makeBroadcastSender();
+      for (let item = dashboard.drainBroadcastQueue(sender); item; item = dashboard.drainBroadcastQueue(sender)) {
         drained++;
         if (drained >= 50) break; // safety cap per tick
       }
