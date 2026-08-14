@@ -479,6 +479,92 @@ let fullMirrorInFlight = false;
 const PG_CRITICAL_FAILURES = 3;
 const PG_QUERY_TIMEOUT_MS = 10000; // hard per-query timeout — a hung pooler never wedges the pipeline
 
+/* ================= Dirty-tracking (bandwidth fix) =================
+ * The 30s full `mirrorAll()` re-sent every row of every table even when the
+ * bot was idle — the dominant egress cost. We now track WHICH tables/rows
+ * actually changed and mirror only those. The v4 durability architecture
+ * (advisory lock, hydration, fail-closed fencing, version ordering) is
+ * untouched: this only changes the *sync payload shape + cadence*.
+ */
+const SYNC_SKIP_TABLES = new Set(['backups']); // backups already write once via saveBackupPg()
+const RECONCILE_INTERVAL_MS = 15 * 60 * 1000;  // safety-net full reconciliation cadence
+const dirtyTables = new Set();                  // tables with unsynced local changes
+const dirtyRowKeys = new Map();                 // table -> Set of single-PK key strings
+let rowsMirrored = 0;                           // cumulative rows upserted to Postgres
+let bytesMirrored = 0;                          // cumulative estimated payload bytes
+let mirrorAllRuns = 0;                          // dirty-sync runs (periodic)
+let reconcileRuns = 0;                          // full reconciliation runs
+let lastFullReconcileAt = 0;                    // when the last full reconciliation completed
+let lastMirrorRows = 0;
+let lastMirrorBytes = 0;
+let lastMirrorTables = 0;
+
+/** Mark a table (and optionally one row, for single-PK tables) as changed. */
+function markDirty(table, pkValue = null) {
+  dirtyTables.add(table);
+  if (pkValue != null && TABLE_PKS[table] && TABLE_PKS[table].length === 1) {
+    if (!dirtyRowKeys.has(table)) dirtyRowKeys.set(table, new Set());
+    dirtyRowKeys.get(table).add(String(pkValue));
+  }
+}
+
+/** Atomically take + clear the dirty markers for one table. */
+function captureDirty(table) {
+  const keys = dirtyRowKeys.get(table) || null;
+  dirtyRowKeys.delete(table);
+  dirtyTables.delete(table);
+  return keys;
+}
+
+/** Select rows for a single-PK table by primary-key values (inside the queue). */
+function selectRowsBySinglePk(table, pkValues) {
+  const cols = TABLE_COLS[table].split(', ');
+  const pkCol = TABLE_PKS[table][0];
+  const placeholders = pkValues.map(() => '?').join(', ');
+  return db.prepare(`SELECT ${cols.join(', ')} FROM ${table} WHERE ${pkCol} IN (${placeholders})`).all(...pkValues);
+}
+
+/**
+ * Immediately mirror ONE changed row (single-PK tables) with a batched upsert.
+ * This is the O(1)-per-write replacement for `mirrorTable('users')`: it marks
+ * the row dirty, pushes only that row, and clears the marker on success. If the
+ * push fails (degraded mode), the marker REMAINS so the periodic loop or the
+ * reconnect reconcile retries it — durability is preserved, egress is collapsed.
+ */
+function mirrorChangedRow(table, pkValue) {
+  if (!TABLE_PKS[table] || TABLE_PKS[table].length !== 1) {
+    // No single PK → can't target one row; fall back to a dirty whole-table mirror.
+    markDirty(table);
+    return mirrorTable(table);
+  }
+  const key = String(pkValue);
+  markDirty(table, pkValue);
+  return queuePgWrite(table, async () => {
+    if (!pool || !pgReady || !syncEnabled || persistenceDegraded) return 0;
+    if (pgEnabled && !instanceLockHeld) return 0;
+    const rows = selectRowsBySinglePk(table, [key]);
+    if (!rows.length) return 0;
+    const client = await pool.connect();
+    try {
+      const written = await upsertRowsBatched(client, table, rows);
+      // Clear this row's dirty marker only after a successful push.
+      const dk = dirtyRowKeys.get(table);
+      if (dk) {
+        dk.delete(key);
+        if (dk.size === 0) {
+          dirtyRowKeys.delete(table);
+          dirtyTables.delete(table);
+        }
+      }
+      rowsMirrored += written;
+      bytesMirrored += rows.reduce((n, r) => n + JSON.stringify(r).length + 8, 0);
+      return written;
+    } finally {
+      client.release();
+    }
+  });
+}
+
 // Per-table write chain so writes to the same table stay strictly ordered.
 const pgChains = {};
 function tableChain(table) {
@@ -660,12 +746,69 @@ const TABLE_PKS = {
 };
 
 /**
- * Upsert the SQLite cache of one table into Postgres, then READ BACK the
- * affected rows to VERIFY the write landed. The whole transaction runs under
- * the hard query timeout (PG_QUERY_TIMEOUT_MS) — a hung pooler connection
- * can never wedge the pipeline. Returns the number of rows written.
+ * Batch-upsert a set of rows into Postgres as ONE multi-row statement, then
+ * READ BACK the first row to VERIFY the write landed. Runs inside the caller's
+ * serialized queue task (a dedicated client + transaction). Returns rows written.
+ * This is the bandwidth fix: one round-trip for N rows instead of N round-trips.
  */
-function mirrorTable(table) {
+async function upsertRowsBatched(client, table, rows) {
+  if (!rows.length) return 0;
+  const cols = TABLE_COLS[table].split(', ');
+  const pkCols = TABLE_PKS[table] || [cols[0]];
+  const updateCols = cols.filter((c) => !pkCols.includes(c));
+  if (!updateCols.length) return 0;
+
+  const versioned = VERSIONED_TABLES.has(table) && cols.includes('updated_at');
+  const whereClause = versioned
+    ? ` WHERE ${table}.updated_at < EXCLUDED.updated_at`
+    : '';
+
+  const colList = cols.join(', ');
+  const colCount = cols.length;
+  const valueGroups = [];
+  const params = [];
+  for (const row of rows) {
+    const placeholders = cols.map((_, i) => `$${params.length + i + 1}`).join(', ');
+    valueGroups.push(`(${placeholders})`);
+    for (const c of cols) params.push(row[c]);
+  }
+
+  await client.query('BEGIN');
+  try {
+    await client.query(`SET LOCAL statement_timeout = ${PG_QUERY_TIMEOUT_MS}`);
+    await client.query(
+      `INSERT INTO ${table} (${colList}) VALUES ${valueGroups.join(', ')}
+       ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols.map((c) => `${c} = EXCLUDED.${c}`).join(', ')}${whereClause}`,
+      params
+    );
+    await client.query('COMMIT');
+  } catch (e) {
+    await client.query('ROLLBACK').catch(() => {});
+    throw e;
+  }
+
+  // Read-back verification on the SAME connection after commit.
+  const first = rows[0];
+  const where = pkCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ');
+  const vals = pkCols.map((c) => first[c]);
+  const rb = await client.query(`SELECT COUNT(*) AS c FROM ${table} WHERE ${where}`, vals);
+  const found = Number((rb.rows && rb.rows[0] && rb.rows[0].c) || 0);
+  if (found > 0) {
+    pgLastVerifyAt = Date.now();
+  } else {
+    throw new Error(`read-back found 0 rows for ${table} pk=${JSON.stringify(vals)} — write did not land`);
+  }
+
+  return rows.length;
+}
+
+/**
+ * Upsert the SQLite cache of one table into Postgres (batched), then VERIFY.
+ * `rowKeys` (optional) limits the mirror to specific single-PK rows that
+ * actually changed — the whole-table re-send is only used by the low-frequency
+ * reconciliation pass. Returns the number of rows written.
+ */
+function mirrorTable(table, rowKeys = null) {
   if (!pool || !pgReady || !syncEnabled || (pgEnabled && !instanceLockHeld)) return 0;
 
   // IMPORTANT: capture the SQLite snapshot INSIDE the serialized task, not when
@@ -673,71 +816,72 @@ function mirrorTable(table) {
   // queue for seconds and then being written after newer local state exists.
   return queuePgWrite(table, async () => {
     if (pgEnabled && !instanceLockHeld) return 0;
-    const rows = sqliteRows(table);
+    // Single-PK dirty-row mirror: select only the changed rows (still inside the task).
+    let rows;
+    if (rowKeys && rowKeys.size && TABLE_PKS[table] && TABLE_PKS[table].length === 1) {
+      rows = selectRowsBySinglePk(table, Array.from(rowKeys));
+    } else {
+      rows = sqliteRows(table);
+    }
     if (!rows.length) return 0;
 
-    const cols = TABLE_COLS[table].split(', ');
     const client = await pool.connect();
     try {
-      await client.query(`SET LOCAL statement_timeout = ${PG_QUERY_TIMEOUT_MS}`);
-      await client.query('BEGIN');
-      for (const row of rows) {
-        const placeholders = cols.map((_, i) => `$${i + 1}`).join(', ');
-        const pkCols = TABLE_PKS[table] || [cols[0]];
-        const updateCols = cols
-          .filter((c) => !pkCols.includes(c))
-          .map((c) => `${c} = EXCLUDED.${c}`)
-          .join(', ');
-        if (!updateCols) continue;
-
-        const versioned = VERSIONED_TABLES.has(table) && cols.includes('updated_at');
-        const whereClause = versioned
-          ? ` WHERE ${table}.updated_at < EXCLUDED.updated_at`
-          : '';
-
-        await client.query(
-          `INSERT INTO ${table} (${cols.join(', ')}) VALUES (${placeholders})
-           ON CONFLICT (${pkCols.join(', ')}) DO UPDATE SET ${updateCols}${whereClause}`,
-          cols.map((c) => row[c])
-        );
-      }
-      await client.query('COMMIT');
-
-      // Read-back verification happens on the SAME connection after commit.
-      const first = rows[0];
-      const pkCols = TABLE_PKS[table] || [cols[0]];
-      const where = pkCols.map((c, i) => `${c} = $${i + 1}`).join(' AND ');
-      const vals = pkCols.map((c) => first[c]);
-      const rb = await client.query(`SELECT COUNT(*) AS c FROM ${table} WHERE ${where}`, vals);
-      const found = Number((rb.rows && rb.rows[0] && rb.rows[0].c) || 0);
-      if (found > 0) {
-        pgLastVerifyAt = Date.now();
-      } else {
-        throw new Error(`read-back found 0 rows for ${table} pk=${JSON.stringify(vals)} — write did not land`);
-      }
-
-      return rows.length;
-    } catch (e) {
-      await client.query('ROLLBACK').catch(() => {});
-      throw e;
+      const written = await upsertRowsBatched(client, table, rows);
+      // Lightweight telemetry so we can prove the payload drop in production.
+      rowsMirrored += written;
+      const approxBytes = rows.reduce((n, r) => n + JSON.stringify(r).length + 8, 0);
+      bytesMirrored += approxBytes;
+      return written;
     } finally {
       client.release();
     }
   });
 }
 
-/** Full mirror: push every SQLite table to Postgres (called on boot + periodically). */
-async function mirrorAll() {
+/**
+ * Mirror dirty tables (and, for single-PK tables, only their changed rows).
+ * Once every RECONCILE_INTERVAL_MS (and always on boot/reconnect), fall back
+ * to a FULL reconciliation that pushes every table as a safety net — so a
+ * missed dirty flag can never cause permanent divergence. `force` is set by
+ * boot / reconnect paths.
+ */
+async function mirrorAll(force = false) {
   if (!pool || !pgReady || !syncEnabled || persistenceDegraded || fullMirrorInFlight) return;
   fullMirrorInFlight = true;
   try {
+    const now = Date.now();
+    const doReconcile = force || (now - lastFullReconcileAt >= RECONCILE_INTERVAL_MS);
+
     const tasks = [];
     for (const table of Object.keys(TABLE_COLS)) {
       if (!pgReady || !syncEnabled || persistenceDegraded) break;
-      const task = mirrorTable(table);
+      if (SYNC_SKIP_TABLES.has(table)) continue; // backups written once by saveBackupPg()
+      if (!doReconcile && !dirtyTables.has(table)) continue; // skip clean tables
+      let rowKeys = null;
+      if (doReconcile) {
+        // Full reconciliation mirrors the ENTIRE table, not just dirty rows,
+        // and clears any markers (the pass below covers everything).
+        dirtyRowKeys.delete(table);
+        dirtyTables.delete(table);
+      } else {
+        rowKeys = captureDirty(table);
+      }
+      const task = mirrorTable(table, rowKeys);
       if (task && typeof task.then === 'function') tasks.push(task);
     }
     await Promise.allSettled(tasks);
+
+    if (doReconcile) {
+      lastFullReconcileAt = now;
+      reconcileRuns++;
+      // Any rows that changed DURING the reconcile pass above stay marked for
+      // the next cycle — they are intentionally NOT cleared by captureDirty's
+      // per-table grab for tables that weren't in this pass, but to be safe we
+      // leave any new markers intact (markDirty re-adds as writes land).
+    } else {
+      mirrorAllRuns++;
+    }
   } finally {
     fullMirrorInFlight = false;
   }
@@ -821,7 +965,7 @@ function getOrCreateUser(userId, meta = {}) {
         .run(newUsername, newFirstName, stamp, userId);
       const updated = db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId);
       logDbWrite(userId, 'updateProfile', '', 'meta', 'getOrCreateUser');
-      mirrorTable('users');
+      mirrorChangedRow('users', userId);
       return mapUser(updated);
     }
     return mapUser(row);
@@ -830,7 +974,7 @@ function getOrCreateUser(userId, meta = {}) {
   db.prepare('INSERT INTO users (user_id, username, first_name, wallet, bank, status, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
     .run(userId, meta.username || '', meta.first_name || '', config.startBalance, 0, 'active', now, now);
   logDbWrite(userId, 'createUser', 0, config.startBalance, 'getOrCreateUser');
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
   return mapUser(db.prepare('SELECT * FROM users WHERE user_id = ?').get(userId));
 }
 
@@ -848,14 +992,14 @@ function setWallet(userId, amount, src = 'setWallet') {
   const prev = getUser(userId);
   db.prepare('UPDATE users SET wallet = ?, updated_at = ? WHERE user_id = ?').run(amount, nowStamp(), userId);
   logDbWrite(userId, 'setWallet', prev ? prev.wallet : 0, amount, src);
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
 }
 
 function setBank(userId, amount, src = 'setBank') {
   const prev = getUser(userId);
   db.prepare('UPDATE users SET bank = ?, updated_at = ? WHERE user_id = ?').run(amount, nowStamp(), userId);
   logDbWrite(userId, 'setBank', prev ? prev.bank : 0, amount, src);
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
 }
 
 /** Set the ENTIRE networth in one atomic write: wallet = amount, bank = 0.
@@ -866,7 +1010,7 @@ function setNetworth(userId, amount, src = 'setNetworth') {
   db.prepare('UPDATE users SET wallet = ?, bank = 0, updated_at = ? WHERE user_id = ?')
     .run(amount, nowStamp(), userId);
   logDbWrite(userId, 'setNetworth', prev ? prev.wallet + prev.bank : 0, amount, src);
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
 }
 
 /** Atomically add to wallet (positive or negative). Returns new wallet. */
@@ -875,7 +1019,7 @@ function addWallet(userId, delta, src = 'addWallet') {
   db.prepare('UPDATE users SET wallet = wallet + ?, updated_at = ? WHERE user_id = ?').run(delta, nowStamp(), userId);
   const after = getUser(userId).wallet;
   logDbWrite(userId, 'addWallet', prev ? prev.wallet : 0, after, src);
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
   return after;
 }
 
@@ -885,7 +1029,7 @@ function addBank(userId, delta, src = 'addBank') {
   db.prepare('UPDATE users SET bank = bank + ?, updated_at = ? WHERE user_id = ?').run(delta, nowStamp(), userId);
   const after = getUser(userId).bank;
   logDbWrite(userId, 'addBank', prev ? prev.bank : 0, after, src);
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
   return after;
 }
 
@@ -893,7 +1037,7 @@ function setStatus(userId, status, reason, until = 0) {
   db.prepare('UPDATE users SET status = ?, status_reason = ?, status_until = ?, updated_at = ? WHERE user_id = ?')
     .run(status, reason || '', until, nowStamp(), userId);
   logDbWrite(userId, 'setStatus', '', status, 'setStatus');
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
 }
 
 /** /hide — vanish from rob/heist targeting until `untilTs` (ms epoch). */
@@ -927,7 +1071,7 @@ function getAllUsers() {
 function clearStatus(userId) {
   db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0, updated_at = ? WHERE user_id = ?").run(nowStamp(), userId);
   logDbWrite(userId, 'clearStatus', '', 'active', 'clearStatus');
-  mirrorTable('users');
+  mirrorChangedRow('users', userId);
 }
 
 /** Top 10 by net worth (wallet + bank). */
@@ -1276,7 +1420,7 @@ function createEvent(ev) {
       ev.starts_at || 0, ev.ends_at || 0, ev.active === false ? 0 : 1,
       ev.created_by || 0, Date.now());
   const created = db.prepare('SELECT * FROM bot_events ORDER BY id DESC LIMIT 1').get();
-  mirrorTable('bot_events');
+  mirrorChangedRow('bot_events', created.id);
   return mapEvent(created);
 }
 
@@ -1294,7 +1438,7 @@ function updateEvent(id, fields) {
       fields.ends_at !== undefined ? fields.ends_at : ev.ends_at,
       id
     );
-  mirrorTable('bot_events');
+  mirrorChangedRow('bot_events', id);
   return mapEvent(db.prepare('SELECT * FROM bot_events WHERE id = ?').get(id));
 }
 
@@ -1665,7 +1809,9 @@ function expirePenalties() {
   for (const u of expired) {
     db.prepare("UPDATE users SET status = 'active', status_reason = '', status_until = 0, updated_at = ? WHERE user_id = ?").run(nowStamp(), u.user_id);
   }
-  if (expired.length) mirrorTable('users');
+  if (expired.length) {
+    for (const u of expired) mirrorChangedRow('users', u.user_id);
+  }
   return expired.map((u) => ({ ...u, user_id: Number(u.user_id) }));
 }
 
@@ -1870,6 +2016,12 @@ function syncInfo() {
     persistenceDegraded,
     writable: (!pgEnabled || (pgReady && pgConnectivity !== 'degraded' && syncEnabled && instanceLockHeld)),
     dbSyncIntervalMs: config.dbSyncIntervalMs,
+    // Bandwidth telemetry — proves dirty-row mirroring replaces the 30s full dump.
+    mirroredRowsTotal: rowsMirrored,
+    mirroredBytesTotal: bytesMirrored,
+    mirrorAllRuns,
+    reconcileRuns,
+    lastFullReconcileAt: lastFullReconcileAt || 0,
   };
 }
 
@@ -1963,7 +2115,9 @@ function setSyncEnabled(v) {
     startSyncLoop();
     // Push any local-only rows up immediately (rather than waiting for the
     // first periodic tick) so a freshly-promoted primary converges at once.
-    mirrorAll();
+    // `true` forces a FULL reconciliation on promotion/boot (safe: a freshly
+    // promoted primary must converge its whole cache, not just dirty rows).
+    mirrorAll(true);
   }
   return syncEnabled;
 }
@@ -2065,7 +2219,7 @@ function schedulePgRetry() {
         if (instanceLockHeld) {
           syncEnabled = true;
           startSyncLoop();
-          mirrorAll();
+          mirrorAll(true); // full reconcile after recovery (re-hydration may have changed rows)
           console.log('[db] ✅ persistence recovered — write pipeline re-enabled.');
         }
       } else {
@@ -2185,6 +2339,7 @@ module.exports = {
   setSyncEnabled,
   isSyncEnabled,
   mirrorTable,
+  mirrorAll,
   pgRun,
   syncInfo,
   ping,
