@@ -49,6 +49,7 @@ const { Server } = require('socket.io');
 const config = require('../config');
 const db = require('../db');
 const admin = require('../admin');
+const broadcast = require('../broadcast');
 
 const OWNER_ID = Number(config.ownerId);
 const SESSION_TTL = config.dashboard.sessionTtlMs;
@@ -443,7 +444,16 @@ function createDashboard(server, bot) {
     });
     db.logActivity('event', `Event created: ${title} (${t})`, { event_id: ev.id });
     audit(req.admin, 'create_event', 0, title);
-    res.json({ ok: true, event: ev });
+    // Announce the new event/mission through the SAME broadcast pipeline the
+    // /broadcast API uses, so it is actually delivered to users + groups.
+    try {
+      const rec = db.createBroadcast(broadcast.buildEventAnnouncement(ev), 'all', req.admin.userId);
+      queueBroadcast(rec.id, rec.message, 'all');
+      db.logActivity('broadcast', `Event announced to all chats: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
+    } catch (e) {
+      console.error('[dashboard] event broadcast failed:', e.message);
+    }
+    res.json({ ok: true, event: ev, announced: !!activeBot });
   });
 
   /** Create a pre-built free-entry giveaway event (no cost, big reward) AND
@@ -466,7 +476,7 @@ function createDashboard(server, bot) {
     // Always queue (even mid-redeploy): bot.js drains the queue every 10s.
     try {
       const rec = db.createBroadcast(
-        `🎁 <b>${escHtml(ev.title)}</b>\n\n${escHtml(ev.description || '')}\n\n💰 Reward: <b>${fmt(ev.reward)}</b> coins — free entry! Try <code>/mission ${ev.id}</code> to claim it, mortal.`,
+        broadcast.buildEventAnnouncement({ ...ev, description: `${ev.description || 'Free entry — no coins needed.'} — free entry!` }),
         'all',
         req.admin.userId
       );
@@ -623,4 +633,4 @@ function createDashboard(server, bot) {
   return { app, io, drainBroadcastQueue, pendingBroadcasts };
 }
 
-module.exports = { createDashboard, setActiveBot, drainBroadcastQueue, OWNER_ID, ensureOwnerPassword };
+module.exports = { createDashboard, setActiveBot, drainBroadcastQueue, queueBroadcast, pendingBroadcasts, OWNER_ID, ensureOwnerPassword };

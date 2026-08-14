@@ -871,6 +871,74 @@ test('pause flag: setBotPaused/getBotPaused persisted (SQLite + mirrored to PG p
   assert.ok(row && String(row.value) === '0', 'settings row persisted');
 });
 
+/* ---------- /sb networth (Feature 1) ---------- */
+test('db.setNetworth: sets wallet=N AND resets bank=0 (whole networth = N)', () => {
+  const uid = 9301;
+  db.getOrCreateUser(uid, { first_name: 'Networth', username: 'nw' });
+  db.setWallet(uid, 5000);
+  db.setBank(uid, 95000); // networth 100000 before
+  db.setNetworth(uid, 12345);
+  const u = db.getUser(uid);
+  assert.strictEqual(u.wallet, 12345, 'wallet becomes N');
+  assert.strictEqual(u.bank, 0, 'bank reset to 0');
+  assert.strictEqual(u.wallet + u.bank, 12345, 'networth exactly N');
+});
+
+test('db.setNetworth: zero is allowed (wallet 0, bank 0)', () => {
+  const uid = 9302;
+  db.getOrCreateUser(uid, { first_name: 'Zero', username: 'zero' });
+  db.setWallet(uid, 999999);
+  db.setBank(uid, 999999);
+  db.setNetworth(uid, 0);
+  const u = db.getUser(uid);
+  assert.strictEqual(u.wallet, 0);
+  assert.strictEqual(u.bank, 0);
+});
+
+/* ---------- /broadcast relevance + /set helpers (Features 2 & 3) ---------- */
+test('broadcast: keyword relevance accepts bot-related messages', async () => {
+  const bc = require('../src/broadcast');
+  assert.ok(bc.keywordRelevance('New casino event with a 50000 coin reward') >= 1);
+  const r = await bc.isRelevant('Rimuru casino economy update');
+  assert.ok(r.ok, 'relevant message accepted: ' + r.reason);
+});
+
+test('broadcast: relevance rejects random/unrelated messages (no Groq key in tests)', async () => {
+  const bc = require('../src/broadcast');
+  const r = await bc.isRelevant('buy my crypto course now!!!');
+  assert.ok(!r.ok, 'unrelated message rejected');
+  assert.strictEqual(r.via, 'keyword', 'uses keyword fallback when Groq is off');
+});
+
+test('broadcast: event announcement builder + type whitelist', () => {
+  const bc = require('../src/broadcast');
+  assert.deepStrictEqual(bc.EVENT_TYPES, ['mission', 'event', 'giveaway', 'trivia', 'challenge']);
+  assert.ok(bc.isEventType('giveaway'));
+  assert.ok(!bc.isEventType('bogus'));
+  const ann = bc.buildEventAnnouncement({ id: 5, title: 'Heist Rimuru', description: 'Steal it', type: 'mission', reward: 100000 });
+  assert.ok(ann.includes('Heist Rimuru'), 'announcement has title');
+  assert.ok(ann.includes('100,000'), 'announcement has formatted reward');
+  assert.ok(ann.includes('/mission 5'), 'announcement links the event id');
+});
+
+/* ---------- broadcast queue pipeline (Feature 4) ---------- */
+test('broadcast: queueBroadcast + drainBroadcastQueue actually deliver', () => {
+  const dboard = require('../src/dashboard/server');
+  const delivered = [];
+  // Create a broadcast row first (queueBroadcast just needs id/message/target).
+  const rec = db.createBroadcast('queued announcement', 'all', 8781690556);
+  dboard.queueBroadcast(rec.id, rec.message, 'all');
+  assert.strictEqual(dboard.pendingBroadcasts(), 1, 'one item pending');
+  const item = dboard.drainBroadcastQueue((it, done) => {
+    delivered.push(it);
+    done(3);
+  });
+  assert.ok(item, 'drained an item');
+  assert.strictEqual(item.id, rec.id, 'drained the right item');
+  assert.strictEqual(delivered.length, 1, 'send callback fired');
+  assert.strictEqual(dboard.pendingBroadcasts(), 0, 'queue emptied');
+});
+
 console.log(`\n${passed} passed, ${failed} failed`);
 if (failed > 0) process.exit(1);
 console.log('ALL SMOKE TESTS PASSED ✅');

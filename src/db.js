@@ -858,6 +858,17 @@ function setBank(userId, amount, src = 'setBank') {
   mirrorTable('users');
 }
 
+/** Set the ENTIRE networth in one atomic write: wallet = amount, bank = 0.
+ *  /sb N means "make this user's total coins exactly N" — so the bank is
+ *  reset to 0 (not left untouched) and the wallet becomes N. */
+function setNetworth(userId, amount, src = 'setNetworth') {
+  const prev = getUser(userId);
+  db.prepare('UPDATE users SET wallet = ?, bank = 0, updated_at = ? WHERE user_id = ?')
+    .run(amount, nowStamp(), userId);
+  logDbWrite(userId, 'setNetworth', prev ? prev.wallet + prev.bank : 0, amount, src);
+  mirrorTable('users');
+}
+
 /** Atomically add to wallet (positive or negative). Returns new wallet. */
 function addWallet(userId, delta, src = 'addWallet') {
   const prev = getUser(userId);
@@ -2093,6 +2104,7 @@ module.exports = {
   getNetWorth,
   setWallet,
   setBank,
+  setNetworth,
   addWallet,
   addBank,
   setStatus,

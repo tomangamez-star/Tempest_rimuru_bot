@@ -56,6 +56,7 @@ const missions = require('./missions');
 const backup = require('./backup');
 const redeem = require('./redeem');
 const profile = require('./profile');
+const broadcastMod = require('./broadcast');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -692,6 +693,10 @@ function createBot() {
         `<b>👑 Staff</b>\n` +
         `• /redeem create [CODE] [AMT] [USES] — mint a code (mods capped at 50M)\n` +
         `• /redeem list · /redeem delete [CODE] · /backup · /backups · /restore [id]\n` +
+        `• /sb [amount] — set a user's whole networth (wallet = amount, bank = 0)\n` +
+        `• /broadcast [message] (alias /bd) — announce to all users & groups\n` +
+        `  · owner: any message · mods: must be relevant to the bot\n` +
+        `• /set [type] [title] | [desc] | [reward] (alias /s) — create an event / mission / giveaway\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
@@ -1121,6 +1126,22 @@ function createBot() {
       await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
     },
 
+    // ----- /broadcast (alias /bd) — owner (any) + mods (relevance-gated) -----
+    broadcast: async (ctx) => {
+      await handleBroadcast(ctx);
+    },
+    bd: async (ctx) => {
+      await handleBroadcast(ctx);
+    },
+
+    // ----- /set (alias /s) — create events/missions/giveaways (staff) -----
+    set: async (ctx) => {
+      await handleSet(ctx);
+    },
+    s: async (ctx) => {
+      await handleSet(ctx);
+    },
+
     // ----- group gate -----
     verify: async (ctx) => verifyCommand(ctx),
 
@@ -1354,11 +1375,16 @@ function createBot() {
     }
     const raw = String((ctx.args || [])[0] || '').trim();
     const amt = Math.floor(Number(raw.replace(/,/g, '')));
-    if (!Number.isFinite(amt) || amt <= 0) {
+    // /sb (set) accepts 0 (zero-out the networth); /addcoin (add) must be > 0.
+    const minAmount = mode === 'add' ? 1 : 0;
+    if (!Number.isFinite(amt) || amt < minAmount) {
       return {
         title: mode === 'add' ? '➕ ADDCOIN' : '🎯 SET BALANCE',
         color: THEME.red,
-        message: `Usage: <code>/${mode} [amount] [@username or reply]</code> — amount must be a positive number.`,
+        message:
+          mode === 'add'
+            ? `Usage: <code>/addcoin [amount] [@username or reply]</code> — amount must be a positive number.`
+            : `Usage: <code>/sb [amount] [@username or reply]</code> — amount must be zero or greater (0 clears wallet AND bank).`,
       };
     }
     // Target resolution: replied-to user > @username > the sender
@@ -1382,7 +1408,7 @@ function createBot() {
     const actor = metaOf(ctx.msg);
     const target = db.getOrCreateUser(targetId);
     if (mode === 'add') db.addWallet(targetId, amt);
-    else db.setWallet(targetId, amt);
+    else db.setNetworth(targetId, amt);
     const after = db.getUser(targetId);
     db.logActivity('admin', `/${mode} ${fmt(amt)} -> ${target.first_name || targetId} by ${actor.username || ctx.userId}`, {
       target: targetId,
@@ -1394,10 +1420,118 @@ function createBot() {
       message:
         (mode === 'add'
           ? `➕ <b>Added</b> ${fmt(amt)} coins to `
-          : `🎯 <b>Set</b> balance to <b>${fmt(amt)}</b> for `) +
+          : `🎯 <b>Set</b> networth to <b>${fmt(amt)}</b> (wallet ${fmt(amt)} · bank 0) for `) +
         `<a href="tg://user?id=${targetId}">${target.first_name || targetId}</a>.\n` +
-        `💰 Wallet: <b>${fmt(after.wallet)}</b> · 🏦 Bank: <b>${fmt(after.bank)}</b> · 💎 Net: <b>${fmt(after.wallet + after.bank)}</b>`,
+        `💳 Wallet: <b>${fmt(after.wallet)}</b> · 🏦 Bank: <b>${fmt(after.bank)}</b> · 💎 Net: <b>${fmt(after.wallet + after.bank)}</b>`,
     };
+  }
+
+  /**
+   * /broadcast (alias /bd) — send a message to every known user + group chat.
+   * Owner: no restriction. Moderators: must pass a relevance check so random /
+   * unrelated / spam content is rejected before it ever reaches the queue.
+   */
+  async function handleBroadcast(ctx) {
+    const actor = metaOf(ctx.msg);
+    if (!isStaff(ctx.userId)) {
+      return ctx.reply('Only the King and his moderators can broadcast. 👑', { title: '📣 BROADCAST', color: THEME.red });
+    }
+    const text = (ctx.args || []).join(' ').trim();
+    if (!text) {
+      return ctx.reply(
+        `Usage: <code>/broadcast [message]</code>\n\nOwner may broadcast any message. Moderators must keep it relevant to the Rimuru bot (economy, games, events, commands, etc.).`,
+        { title: '📣 BROADCAST', color: THEME.cyan, html: true }
+      );
+    }
+
+    // Owner bypasses the content gate entirely; moderators are gated.
+    if (!ctx.isOwner) {
+      const verdict = await broadcastMod.isRelevant(text);
+      if (!verdict.ok) {
+        db.logActivity('mod', `Rejected broadcast from ${actor.username || ctx.userId}: ${text.slice(0, 80)} (${verdict.reason})`, { target: ctx.userId });
+        return ctx.reply(
+          `🚫 <b>BROADCAST REJECTED</b>\n\nThat message isn't relevant to the Rimuru bot (${verdict.reason}). Moderators can only broadcast about the bot, its economy, games, events, commands, or maintenance.`,
+          { title: '📣 BROADCAST', color: THEME.red, html: true }
+        );
+      }
+    }
+
+    const rec = db.createBroadcast(text, 'all', ctx.userId);
+    dashboard.queueBroadcast(rec.id, rec.message, 'all');
+    db.logActivity('broadcast', `Broadcast queued by ${actor.username || ctx.userId}: ${text.slice(0, 60)}`, { broadcast_id: rec.id });
+    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'broadcast', 0, `target=all`);
+    await ctx.reply(
+      `📣 <b>BROADCAST QUEUED</b> (#${rec.id})\n\nDelivering to all known users & groups…`,
+      { title: '📣 BROADCAST', color: THEME.gold, html: true }
+    );
+  }
+
+  /**
+   * /set (alias /s) — create an event / mission / giveaway that goes LIVE in
+   * the bot. Staff (owner + moderators) may use it. Usage:
+   *   /set [type] [title] | [description] | [reward]
+   * e.g. /set mission Heist Rimuru and survive | Steal from the vault | 100000
+   * The new event is announced through the same broadcast pipeline.
+   */
+  async function handleSet(ctx) {
+    const actor = metaOf(ctx.msg);
+    if (!isStaff(ctx.userId)) {
+      return ctx.reply('Only the King and his moderators can set events. 👑', { title: '🎯 SET EVENT', color: THEME.red });
+    }
+
+    const args = (ctx.args || []).join(' ').trim();
+    if (!args) {
+      return ctx.reply(
+        `Usage: <code>/set [type] [title] | [description] | [reward]</code>\n\n` +
+        `Types: ${broadcastMod.EVENT_TYPES.join(', ')}\n` +
+        `Example: <code>/set mission Heist Rimuru and survive | Steal from the vault | 100000</code>\n\n` +
+        `The event goes live immediately (players use <code>/mission [id]</code>) and is announced to all chats.`,
+        { title: '🎯 SET EVENT', color: THEME.cyan, html: true }
+      );
+    }
+
+    // Parse: /set [type] [title | desc | reward] — type optional (defaults to mission).
+    let type = 'mission';
+    let rest = args;
+    const first = args.split(/\s+/)[0].toLowerCase();
+    if (broadcastMod.EVENT_TYPES.includes(first)) {
+      type = first;
+      rest = args.slice(first.length).trim();
+    }
+    if (!rest) {
+      return ctx.reply('Give the event a title: <code>/set mission Heist Rimuru | description | 100000</code>', { title: '🎯 SET EVENT', color: THEME.red, html: true });
+    }
+
+    // Pipe-separated fields (first field may already have the type stripped).
+    const parts = rest.split('|').map((p) => p.trim());
+    const title = parts[0] || 'New event';
+    const description = parts[1] || '';
+    const reward = Math.max(0, Math.floor(Number(String(parts[2] || '').replace(/,/g, '')) || 0));
+
+    const ev = db.createEvent({
+      title,
+      description,
+      type,
+      reward,
+      ends_at: 0,
+      created_by: ctx.userId,
+    });
+    db.logActivity('event', `Event created via /set: ${title} (${type})`, { event_id: ev.id });
+    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'set_event', 0, `${type}: ${title} reward=${reward}`);
+
+    // Announce through the SAME queue so /set events are actually delivered.
+    try {
+      const rec = db.createBroadcast(broadcastMod.buildEventAnnouncement(ev), 'all', ctx.userId);
+      dashboard.queueBroadcast(rec.id, rec.message, 'all');
+      db.logActivity('broadcast', `Event announced via /set: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
+    } catch (e) {
+      console.error('[set] announce failed:', e.message);
+    }
+
+    await ctx.reply(
+      `✅ <b>EVENT LIVE</b> (#${ev.id})\n\n${broadcastMod.buildEventAnnouncement(ev)}\n\nPlayers use <code>/missions</code> and <code>/mission ${ev.id}</code>.`,
+      { title: '🎯 SET EVENT', color: THEME.gold, html: true }
+    );
   }
 
   /** Schedule heist execution after the 60s open window. */
@@ -1496,6 +1630,7 @@ function createBot() {
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health\n` +
+            `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
           await answerCb('');
@@ -1670,7 +1805,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
