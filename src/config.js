@@ -49,7 +49,7 @@ const config = {
   //     LOUDLY (logs + /health + /debug) and retries every 15s — it never
   //     silently pretends persistence is on.
   databaseUrl: process.env.DATABASE_URL || process.env.SUPABASE_URL || '',
-  dbSyncIntervalMs: Number(process.env.DB_SYNC_INTERVAL_MS || 1500),
+  dbSyncIntervalMs: Number(process.env.DB_SYNC_INTERVAL_MS || 30000),
 
   // ===================== AUTO-BACKUP (hidden safety net) =====================
   // Automatic backups run on a 40-minute cycle: every 5 min for the first

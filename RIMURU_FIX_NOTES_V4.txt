@@ -1,0 +1,11 @@
+RIMURU persistence v4 changes
+
+1. Removed the process-kill behavior after three transient Postgres write failures. The bot now enters persistence-degraded/read-only mode and keeps /health alive instead of causing a Render 502/restart loop.
+2. Added persistence-degraded fencing at the Telegram router/callback level so state-changing commands are blocked before SQLite mutation while durable Postgres persistence is unavailable.
+3. Postgres recovery now happens in the background; the pool is re-tested, state is rehydrated, the primary lock is revalidated/reacquired if necessary, and only then is the write pipeline re-enabled.
+4. Added Postgres pool error handling.
+5. Stopped full-mirror overlap: a full reconciliation pass now waits for queued table mirrors to settle before another can start.
+6. Reduced the default full reconciliation cadence from 1.5 seconds to 30 seconds. Per-mutation mirror/write-through paths remain available; the periodic pass is now a safety reconciliation rather than a hot loop.
+7. A single successful write no longer immediately clears a degraded state; recovery must complete through the dedicated reconnect path.
+
+This version is intended to address the observed Render 502 loop and the pool-connection saturation seen in logs, while preserving the stale-writer protections already added in v3. Production verification is still required.

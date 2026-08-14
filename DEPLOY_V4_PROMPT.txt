@@ -1,0 +1,39 @@
+RIMURU V4 — PUSH THIS EXACT SOURCE
+
+This source is the corrected successor to v3.
+The v3 deployment entered a Render 502/restart loop because repeated Postgres connection timeouts triggered process termination.
+
+Important production evidence:
+- Postgres initially hydrated successfully.
+- The advisory lock was acquired successfully.
+- Then multiple tables reported "timeout exceeded when trying to connect".
+- After 3 failures v3 sent SIGTERM.
+- Render restarted the process.
+- The same cycle repeated.
+
+V4 changes:
+1. Removed the persistence-failure process termination path. Transient Postgres failures now fence durable writes and keep /health alive.
+2. Telegram state-changing commands/callbacks are blocked while persistence is degraded, so SQLite does not continue accumulating unsafe economic changes.
+3. Background recovery reconnects to Postgres, validates a real query, rehydrates safely, revalidates/reacquires the primary lock if necessary, and only then re-enables the write pipeline.
+4. Added Postgres pool error logging.
+5. Prevented full-mirror overlap by awaiting queued table mirrors before another full reconciliation pass can start.
+6. Reduced the default full reconciliation interval from 1.5 seconds to 30 seconds. Per-mutation write-through paths remain active; the periodic pass is only a safety reconciliation now.
+7. A single successful late write no longer clears a degraded state. Recovery must complete through the reconnect path.
+
+DO NOT:
+- overwrite these changes with the previous v3 fail-closed process.exit logic
+- reintroduce a 1.5-second full mirror loop
+- disable the dedicated-session advisory lock
+- auto-restore an old backup during recovery
+- declare success from local tests alone
+
+Deployment steps:
+1. Push this exact source to GitHub.
+2. Confirm Render is deploying the new commit.
+3. Confirm /health returns HTTP 200 immediately and exposes persistence.writable / persistence.persistenceDegraded state.
+4. Watch logs during startup and for at least one full old-regression window.
+5. Test a known balance/state change, then redeploy once.
+6. If Postgres times out, the bot must remain reachable and enter safe maintenance/read-only behavior rather than crash.
+7. When Postgres connectivity is restored, the bot should automatically recover without requiring a Render restart.
+
+After deployment, send the Render logs around any persistence error or state regression before making another code change.

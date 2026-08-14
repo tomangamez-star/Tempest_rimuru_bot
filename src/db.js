@@ -246,6 +246,10 @@ if (pgEnabled) {
             ? { rejectUnauthorized: false }
             : undefined,
     });
+    pool.on('error', (err) => {
+      console.error('[db] Postgres pool error:', err && err.message ? err.message : err);
+      recordPgFailure(err || new Error('unknown pg pool error'), 'pool');
+    });
   } catch (e) {
     console.error('[db] Invalid DATABASE_URL — falling back to SQLite-only:', e.message);
     pool = null;
@@ -470,6 +474,8 @@ let pgLastVerifyAt = 0;         // when the last read-back verification passed (
 let pgWritesOk = 0;             // total verified writes
 let pgWritesFailed = 0;         // total failed writes
 let lastMirrorAt = 0;           // when the periodic full-sync last RAN (completed)
+let persistenceDegraded = false;
+let fullMirrorInFlight = false;
 const PG_CRITICAL_FAILURES = 3;
 const PG_QUERY_TIMEOUT_MS = 10000; // hard per-query timeout — a hung pooler never wedges the pipeline
 
@@ -536,21 +542,30 @@ function recordPgFailure(err, label) {
   pgLastError = `${label || 'pg'}: ${String((err && err.message) || err).slice(0, 300)}${code}`;
   pgLastErrorAt = Date.now();
   pgConnectivity = 'degraded';
+  persistenceDegraded = true;
+
+  // IMPORTANT: do NOT terminate the Render process on transient Postgres
+  // connection failures. A hard process exit creates a restart/502 loop and
+  // makes diagnosis harder. Instead, fence the write pipeline, keep /health
+  // alive, and recover the durable connection in the background.
+  syncEnabled = false;
+  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+
   if (pgFailures >= PG_CRITICAL_FAILURES) {
-    // Fail closed: once durable writes repeatedly fail, do not keep accepting
-    // economy mutations into Render's ephemeral SQLite cache. Stop the bot so
-    // Render can restart it cleanly after persistence recovers.
-    syncEnabled = false;
-    if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
     console.error(
       `[db] ❌ Postgres write failures reached ${pgFailures} (last: ${pgLastError}). ` +
-      'Durable persistence is unsafe; shutting down to prevent divergent local state.'
+      'Persistence is degraded; economic writes are fenced and background recovery is active.'
     );
-    setImmediate(() => { try { process.kill(process.pid, 'SIGTERM'); } catch (_) {} });
   } else {
     console.error('[db] pg write error:', pgLastError);
   }
+
+  // Mark the pool as not ready so queued writes stop immediately and the
+  // existing reconnect path can re-establish the connection and rehydrate.
+  pgReady = false;
+  schedulePgRetry();
 }
+
 
 /**
  * Execute a pg write on the table's ordered chain. The query runs under the
@@ -559,7 +574,7 @@ function recordPgFailure(err, label) {
  * NEXT write for that table can still go through.
  */
 function queuePgWrite(table, task) {
-  if (!pool || !pgReady || !syncEnabled) return Promise.resolve(false);
+  if (!pool || !pgReady || !syncEnabled || persistenceDegraded) return Promise.resolve(false);
   if (pgEnabled && !instanceLockHeld) return Promise.resolve(false);
   const chain = tableChain(table);
   const run = chain.then(async () => {
@@ -567,13 +582,10 @@ function queuePgWrite(table, task) {
       const result = await task();
       pgWritesOk++;
       pgLastWriteAt = Date.now();
-      if (pgConnectivity === 'degraded' && pgFailures > 0) {
-        // A write succeeded again — clear the degraded state if no other error is pending.
-        pgConnectivity = 'connected';
-        pgFailures = 0;
-        pgLastError = '';
-        console.log(`[db] ✅ Postgres writes resumed for ${table} — connectivity restored.`);
-      }
+      // A single successful queued write does not immediately clear a degraded
+      // state. Recovery is finalized only after the reconnect path completes a
+      // fresh init + hydration + lock check. This prevents a late success from
+      // re-enabling writes while the connection is still unstable.
       return result;
     } catch (err) {
       pgWritesFailed++;
@@ -715,9 +727,20 @@ function mirrorTable(table) {
 }
 
 /** Full mirror: push every SQLite table to Postgres (called on boot + periodically). */
-function mirrorAll() {
-  if (!pool || !pgReady || !syncEnabled) return;
-  for (const table of Object.keys(TABLE_COLS)) mirrorTable(table);
+async function mirrorAll() {
+  if (!pool || !pgReady || !syncEnabled || persistenceDegraded || fullMirrorInFlight) return;
+  fullMirrorInFlight = true;
+  try {
+    const tasks = [];
+    for (const table of Object.keys(TABLE_COLS)) {
+      if (!pgReady || !syncEnabled || persistenceDegraded) break;
+      const task = mirrorTable(table);
+      if (task && typeof task.then === 'function') tasks.push(task);
+    }
+    await Promise.allSettled(tasks);
+  } finally {
+    fullMirrorInFlight = false;
+  }
 }
 
 /* ================= User row helpers ================= */
@@ -1680,7 +1703,9 @@ async function acquireInstanceLock(key) {
         await pgQueryWithTimeout('SELECT 1', [], instanceLockClient);
       } catch (e) {
         console.error('[db] ❌ advisory-lock heartbeat lost:', e.message);
+        const lostKey = instanceLockKey;
         instanceLockHeld = false;
+        persistenceDegraded = true;
         syncEnabled = false;
         if (syncTimer) {
           clearInterval(syncTimer);
@@ -1688,10 +1713,9 @@ async function acquireInstanceLock(key) {
         }
         try { instanceLockClient.release(); } catch (_) {}
         instanceLockClient = null;
-        instanceLockKey = null;
-        // Never continue running as a writable primary after the fencing lock
-        // is lost. A stale SQLite cache must not survive as an unsupervised writer.
-        setImmediate(() => { try { process.kill(process.pid, 'SIGTERM'); } catch (_) {} });
+        // Keep the process alive for Render health, but fence all writes.
+        // Recovery will reconnect Postgres and attempt to reacquire this lock.
+        if (lostKey != null) schedulePgRetry();
       }
     }, 10000);
     instanceLockHeartbeat.unref && instanceLockHeartbeat.unref();
@@ -1832,6 +1856,8 @@ function syncInfo() {
     writesFailed: pgWritesFailed || 0,
     instanceLockHeld: !pgEnabled || instanceLockHeld,
     instanceLockPinned: !!instanceLockClient,
+    persistenceDegraded,
+    writable: (!pgEnabled || (pgReady && pgConnectivity !== 'degraded' && syncEnabled && instanceLockHeld)),
     dbSyncIntervalMs: config.dbSyncIntervalMs,
   };
 }
@@ -1966,6 +1992,7 @@ async function initPersistence() {
       pgConnectivity = 'connected';
       pgFailures = 0;
       pgLastError = '';
+      persistenceDegraded = false;
       console.log('[db] Postgres ready — hydrating SQLite cache from Postgres…');
       // Hydration MUST fully complete BEFORE the sync loop starts (rollback
       // fix): the loop can never push a half-merged cache up to Postgres.
@@ -2002,17 +2029,33 @@ function schedulePgRetry() {
         pgConnectivity = 'connected';
         pgFailures = 0;
         pgLastError = '';
+        // Prove the pool can execute a real query before re-enabling writes.
+        await pgQueryWithTimeout('SELECT 1');
         console.log('[db] ✅ Postgres connection restored — reconciling durable state…');
         // Never hydrate a live cache while it is simultaneously allowed to
         // write. Fence the write pipeline for the whole reconciliation window.
         const wasSyncEnabled = syncEnabled;
         syncEnabled = false;
-        const hydrated = await runHydration('Re-hydrated');
+        await runHydration('Re-hydrated');
+
+        // If the previous dedicated lock session survived the transient pool
+        // outage, reuse it. If heartbeat lost the session, reacquire the lock
+        // before restoring write ownership.
+        if (instanceLockKey != null && !instanceLockHeld) {
+          try {
+            await acquireInstanceLock(instanceLockKey);
+          } catch (e) {
+            console.warn('[db] primary lock reacquisition deferred:', e.message);
+          }
+        }
+
         pgInitPromise = null;
-        if (wasSyncEnabled && instanceLockHeld) {
+        persistenceDegraded = false;
+        if (instanceLockHeld) {
           syncEnabled = true;
           startSyncLoop();
           mirrorAll();
+          console.log('[db] ✅ persistence recovered — write pipeline re-enabled.');
         }
       } else {
         // initPg() failed — retry later (initPg already logged the reason).

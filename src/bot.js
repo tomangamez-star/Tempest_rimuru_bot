@@ -1428,6 +1428,11 @@ function createBot() {
     const from = query.from || {};
     const userId = from.id;
     const ctx = buildCtx(query.message || { chat: { id: chatId }, from }, []);
+    const pinfo = db.syncInfo();
+    if (pinfo.configured && !pinfo.writable) {
+      try { await bot.answerCallbackQuery(query.id, { text: 'Rimuru is in safe maintenance mode while the database recovers.', show_alert: true }); } catch (_) {}
+      return;
+    }
 
     const answerCb = (text) => bot.answerCallbackQuery(query.id, { text }).catch(() => {});
     // Bound partial for game modules: editMsg(text, opts) → edits THIS message
@@ -1599,12 +1604,29 @@ function createBot() {
     return true;
   }
 
+  const PERSISTENCE_EXEMPT_CMDS = new Set(['health', 'debug', 'help', 'start', 'verify', 'stop', 'run']);
+  const PERSISTENCE_NOTICE = '🛠️ Rimuru is temporarily in safe maintenance mode while the database connection recovers. Your balance and progress are protected. Please try again shortly.';
+
+  function isPersistenceBlockedFor(msg) {
+    const info = db.syncInfo();
+    if (!info.configured || info.writable) return false;
+    const from = msg.from || {};
+    const parsed = parseCommand(String(msg.text || msg.caption || ''));
+    if (parsed && PERSISTENCE_EXEMPT_CMDS.has(parsed.cmd)) return false;
+    try { bot.sendMessage(msg.chat.id, PERSISTENCE_NOTICE).catch(() => {}); } catch (_) {}
+    return true;
+  }
+
   async function onMessage(msg) {
     // Ignore non-user messages (channel posts, etc.)
     if (!msg.from || msg.from.is_bot) return;
     const text = String(msg.text || msg.caption || '');
     const userId = msg.from.id;
     const chatId = msg.chat.id;
+    // IMPORTANT: once durable persistence is degraded, stop all state-changing
+    // interaction before touching SQLite. This prevents offline mutations from
+    // accumulating in Render's ephemeral cache and later overwriting durable data.
+    if (isPersistenceBlockedFor(msg)) return;
     // AUTO-CREATE PROFILE: ANY message or command from a user creates their
     // profile — /start is no longer required. getOrCreateUser is idempotent
     // and only writes when a profile field actually changes, so this is cheap
