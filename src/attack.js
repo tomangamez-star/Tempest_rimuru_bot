@@ -181,6 +181,14 @@ async function announce(text) {
   // Fallback: at least DM the target if we know it (handled by caller).
 }
 
+/** Send an attack sequence message to the target's DM AND all group chats. */
+async function emit(chatId, text, opts = {}) {
+  await send(chatId, text, opts);
+  if (deps && typeof deps.group === 'function') {
+    try { await deps.group(text, opts, Number(chatId)); } catch (e) { console.warn('[attack] group announce failed:', e.message); }
+  }
+}
+
 /* ---------------- challenge lifecycle ---------------- */
 
 async function failBreach(targetId, chatId, attackers, reason) {
@@ -190,7 +198,7 @@ async function failBreach(targetId, chatId, attackers, reason) {
   if (stolen > 0) db.addWallet(targetId, -stolen);
   const after = db.getUser(targetId) || { wallet: 0 };
   db.logActivity('event', `Attack breached ${targetId} (${reason}) — stolen ${stolen}`, { target: targetId, stolen });
-  await send(chatId,
+  await emit(chatId,
     `🔴 <b>BREACH COMPLETE</b>\n\n` +
     `The attackers escaped before authorities arrived.\n` +
     `💰 Stolen: <b>${fmt(stolen)}</b>\n` +
@@ -217,7 +225,7 @@ async function sendNextChallenge(targetId, chatId, round, roundsTotal, attackers
   }, config.attack.challengeWindowMs + 500);
   timer.unref && timer.unref();
   pendingChallenges.set(targetId, { code, round, roundsTotal, expiresAt, timer, attackers, chatId });
-  await send(chatId,
+  await emit(chatId,
     `🚨 <b>SYSTEM BREACH!</b>\n\n` +
     `Attackers are inside your network!\n` +
     `Type:\n\n<code>${code}</code>\n\n` +
@@ -229,7 +237,7 @@ async function sendNextChallenge(targetId, chatId, round, roundsTotal, attackers
 async function succeedDefense(targetId, chatId, attackers) {
   clearChallenge(targetId);
   const remaining = db.getItemQty(targetId, 'security');
-  await send(chatId,
+  await emit(chatId,
     `🛡️ <b>BREACH CONTAINED</b>\n\n` +
     `🚨 Emergency response successful.\n` +
     `🕵️ All attackers have been arrested.\n` +
@@ -325,7 +333,7 @@ async function spawnOne({ manual = false, force = false, chatId = null, actorId 
   else await announce(ann);
 
   // Security fight.
-  await send(targetId,
+  await emit(targetId,
     `🛡️ <b>SECURITY DEPLOYED</b>\n` +
     `Player security: ${playerSecurity}\n` +
     `Incoming attackers: ${attackers}\n\n` +
@@ -337,7 +345,7 @@ async function spawnOne({ manual = false, force = false, chatId = null, actorId 
     // Security wins — consume exactly `attackers` security (never below 0).
     if (attackers > 0) db.addItem(targetId, 'security', -attackers);
     db.logActivity('event', `Attack repelled for ${targetId} (${attackers} attackers)`, { target: targetId });
-    await send(targetId,
+    await emit(targetId,
       `🛡️ <b>ATTACK REPELLED!</b>\n\n` +
       `Your security successfully defended your funds.\n\n` +
       `🔐 Security consumed: <b>${Math.min(attackers, playerSecurity)}</b>\n` +
@@ -349,7 +357,7 @@ async function spawnOne({ manual = false, force = false, chatId = null, actorId 
 
   // Breached — consume all security, then breach stage.
   if (playerSecurity > 0) db.addItem(targetId, 'security', -playerSecurity);
-  await send(targetId,
+  await emit(targetId,
     `🔴 <b>SECURITY BREACHED</b>\n\n` +
     `Your security system has been overwhelmed.\n` +
     `🚨 Attackers have entered the next stage...`,

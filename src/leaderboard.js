@@ -29,7 +29,17 @@ const FOOTER = '• 𝖴𝗉𝖽𝖺𝗍𝖾𝖽 𝗅𝗂𝗏𝖾 𝖿𝗋𝗈�
 
 /** Render the leaderboard as an HTML string (safe inside a note body). */
 function render() {
-  const top = db.leaderboard(10);
+  return renderCount(10);
+}
+
+/**
+ * Render an EXTENDED leaderboard with an explicit player cap (1..100).
+ * Used by /xleaderboard (staff) so mods can see the full list without
+ * changing the normal /leaderboard top-10 output.
+ */
+function renderCount(limit) {
+  const cap = Math.max(1, Math.min(100, Math.floor(Number(limit) || 10)));
+  const top = db.leaderboard(cap);
   if (!top.length) return '🏆 No players yet. Be the first!';
 
   const entries = top.map((u, i) => {
@@ -40,11 +50,11 @@ function render() {
   });
 
   return (
-    `${HEADER}\n` +
+    `${HEADER} (TOP ${top.length})\n` +
     `${TAGLINE}\n\n` +
     entries.join('\n\n') +
     `\n\n${FOOTER}`
   );
 }
 
-module.exports = { render, HEADER, TAGLINE, FOOTER };
+module.exports = { render, renderCount, HEADER, TAGLINE, FOOTER };

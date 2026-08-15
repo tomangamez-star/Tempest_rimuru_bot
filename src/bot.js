@@ -541,10 +541,10 @@ function createBot() {
     dice: '🎲 <b>Dice</b>\n<code>/dice [1-6] [amount]</code>\nAnimated dice — hit your number = 6×. Rare, but sweet. 😎',
     hl: '📏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
     guess: '🎯 <b>Guess the Number</b>\n<code>/guess [amount]</code>\nPick 1-10. 3 chances with higher/lower hints. 1st try = 5x, 2nd = 3x, 3rd = 2x. 🎲',
-    crash: '💥 <b>Crash</b>\n<code>/crash [amount]</code>\nThe multiplier rockets up — cash out before it crashes. Long rides pay big. 💥',
+    crash: '💥 <b>Crash</b>\n<code>/crash [amount]</code>\nA LIVE multiplier rocket — press 💰 CASHOUT before it explodes. Long rides pay big. 💥',
     wheel: '🎡 <b>Wheel of Fortune</b>\n<code>/wheel [amount]</code>\nSpin a 12-segment wheel — 0.5x to 10x. Lady luck decides. 🎰',
     rps: '✊ <b>Rock Paper Scissors</b>\n<code>/rps [rock|paper|scissors] [amount]</code>\nBeat the house. Tie = half back. ✋✌️',
-    ttt: '⭕ <b>Tic-Tac-Toe</b>\n<code>/ttt [amount]</code>\nBeat the house at tic-tac-toe. Win = 1.8x, draw = half back. ❌',
+    ttt: '⭕ <b>Tic-Tac-Toe</b>\n<code>/ttt [amount]</code>\nButton game vs the house — pick difficulty (Easy/Normal/Hard), then X or O. No bet = play for fun. ❌',
     duel: '🎲 <b>Dice Duel</b>\n<code>/duel [amount]</code>\nYou vs the house — higher roll wins. Ties go to the house. ⚔️',
     cfs: '🪙 <b>Coin Flip Streak</b>\n<code>/cfs [heads|tails] [amount]</code>\nEach correct flip doubles your payout. One miss = everything gone. 🔥',
     num: '🎯 <b>Number Roulette</b>\n<code>/num [1-10] [amount]</code>\nPick 1-10. Rarer picks pay more — up to 9x. 🎡',
@@ -657,7 +657,7 @@ function createBot() {
         `• /crash [amt] — multiplier rocket, cash out before it crashes 💥\n` +
         `• /wheel [amt] — wheel of fortune, 0.5x–10x 🎡\n` +
         `• /rps [rock|paper|scissors] [amt] — vs the house ✊✋✌️\n` +
-        `• /ttt [amt] — tic-tac-toe vs the house ⭕❌\n` +
+        `• /ttt [amt] — button tic-tac-toe vs the house (difficulty + X/O, no bet = fun) ⭕❌\n` +
         `• /duel [amt] — dice duel, higher roll wins 🎲\n` +
         `• /cfs [heads|tails] [amt] — coin flip streak, doubles each win 🪙\n` +
         `• /num [1-10] [amt] — number roulette, rare picks pay up to 9x 🎯\n\n` +
@@ -699,6 +699,7 @@ function createBot() {
         `  · owner: any message · mods: must be relevant to the bot\n` +
         `• /set [type] [title] | [desc] | [reward] (alias /s) — create an event / mission / giveaway\n` +
         `• /attack — Rimuru deploys attackers against a wealthy player (owner/Rimuru only)\n` +
+        `• /xleaderboard [n] (alias /xlb) — full networth list of ALL players, 1–100 (staff only)\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
@@ -987,6 +988,26 @@ function createBot() {
     // ----- leaderboard -----
     lb: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
     leaderboard: async (ctx) => { await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true }); },
+
+    // ----- extended leaderboard (owner + moderators only) -----
+    // /xleaderboard [n] — full networth list of ALL players (1..100).
+    // The normal /leaderboard stays exactly as-is (top 10).
+    xleaderboard: async (ctx) => {
+      if (!isStaff(ctx.userId)) {
+        return ctx.reply('Only staff can view the extended leaderboard. 👑', { title: '🔒 STAFF ONLY', color: THEME.red });
+      }
+      const n = Number(String((ctx.args || [])[0] || '100').replace(/,/g, ''));
+      const limit = Number.isFinite(n) && n > 0 ? Math.min(100, Math.floor(n)) : 100;
+      await ctx.reply(leaderboard.renderCount(limit), { title: '🏆 EXTENDED LEADERBOARD', color: THEME.gold, html: true });
+    },
+    xlb: async (ctx) => {
+      if (!isStaff(ctx.userId)) {
+        return ctx.reply('Only staff can view the extended leaderboard. 👑', { title: '🔒 STAFF ONLY', color: THEME.red });
+      }
+      const n = Number(String((ctx.args || [])[0] || '100').replace(/,/g, ''));
+      const limit = Number.isFinite(n) && n > 0 ? Math.min(100, Math.floor(n)) : 100;
+      await ctx.reply(leaderboard.renderCount(limit), { title: '🏆 EXTENDED LEADERBOARD', color: THEME.gold, html: true });
+    },
 
     // ----- profile / badges / id -----
     p: async (ctx) => { await ctx.reply(profile.profileText(ctx, ctx.userId), { title: '🪪 PROFILE', color: THEME.gold, html: true }); },
@@ -1714,6 +1735,14 @@ function createBot() {
         await race.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
         return;
       }
+      if (data.startsWith('crash:')) {
+        await crash.onCash({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
+        return;
+      }
+      if (data.startsWith('ttt:')) {
+        await tictactoe.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
+        return;
+      }
       await answerCb('Unknown button.');
     } catch (e) {
       console.error('[callback] error:', e.message);
@@ -1835,7 +1864,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'xleaderboard', 'xlb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
@@ -2026,6 +2055,14 @@ function createBot() {
         const rec = db.createBroadcast(text, 'all', Number(config.ownerId));
         dashboard.queueBroadcast(rec.id, rec.message, 'all');
         return Promise.resolve();
+      },
+      // Broadcast the attack sequence to GROUP chats (in addition to the
+      // target's DM) so everyone can watch the security event unfold.
+      group: async (text, opts) => {
+        const groups = db.getSeenChatIds().filter((cid) => Number(cid) < 0);
+        for (const gid of groups) {
+          try { await reply(gid, text, opts); } catch (e) { /* non-fatal */ }
+        }
       },
     });
     attack.startRandomScheduler();
