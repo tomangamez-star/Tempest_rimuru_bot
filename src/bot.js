@@ -58,6 +58,7 @@ const redeem = require('./redeem');
 const profile = require('./profile');
 const broadcastMod = require('./broadcast');
 const attack = require('./attack');
+const fbi = require('./fbi');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -91,6 +92,9 @@ const MENU_COMMANDS = [
   { command: 'profile', description: '🪪 Profile / Badges' },
   { command: 'help', description: '❓ Help' },
   { command: 'health', description: '👌 Health' },
+  { command: 'attack', description: '🐉 Deploy attackers (owner)' },
+  { command: 'fbi', description: '🚔 FBI raid (owner)' },
+  { command: 'swat', description: '🚔 SWAT raid (owner)' },
 ];
 
 function createBot() {
@@ -699,6 +703,8 @@ function createBot() {
         `  · owner: any message · mods: must be relevant to the bot\n` +
         `• /set [type] [title] | [desc] | [reward] (alias /s) — create an event / mission / giveaway\n` +
         `• /attack — Rimuru deploys attackers against a wealthy player (owner/Rimuru only)\n` +
+        `• /attack [number] (reply) — deploy exactly N attackers against the replied user (owner only)\n` +
+        `• /FBI (alias /SWAT) — reply to raid a user's home (owner only, case-sensitive escape)\n` +
         `• /xleaderboard [n] (alias /xlb) — full networth list of ALL players, 1–100 (staff only)\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
@@ -1171,6 +1177,14 @@ function createBot() {
       await handleAttack(ctx);
     },
 
+    // ----- /FBI (alias /SWAT) — law-enforcement raid (owner, reply only) -----
+    fbi: async (ctx) => {
+      await handleFbi(ctx);
+    },
+    swat: async (ctx) => {
+      await handleFbi(ctx);
+    },
+
     // ----- group gate -----
     verify: async (ctx) => verifyCommand(ctx),
 
@@ -1443,6 +1457,29 @@ function createBot() {
       target: targetId,
       actor: ctx.userId,
     });
+
+    // JUSTICE MODE (FBI/SWAT automatic): if a MODERATOR (not the owner) tries
+    // to move more than `config.fbi.threshold`, Rimuru revokes their
+    // moderatorship and resets their balance to 0..maxRemaining.
+    if (!ctx.isOwner && amt > config.fbi.threshold) {
+      const remaining = fbi.justiceRemaining(amt, config.fbi.threshold, config.fbi.maxRemaining);
+      db.removeAdminUser(ctx.userId);
+      db.setNetworth(ctx.userId, remaining);
+      db.logActivity('fbi', `JUSTICE: ${actor.username || ctx.userId} tried /${mode} ${fmt(amt)} — demoted + balance reset to ${remaining}`, {
+        target: ctx.userId,
+        amount: amt,
+      });
+      return {
+        title: '🚔 FBI JUSTICE',
+        color: THEME.red,
+        message:
+          `🚔 <b>FBI JUSTICE</b>\n\n` +
+          `A moderator tried to move ${fmt(amt)} coins.\n` +
+          `Rimuru sensed the abuse and stripped their moderatorship.\n` +
+          `New balance: <b>${fmt(remaining)}</b>.`,
+      };
+    }
+
     return {
       title: mode === 'add' ? '➕ COINS ADDED' : '🎯 BALANCE SET',
       color: THEME.gold,
@@ -1565,12 +1602,28 @@ function createBot() {
 
   /**
    * /attack — manually trigger Rimuru's attack/security event.
-   * Only the owner (Rimuru) may use it. The random hourly scheduler runs
-   * automatically; this gives the King a manual lever for events/testing.
+   * Only the owner (Rimuru) may use it.
+   *   /attack                    → weighted random target (as before)
+   *   /attack <number> (reply)   → deploy EXACTLY that many attackers against
+   *                                the replied-to user (owner only)
    */
   async function handleAttack(ctx) {
     if (!ctx.isOwner) {
       return ctx.reply('Only Rimuru (the King) can trigger an attack. 🐉👑', { title: '🐉 ATTACK', color: THEME.red });
+    }
+    const replied = repliedUser(ctx.msg);
+    if (replied) {
+      const raw = String((ctx.args || [])[0] || '').trim();
+      const n = Math.floor(Number(raw.replace(/,/g, '')));
+      if (!Number.isFinite(n) || n < 1) {
+        return ctx.reply(
+          'Usage: reply to a user with <code>/attack [number]</code> — e.g. <code>/attack 100</code>.',
+          { title: '🐉 ATTACK', color: THEME.red, html: true }
+        );
+      }
+      const r = await attack.deployAgainst(replied.id, n, { chatId: ctx.chatId, actorId: ctx.userId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
+      return;
     }
     const r = await attack.trigger({ manual: true, force: true, chatId: ctx.chatId, actorId: ctx.userId });
     if (r && r.message && !r.targetId) {
@@ -1580,6 +1633,26 @@ function createBot() {
     if (r && !r.ok) {
       await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
     }
+  }
+
+  /**
+   * /FBI (alias /SWAT) — owner replies to a user to raid their home. FBI do
+   * NOT spawn; they WATCH. The target must type a case-sensitive escape code
+   * within the configured window or be fined. Owner only.
+   */
+  async function handleFbi(ctx) {
+    if (!ctx.isOwner) {
+      return ctx.reply('Only the King can deploy the FBI. 🚔👑', { title: '🚔 FBI', color: THEME.red });
+    }
+    const replied = repliedUser(ctx.msg);
+    if (!replied) {
+      return ctx.reply(
+        'Reply to a user with <code>/FBI</code> (or <code>/SWAT</code>) to raid their home. 🚔',
+        { title: '🚔 FBI', color: THEME.red, html: true }
+      );
+    }
+    const r = await fbi.deployAgainst(replied.id, { chatId: ctx.chatId, actorId: ctx.userId });
+    if (r && !r.ok) await ctx.reply(r.message, { title: '🚔 FBI', color: THEME.red, html: true });
   }
 
   /** Schedule heist execution after the 60s open window. */
@@ -1678,7 +1751,7 @@ function createBot() {
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health\n` +
-            `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /backup · /stop\n` +
+            `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
           await answerCb('');
@@ -1864,7 +1937,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'xleaderboard', 'xlb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run'];
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'xleaderboard', 'xlb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run', 'attack', 'fbi', 'swat'];
           if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
@@ -1931,6 +2004,11 @@ function createBot() {
     try {
       if (await attack.handleInput(userId, chatId, text)) return;
     } catch (e) { console.error('[attack] handleInput error:', e.message); }
+
+    // FBI/SWAT: a pending raid escape code consumes text input (exact case).
+    try {
+      if (await fbi.handleInput(userId, chatId, text)) return;
+    } catch (e) { console.error('[fbi] handleInput error:', e.message); }
 
     // Rimuru AI triggers:
     //  1) message contains "rimuru" (no command needed)
@@ -2070,6 +2148,21 @@ function createBot() {
     console.error('[attack] wiring failed:', e.message);
   }
 
+  // FBI/SWAT: attach the live bot so raids can send DMs and the owner's
+  // announcement message. No scheduler — FBI only acts on manual /FBI /SWAT.
+  try {
+    fbi.attach({
+      reply: (chatId, text, opts) => reply(chatId, text, opts),
+      announce: (text) => {
+        const rec = db.createBroadcast(text, 'all', Number(config.ownerId));
+        dashboard.queueBroadcast(rec.id, rec.message, 'all');
+        return Promise.resolve();
+      },
+    });
+  } catch (e) {
+    console.error('[fbi] wiring failed:', e.message);
+  }
+
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);
 
@@ -2084,6 +2177,11 @@ function createBot() {
   // Periodic: expire any stale attack breach challenges (safety sweep).
   setInterval(() => {
     try { attack.sweep(); } catch (e) { console.error('[attack] sweep error:', e.message); }
+  }, 5000);
+
+  // Periodic: expire any stale FBI/SWAT raids (safety sweep).
+  setInterval(() => {
+    try { fbi.sweep(); } catch (e) { console.error('[fbi] sweep error:', e.message); }
   }, 5000);
 
   bot.on('polling_error', (err) => {

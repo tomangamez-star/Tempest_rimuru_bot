@@ -225,6 +225,9 @@ const config = {
     onlineWindowMs: 5 * 60 * 1000,        // "online" = messaged within last 5m
     onlineSecurityBonus: 1,               // small defense bonus for being online
     offlineSecurityAdvantage: 0,          // offline gets NO security advantage
+    // Owner-directed deployments (/attack <number> with a reply) may exceed the
+    // wealth-scaled attacker cap; this is the absolute ceiling for safety.
+    manualMaxAttackers: 10000,
   },
 
   // Mines
@@ -344,6 +347,25 @@ const config = {
       `🪣 A rusty bucket. The fish laughed at you.`,
       `🌿 Just seaweed. The ocean is mocking you.`,
     ],
+  },
+
+  // ===================== FBI / SWAT =====================
+  // Rimuru's law-enforcement layer. Two modes:
+  //   1. JUSTICE (automatic): if a MODERATOR (not the owner) tries to move more
+  //      than `threshold` coins via /addcoin or /sb, Rimuru revokes their
+  //      moderatorship and resets their balance to a 0..maxRemaining value that
+  //      scales with how far over the threshold the attempt went.
+  //   2. RAID (manual): owner replies to a user with /FBI (alias /SWAT) and the
+  //      user must type a case-sensitive escape code within raidWindowMs or
+  //      lose a controlled % of their net worth.
+  fbi: {
+    enabled: String(process.env.FBI_ENABLED || 'true').toLowerCase() !== 'false',
+    threshold: 1000000000,               // 1B — justice triggers above this
+    maxRemaining: 1000000,               // 1M — least-harsh justice result
+    raidWindowMs: 3 * 1000,              // 3s to type the exact escape code
+    finePct: 0.10,                       // 10% of net worth on failed escape
+    fineMin: 1000,
+    fineMax: 1000000000000,              // hard ceiling (sane cap)
   },
 };
 

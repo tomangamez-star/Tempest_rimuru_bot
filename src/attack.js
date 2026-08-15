@@ -103,13 +103,27 @@ function buildChallenge(round, rng = Math.random) {
   }
 }
 
-/** Controlled financial consequence: a % of wallet, clamped, never all of it. */
-function stealAmount(wallet) {
+/**
+ * Controlled financial consequence: a % of the user's TOTAL net worth, clamped,
+ * never all of it. Funds are taken from the WALLET first, then the BANK.
+ * Returns { stolen, fromWallet, fromBank }.
+ */
+function computeTheft(wallet, bank) {
   const w = Math.max(0, Number(wallet) || 0);
-  if (!w) return 0;
-  const raw = Math.floor(w * config.attack.breachPct);
+  const b = Math.max(0, Number(bank) || 0);
+  const total = w + b;
+  if (!total) return { stolen: 0, fromWallet: 0, fromBank: 0 };
+  const raw = Math.floor(total * config.attack.breachPct);
   const capped = clamp(raw, config.attack.breachMin, config.attack.breachMax);
-  return Math.max(0, Math.min(capped, w));
+  const stolen = Math.max(0, Math.min(capped, total));
+  const fromWallet = Math.min(w, stolen);
+  const fromBank = Math.min(b, stolen - fromWallet);
+  return { stolen, fromWallet, fromBank };
+}
+
+/** Back-compat helper: consequence of a single wallet value. */
+function stealAmount(wallet) {
+  return computeTheft(wallet, 0).stolen;
 }
 
 /* ================= CONTROLLER (Telegram wiring) ================= */
@@ -193,16 +207,18 @@ async function emit(chatId, text, opts = {}) {
 
 async function failBreach(targetId, chatId, attackers, reason) {
   clearChallenge(targetId);
-  const u = db.getUser(targetId) || { wallet: 0 };
-  const stolen = stealAmount(u.wallet);
-  if (stolen > 0) db.addWallet(targetId, -stolen);
-  const after = db.getUser(targetId) || { wallet: 0 };
+  const u = db.getUser(targetId) || { wallet: 0, bank: 0 };
+  const { stolen, fromWallet, fromBank } = computeTheft(u.wallet, u.bank);
+  if (fromWallet > 0) db.addWallet(targetId, -fromWallet);
+  if (fromBank > 0) db.addBank(targetId, -fromBank);
+  const after = db.getUser(targetId) || { wallet: 0, bank: 0 };
   db.logActivity('event', `Attack breached ${targetId} (${reason}) — stolen ${stolen}`, { target: targetId, stolen });
   await emit(chatId,
     `🔴 <b>BREACH COMPLETE</b>\n\n` +
     `The attackers escaped before authorities arrived.\n` +
-    `💰 Stolen: <b>${fmt(stolen)}</b>\n` +
-    `👛 Remaining wallet: <b>${fmt(after.wallet)}</b>`,
+    `💰 Stolen: <b>${fmt(stolen)}</b> (wallet ${fmt(fromWallet)} · bank ${fmt(fromBank)})\n` +
+    `👛 Remaining wallet: <b>${fmt(after.wallet)}</b>\n` +
+    `🏦 Remaining bank: <b>${fmt(after.bank)}</b>`,
     { title: '🔴 ATTACK BREACHED', color: '#FF5252', html: true }
   );
 }
@@ -286,14 +302,23 @@ async function sweep() {
  * Run one attack spawn: find + select a target, deploy attackers, resolve the
  * security fight, then either stop (repelled) or start the breach challenge /
  * apply the financial consequence. Returns a result object for the caller.
+ *
+ * `deployCount` optionally overrides the wealth-scaled attacker count (used by
+ * the owner's directed /attack <number> command). When omitted, the count is
+ * derived from the target's net worth as before.
  */
-async function spawnOne({ manual = false, force = false, chatId = null, actorId = 0 } = {}) {
+async function spawnOne({ manual = false, force = false, chatId = null, actorId = 0, deployCount = 0 } = {}) {
   const now = Date.now();
   rollHourIfNeeded(now);
 
   if (!force && isGlobalOnCooldown(now)) {
     return { ok: false, message: 'Rimuru just deployed attackers — the kingdom is on cooldown. Try again shortly.' };
   }
+
+  const wanted = Math.max(0, Math.floor(Number(deployCount) || 0));
+  const noTargetLine = wanted > 0
+    ? `${wanted} attackers broke into the JTF Casino looking for a user to attack...`
+    : 'A crew of attackers broke into the JTF Casino looking for a user to attack...';
 
   // Search for eligible targets, excluding cooldown + this-hour repeats.
   const eligible = db.getAttackEligibleUsers(minNetWorth());
@@ -304,14 +329,16 @@ async function spawnOne({ manual = false, force = false, chatId = null, actorId 
 
   if (!target) {
     globalLastSpawnAt = now;
-    const msg = `🐉 Rimuru spawned attackers...\n🕵️ Attackers are searching for a valuable target...\n\n🕵️ <b>No eligible target found</b> (nobody is worth ${fmt(minNetWorth())} yet) — the attackers simply leave.`;
+    const msg = `${noTargetLine}\n🕵️ Attackers are searching for a valuable target...\n\n🕵️ <b>No eligible target found</b> (nobody is worth ${fmt(minNetWorth())} yet) — the attackers simply leave.`;
     if (chatId) await send(chatId, msg, { title: '🐉 ATTACK EVENT', color: '#FF5252', html: true });
     else await announce(msg);
-    return { ok: true, message: msg, targetId: null, attackers: 0 };
+    return { ok: true, message: msg, targetId: null, attackers: wanted };
   }
 
   const targetId = Number(target.user_id);
-  const attackers = attackerCountFor(target.networth);
+  const attackers = wanted > 0
+    ? Math.min(wanted, config.attack.manualMaxAttackers)
+    : attackerCountFor(target.networth);
   const online = isOnline(targetId);
   const playerSecurity = db.getItemQty(targetId, 'security');
   const effectiveSecurity = playerSecurity + (online ? config.attack.onlineSecurityBonus : 0);
@@ -323,7 +350,7 @@ async function spawnOne({ manual = false, force = false, chatId = null, actorId 
 
   // Announcement (spawn → search → target acquired → deployed).
   const ann =
-    `🐉 <b>Rimuru has spawned attackers...</b>\n` +
+    `${attackers} attackers broke into the JTF Casino looking for a user to attack...\n` +
     `🕵️ Attackers are searching for a valuable target...\n\n` +
     `🚨 <b>TARGET ACQUIRED</b>\n` +
     `🎯 Target: ${targetHandle(target)}\n` +
@@ -382,6 +409,79 @@ async function spawnOne({ manual = false, force = false, chatId = null, actorId 
 async function trigger(opts = {}) {
   const r = await spawnOne(opts);
   return r;
+}
+
+/**
+ * OWNER-directed deployment: reply to a user with `/attack <number>` to deploy
+ * exactly that many attackers against THEM (ignoring the weighted pick and
+ * minimum-net-worth eligibility). Only the owner reaches this path (bot.js
+ * enforces it). Works for online and offline targets alike.
+ */
+async function deployAgainst(targetId, count, opts = {}) {
+  const now = Date.now();
+  rollHourIfNeeded(now);
+  const attackers = clamp(Math.max(1, Math.floor(Number(count) || 1)), 1, config.attack.manualMaxAttackers);
+  const chatId = opts.chatId != null ? opts.chatId : Number(targetId);
+  const target = db.getUser(targetId);
+  if (!target) {
+    return { ok: false, message: 'That user has never interacted with the bot.' };
+  }
+
+  const online = isOnline(targetId);
+  const playerSecurity = db.getItemQty(targetId, 'security');
+  const effectiveSecurity = playerSecurity + (online ? config.attack.onlineSecurityBonus : 0);
+
+  // Mark cooldowns + this-hour distinct target.
+  globalLastSpawnAt = now;
+  recentTargets.set(Number(targetId), now);
+  spawnedThisHour.add(Number(targetId));
+
+  const ann =
+    `${attackers} attackers broke into the JTF Casino looking for a user to attack...\n` +
+    `🕵️ Attackers are searching for a valuable target...\n\n` +
+    `🚨 <b>TARGET ACQUIRED</b>\n` +
+    `🎯 Target: ${targetHandle(target)}\n` +
+    `💰 Net Worth: <b>${fmt((target.wallet || 0) + (target.bank || 0))}</b>\n\n` +
+    `🕵️ <b>${attackers} attackers deployed.</b>`;
+  if (chatId) await send(chatId, ann, { title: '🐉 ATTACK EVENT', color: '#FF5252', html: true });
+  else await announce(ann);
+
+  await emit(Number(targetId),
+    `🛡️ <b>SECURITY DEPLOYED</b>\n` +
+    `Player security: ${playerSecurity}\n` +
+    `Incoming attackers: ${attackers}\n\n` +
+    `⚔️ <b>SECURITY VS ATTACKERS...</b>`,
+    { title: '🛡️ SECURITY DEPLOYED', color: '#4FC3F7', html: true }
+  );
+
+  if (effectiveSecurity >= attackers) {
+    if (attackers > 0) db.addItem(targetId, 'security', -attackers);
+    db.logActivity('event', `Attack repelled for ${targetId} (${attackers} directed attackers)`, { target: targetId });
+    await emit(Number(targetId),
+      `🛡️ <b>ATTACK REPELLED!</b>\n\n` +
+      `Your security successfully defended your funds.\n\n` +
+      `🔐 Security consumed: <b>${Math.min(attackers, playerSecurity)}</b>\n` +
+      `💰 Funds protected.`,
+      { title: '🛡️ ATTACK REPELLED', color: '#4FC3F7', html: true }
+    );
+    return { ok: true, targetId: Number(targetId), attackers, security: playerSecurity, outcome: 'repelled' };
+  }
+
+  if (playerSecurity > 0) db.addItem(targetId, 'security', -playerSecurity);
+  await emit(Number(targetId),
+    `🔴 <b>SECURITY BREACHED</b>\n\n` +
+    `Your security system has been overwhelmed.\n` +
+    `🚨 Attackers have entered the next stage...`,
+    { title: '🔴 SECURITY BREACHED', color: '#FF5252', html: true }
+  );
+
+  if (online) {
+    await sendNextChallenge(Number(targetId), Number(targetId), 1, config.attack.challengeRounds, attackers);
+    return { ok: true, targetId: Number(targetId), attackers, security: playerSecurity, outcome: 'breach-interactive' };
+  }
+
+  await failBreach(Number(targetId), Number(targetId), attackers, 'offline target');
+  return { ok: true, targetId: Number(targetId), attackers, security: playerSecurity, outcome: 'breach-offline' };
 }
 
 /* ---------------- random hourly scheduler ---------------- */
@@ -450,11 +550,13 @@ module.exports = {
   rollSpawnsThisHour,
   buildChallenge,
   stealAmount,
+  computeTheft,
   // controller
   attach,
   markSeen,
   isOnline,
   trigger,
+  deployAgainst,
   handleInput,
   sweep,
   startRandomScheduler,
