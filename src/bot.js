@@ -18,6 +18,7 @@
  */
 const TelegramBot = require('node-telegram-bot-api');
 const path = require('path');
+const fs = require('fs');
 
 const config = require('./config');
 const db = require('./db');
@@ -1055,7 +1056,7 @@ function createBot() {
 
       // Send the cached rank logo (static asset, one-time generated) with the
       // rank card caption. Falls back to a text card if the photo fails.
-      const logo = path.join(__dirname, 'assets', 'ranks', `${r}.png`);
+      const logo = fs.createReadStream(path.join(__dirname, 'assets', 'ranks', `${r}.png`));
       const caption =
         `${emoji} <b>${r.toUpperCase()}</b> — YOUR RANK\n\n` +
         `${progress}\n\n` +
@@ -1067,6 +1068,7 @@ function createBot() {
       try {
         await bot.sendPhoto(ctx.chatId, logo, { caption, parse_mode: 'HTML' });
       } catch (e) {
+        console.error('[rank] sendPhoto failed, falling back to text:', e.message);
         await ctx.reply(caption, { title: '🏆 RANK', color: THEME.gold, html: true });
       }
     },
