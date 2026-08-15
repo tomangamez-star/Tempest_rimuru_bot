@@ -363,9 +363,23 @@ const config = {
     threshold: 1000000000,               // 1B — justice triggers above this
     maxRemaining: 1000000,               // 1M — least-harsh justice result
     raidWindowMs: 3 * 1000,              // 3s to type the exact escape code
-    finePct: 0.10,                       // 10% of net worth on failed escape
+    finePct: 0.40,                       // 40% of COMPLETE net worth on failed escape
     fineMin: 1000,
     fineMax: 1000000000000,              // hard ceiling (sane cap)
+  },
+
+  // ===================== RANK SYSTEM =====================
+  // Bronze → Silver → Gold → Platinum → Diamond → Master → Legend → Mythic.
+  // Promotion requires VALID matches (bet >= validMatchPct of wallet). Seven
+  // consecutive losses demote one rank. During peak hours (08:00–11:00 WAT /
+  // UTC+1) every game is flat 50/50; otherwise rank tier sets the player's
+  // win chance (whales have worse odds). See src/rank.js.
+  rank: {
+    enabled: String(process.env.RANK_ENABLED || 'true').toLowerCase() !== 'false',
+    validMatchPct: 0.10,       // bet must be >= 10% of wallet to count
+    demoteLosses: 7,           // consecutive losses before demotion
+    peakStartHour: 8,          // WAT (UTC+1)
+    peakEndHour: 11,           // exclusive
   },
 };
 

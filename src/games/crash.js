@@ -12,6 +12,7 @@
  */
 const config = require('../config');
 const { fmt } = require('../utils');
+const rank = require('../rank');
 
 // In-memory live sessions (ephemeral — resets on redeploy, like mines).
 const sessions = new Map();
@@ -22,23 +23,26 @@ const TICK_MS = 900;
 const BASE_STEP = 0.05;
 
 /**
- * Roll the crash multiplier: 45% of bets survive ≥ 1.5x, house keeps 10%.
- * (Kept identical for pure-logic tests.)
+ * Roll the crash multiplier: base distribution is 45% of bets survive ≥ 1.5x,
+ * house keeps 10%. `winChance` (player's rank-tier odds) shifts the CDF so a
+ * higher win chance → higher survival odds; peak hours pass 0.5 → default.
  */
-function rollCrash() {
+function rollCrash(winChance = 0.5) {
   const r = Math.random();
-  if (r < 0.30) return 1.0;            // crash at 1.00x — lose instantly
-  if (r < 0.50) return 1.25;           // small tick
-  if (r < 0.70) return 1.5;
-  if (r < 0.85) return 2.0;
-  if (r < 0.93) return 3.0;
-  if (r < 0.98) return 5.0;
+  const shift = (winChance - 0.5) * 0.20; // ±10% at the extremes
+  const s = r - shift;
+  if (s < 0.30) return 1.0;            // crash at 1.00x — lose instantly
+  if (s < 0.50) return 1.25;           // small tick
+  if (s < 0.70) return 1.5;
+  if (s < 0.85) return 2.0;
+  if (s < 0.93) return 3.0;
+  if (s < 0.98) return 5.0;
   return 10.0;
 }
 
 /** Pure logic: { crash, payout } — payout = bet × crash, 0 when crash=1.0. */
-function playCrash(bet) {
-  const crash = rollCrash();
+function playCrash(bet, winChance = 0.5) {
+  const crash = rollCrash(winChance);
   const payout = crash > 1.0 ? Math.floor(bet * crash) : 0;
   return { crash, payout, bet };
 }
@@ -88,6 +92,9 @@ async function crashNow(s, deps) {
   s.alive = false;
   stopTimer(s);
   sessions.delete(s.userId);
+  // Rank progression: a crash at 1.00x = loss; crashing above 1.0x still
+  // counts as a loss since the player never cashed out.
+  rank.recordMatchResult(s.userId, s.bet, false);
   try {
     await deps.editMsg(statusText(s, true), { parse_mode: 'HTML', alwaysShowMarkup: true });
   } catch (e) { /* non-fatal */ }
@@ -144,7 +151,7 @@ async function play(ctx) {
     bet,
     chatId,
     mult: 1.0,
-    crashPoint: rollCrash(),
+    crashPoint: rollCrash(rank.getWinChance(userId, 'crash')),
     alive: true,
     timer: null,
     startedAt: Date.now(),
@@ -187,8 +194,11 @@ async function onCash(ctx, { chatId, userId, reply, editMsg, answerCb, eco }) {
   const winnings = currentWorth(s);
   s.alive = false;
   stopTimer(s);
-  sessions.delete(userId);
+  sessions.delete(s.userId);
   eco.creditWallet(userId, winnings);
+  // Rank progression: a cashout at any multiplier is a WIN (player chose when
+  // to stop).
+  rank.recordMatchResult(userId, s.bet, true);
 
   await editMsg(
     `${statusText(s)}\n\n✅ <b>CASHED OUT ${fmt(winnings)}</b> (net +${fmt(winnings - s.bet)})`,

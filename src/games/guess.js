@@ -14,6 +14,7 @@
  */
 const config = require('../config');
 const { fmt, randInt } = require('../utils');
+const rank = require('../rank');
 
 // In-memory game sessions (same pattern as mines/blackjack)
 const sessions = new Map();
@@ -120,6 +121,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
     const mult = multFor(s);
     const payout = s.bet * mult;
     eco.creditWallet(userId, payout);
+    rank.recordMatchResult(userId, s.bet, true);
     const net = payout - s.bet;
     const guessWord = { 1: 'first', 2: 'second', 3: 'last' }[s.chancesLeft];
     const text =
@@ -145,6 +147,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
   if (s.chancesLeft <= 0) {
     s.done = true;
     s.won = false;
+    rank.recordMatchResult(userId, s.bet, false);
     const text =
       `${statusText(s, hint)}\n\n` +
       `💥 <b>GAME OVER.</b> The number was <b>${s.answer}</b>.\n` +

@@ -7,12 +7,13 @@
  */
 const config = require('../config');
 const { fmt } = require('../utils');
+const rank = require('../rank');
 
 /** Simulate the streak: how many correct flips before a miss. */
-function streak(choice) {
+function streak(choice, winChance = 0.5) {
   let wins = 0;
   while (true) {
-    const flip = Math.random() < 0.5 ? 'heads' : 'tails';
+    const flip = Math.random() < winChance ? choice : (choice === 'heads' ? 'tails' : 'heads');
     if (flip === choice) wins++;
     else break;
   }
@@ -20,8 +21,8 @@ function streak(choice) {
 }
 
 /** Pure logic: { wins, payout } — payout = bet × 2^wins. */
-function playStreak(bet, choice) {
-  const { wins } = streak(choice);
+function playStreak(bet, choice, winChance = 0.5) {
+  const { wins } = streak(choice, winChance);
   const payout = wins > 0 ? Math.floor(bet * Math.pow(2, wins)) : 0;
   return { wins, payout, bet, choice };
 }
@@ -44,7 +45,7 @@ async function play(ctx) {
   if (!charge.ok) return reply(charge.message);
   cd.startGame(userId, 'cfs', config.perGameCooldownMs);
 
-  const r = playStreak(bet, norm);
+  const r = playStreak(bet, norm, rank.getWinChance(userId, 'cfs'));
   let net = -bet;
   let text;
   if (r.wins > 0) {

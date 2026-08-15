@@ -6,6 +6,7 @@
  */
 const config = require('../config');
 const { fmt, pick } = require('../utils');
+const rank = require('../rank');
 
 // 12 segments: [label, mult, weight] — heavy low, rare jackpot
 const SEGMENTS = [
@@ -34,8 +35,13 @@ function weightedPick() {
 }
 
 /** Pure logic: { segment, payout } — payout = floor(bet × mult). */
-function spin(bet) {
-  const seg = weightedPick();
+function spin(bet, winChance = 0.5) {
+  let seg = weightedPick();
+  // Rank-tier win chance: on a losing spin (<1x segment), allow a re-spin
+  // toward a 1x+ segment with the player's rank odds (peak hours = 0.5).
+  if (seg.mult < 1 && Math.random() < Math.max(0, winChance - 0.5) * 2) {
+    seg = weightedPick();
+  }
   const payout = seg.mult < 1 ? 0 : Math.floor(bet * seg.mult);
   return { segment: seg, payout, bet };
 }
@@ -53,7 +59,7 @@ async function play(ctx) {
   if (!charge.ok) return reply(charge.message);
   cd.startGame(userId, 'wheel', config.perGameCooldownMs);
 
-  const r = spin(bet);
+  const r = spin(bet, rank.getWinChance(userId, 'wheel'));
   let net = -bet;
   let text;
   if (r.payout > 0) {

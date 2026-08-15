@@ -17,7 +17,8 @@ function spin(bet) {
   let mult = 0;
   if (a === b && b === c) mult = config.slots.threeMatchMult;
   else if (a === b || a === c || b === c) mult = config.slots.twoMatchMult;
-  else if (Math.random() < 0.55) mult = 0; // house edge on no-match
+  // No-match always loses — slots odds are structural (no binary 50/50 roll to
+  // replace), so rank-based win chance is applied at the coin-flip games only.
   const payout = mult > 0 ? bet * mult : 0;
   return { win: payout > 0, reels, mult, payout, bet };
 }

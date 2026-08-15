@@ -18,6 +18,7 @@
  */
 const config = require('../config');
 const { fmt } = require('../utils');
+const rank = require('../rank');
 
 // Legacy display constants (also used by the pure-logic tests).
 const EMPTY = '·';
@@ -432,6 +433,8 @@ async function settle(s, result, { reply, editMsg, answerCb, eco }) {
 
   if (s.bet) {
     if (payout > 0) eco.creditWallet(s.userId, payout);
+    // Rank progression: only betting games count (free games never do).
+    rank.recordMatchResult(s.userId, s.bet, result === 'player' ? true : result === 'tie' ? 'push' : false);
   }
 
   await editMsg(statusText(s, result), { parse_mode: 'HTML', alwaysShowMarkup: true });

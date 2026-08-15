@@ -8,6 +8,7 @@
  */
 const config = require('../config');
 const { fmt, shuffle, randInt, esc } = require('../utils');
+const rank = require('../rank');
 
 const sessions = new Map(); // userId -> {bet, deck, player[], dealer[], doubled, done}
 
@@ -150,6 +151,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
 
   if (outcome === 'bust') {
     s.done = true;
+    rank.recordMatchResult(userId, s.bet, false);
     const text = `${render(s)}\n\n💥 <b>BUST!</b> You lost ${fmt(s.bet)}.`;
     await editMsg(text, { parse_mode: 'HTML' });
     await answerCb('💥 Bust!');
@@ -175,6 +177,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
       result = 'lose';
     }
     if (payout > 0) eco.creditWallet(userId, payout);
+    rank.recordMatchResult(userId, s.bet, result === 'win' ? true : result === 'push' ? 'push' : false);
     s.payout = payout;
     const emoji = result === 'win' ? '✅ <b>YOU WIN!</b>' : result === 'push' ? '🤝 <b>PUSH</b>' : '❌ <b>DEALER WINS</b>';
     const net = result === 'win' ? `+${fmt(payout - s.bet)}` : result === 'push' ? '0' : `-${fmt(s.bet)}`;

@@ -46,8 +46,20 @@ CREATE TABLE IF NOT EXISTS users (
   status_reason TEXT DEFAULT '',
   status_until INTEGER DEFAULT 0,         -- 0 = permanent
   hidden_until INTEGER DEFAULT 0,         -- hide-in-shadows expiry (ms epoch)
+  rank        TEXT DEFAULT 'bronze',      -- rank ladder (see src/rank.js)
+  rank_valid_matches INTEGER DEFAULT 0,   -- valid matches played (bet >= 10% balance)
+  rank_consecutive_losses INTEGER DEFAULT 0, -- current losing streak (7 → demote)
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL DEFAULT 0  -- version stamp: ONLY timestamp ordering decides which state wins
+);
+
+CREATE TABLE IF NOT EXISTS time_wallet (
+  user_id    INTEGER PRIMARY KEY,
+  amount     INTEGER NOT NULL DEFAULT 0,
+  expires_at INTEGER NOT NULL DEFAULT 0,  -- ms epoch; 0 = no expiry
+  source     TEXT DEFAULT '',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS cooldowns (
@@ -199,6 +211,17 @@ if (!USER_COLS.includes('updated_at')) {
   // Backfill legacy rows with a sensible timestamp (their creation time).
   db.exec("UPDATE users SET updated_at = created_at WHERE updated_at = 0");
 }
+// Rank system columns (idempotent — CREATE IF NOT EXISTS won't add them to an
+// existing users table, so migrate in place without touching any data).
+if (!USER_COLS.includes('rank')) {
+  db.exec("ALTER TABLE users ADD COLUMN rank TEXT DEFAULT 'bronze'");
+}
+if (!USER_COLS.includes('rank_valid_matches')) {
+  db.exec('ALTER TABLE users ADD COLUMN rank_valid_matches INTEGER NOT NULL DEFAULT 0');
+}
+if (!USER_COLS.includes('rank_consecutive_losses')) {
+  db.exec('ALTER TABLE users ADD COLUMN rank_consecutive_losses INTEGER NOT NULL DEFAULT 0');
+}
 
 /* ================= Postgres (durable store) ================= */
 
@@ -279,8 +302,19 @@ CREATE TABLE IF NOT EXISTS users (
   status_reason TEXT DEFAULT '',
   status_until  BIGINT DEFAULT 0,
   hidden_until  BIGINT DEFAULT 0,
+  rank          TEXT DEFAULT 'bronze',
+  rank_valid_matches BIGINT DEFAULT 0,
+  rank_consecutive_losses BIGINT DEFAULT 0,
   created_at    BIGINT NOT NULL,
   updated_at    BIGINT NOT NULL DEFAULT 0  -- version stamp: ONLY timestamp ordering decides which state wins
+);
+CREATE TABLE IF NOT EXISTS time_wallet (
+  user_id    BIGINT PRIMARY KEY,
+  amount     BIGINT NOT NULL DEFAULT 0,
+  expires_at BIGINT NOT NULL DEFAULT 0,
+  source     TEXT DEFAULT '',
+  created_at BIGINT NOT NULL,
+  updated_at BIGINT NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS cooldowns (
   user_id BIGINT NOT NULL,
@@ -415,6 +449,9 @@ CREATE TABLE IF NOT EXISTS settings (
 const PG_ALTERS = [
   "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at BIGINT NOT NULL DEFAULT 0",
   "UPDATE users SET updated_at = created_at WHERE updated_at = 0",
+  "ALTER TABLE users ADD COLUMN IF NOT EXISTS rank TEXT DEFAULT 'bronze'",
+  "ALTER TABLE users ADD COLUMN IF NOT EXISTS rank_valid_matches BIGINT NOT NULL DEFAULT 0",
+  "ALTER TABLE users ADD COLUMN IF NOT EXISTS rank_consecutive_losses BIGINT NOT NULL DEFAULT 0",
 ];
 
 /** Create Postgres tables (idempotent). Returns true on success. */
@@ -699,7 +736,8 @@ function pgRun(table, sql, params = []) {
 /* ================= Table mirror helpers ================= */
 
 const TABLE_COLS = {
-  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, hidden_until, created_at, updated_at',
+  users: 'user_id, username, first_name, wallet, bank, status, status_reason, status_until, hidden_until, rank, rank_valid_matches, rank_consecutive_losses, created_at, updated_at',
+  time_wallet: 'user_id, amount, expires_at, source, created_at, updated_at',
   cooldowns: 'user_id, action, until',
   lottery: 'id, pot, ticket_count, tickets',
   heists: 'leader_id, leader_name, target_id, target_name, members, started_at, status',
@@ -728,6 +766,7 @@ function sqliteRows(table) {
 /** Replace Postgres table contents with the SQLite cache (upsert-all). */
 const TABLE_PKS = {
   users: ['user_id'],
+  time_wallet: ['user_id'],
   cooldowns: ['user_id', 'action'], // composite primary key
   lottery: ['id'],
   heists: ['leader_id'],
@@ -901,6 +940,9 @@ function mapUser(row) {
     status_reason: row.status_reason || '',
     status_until: Number(row.status_until) || 0,
     hidden_until: Number(row.hidden_until) || 0,
+    rank: row.rank || 'bronze',
+    rank_valid_matches: Number(row.rank_valid_matches) || 0,
+    rank_consecutive_losses: Number(row.rank_consecutive_losses) || 0,
     created_at: Number(row.created_at) || 0,
     updated_at: Number(row.updated_at) || 0,
   };
@@ -1082,6 +1124,97 @@ function leaderboard(limit = 10) {
     ORDER BY networth DESC
     LIMIT ?
   `).all(limit).map((r) => ({ ...r, user_id: Number(r.user_id), wallet: Number(r.wallet), bank: Number(r.bank), networth: Number(r.networth) }));
+}
+
+/* ---------------- Rank tracking / time-wallet ---------------- */
+
+/** Persist rank progress (dirty-row mirrored through the normal pipeline). */
+function setRankStats(userId, rank, validMatches, consecutiveLosses) {
+  db.prepare(
+    'UPDATE users SET rank = ?, rank_valid_matches = ?, rank_consecutive_losses = ?, updated_at = ? WHERE user_id = ?'
+  ).run(rank, validMatches, consecutiveLosses, nowStamp(), userId);
+  mirrorChangedRow('users', userId);
+}
+
+/** Add coins to the time-wallet (safe, unrobbable, expires). */
+function addTimeWallet(userId, amount, expiresAt = 0, source = '') {
+  const now = nowStamp();
+  db.prepare(`INSERT INTO time_wallet (user_id, amount, expires_at, source, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT(user_id) DO UPDATE SET
+               amount = time_wallet.amount + excluded.amount,
+               expires_at = MAX(time_wallet.expires_at, excluded.expires_at),
+               updated_at = excluded.updated_at`)
+    .run(userId, Math.floor(amount) || 0, Math.floor(expiresAt) || 0, String(source || ''), now, now);
+  markDirty('time_wallet', userId);
+  mirrorChangedRow('time_wallet', userId);
+  return getTimeWalletBalance(userId);
+}
+
+/** Current time-wallet balance (expired rows count as 0). */
+function getTimeWalletBalance(userId, now = Date.now()) {
+  const row = db.prepare('SELECT amount, expires_at FROM time_wallet WHERE user_id = ?').get(userId);
+  if (!row) return 0;
+  const exp = Number(row.expires_at) || 0;
+  if (exp > 0 && exp <= now) return 0;
+  return Number(row.amount) || 0;
+}
+
+/** Full time-wallet row (for display). */
+function getTimeWalletRow(userId, now = Date.now()) {
+  const row = db.prepare('SELECT * FROM time_wallet WHERE user_id = ?').get(userId);
+  if (!row) return null;
+  return {
+    user_id: Number(row.user_id),
+    amount: getTimeWalletBalance(userId, now),
+    expires_at: Number(row.expires_at) || 0,
+    source: row.source || '',
+  };
+}
+
+/**
+ * Spend from the time-wallet FIRST (oldest expiry first). Returns
+ * { spent, remaining } — the caller then charges the regular wallet for
+ * the rest. Drains only what hasn't expired yet.
+ */
+function spendTimeWallet(userId, amount, now = Date.now()) {
+  const row = db.prepare('SELECT amount, expires_at FROM time_wallet WHERE user_id = ?').get(userId);
+  if (!row) return { spent: 0, remaining: Math.max(0, Number(amount) || 0) };
+  const exp = Number(row.expires_at) || 0;
+  const bal = exp > 0 && exp <= now ? 0 : Number(row.amount) || 0;
+  const spend = Math.min(bal, Math.max(0, Number(amount) || 0));
+  if (spend > 0) {
+    const left = bal - spend;
+    if (left > 0) {
+      db.prepare('UPDATE time_wallet SET amount = ?, updated_at = ? WHERE user_id = ?').run(left, nowStamp(), userId);
+      mirrorChangedRow('time_wallet', userId);
+    } else {
+      db.prepare('DELETE FROM time_wallet WHERE user_id = ?').run(userId);
+      mirrorRowDelete('time_wallet', userId);
+    }
+    markDirty('time_wallet', userId);
+  }
+  return { spent: spend, remaining: Math.max(0, (Number(amount) || 0) - spend) };
+}
+
+/** Mirror a single-row DELETE to Postgres (time-wallet cleanup). */
+function mirrorRowDelete(table, pkValue) {
+  if (!TABLE_PKS[table] || TABLE_PKS[table].length !== 1) return Promise.resolve(false);
+  const pkCol = TABLE_PKS[table][0];
+  return pgRun(table, `DELETE FROM ${table} WHERE ${pkCol} = $1`, [pkValue]);
+}
+
+/** Remove expired time-wallet rows. Returns count removed. */
+function sweepExpiredTimeWallet(now = Date.now()) {
+  const rows = db.prepare('SELECT user_id FROM time_wallet WHERE expires_at > 0 AND expires_at <= ?').all(now);
+  if (!rows.length) return 0;
+  const ids = rows.map((r) => r.user_id);
+  db.prepare(`DELETE FROM time_wallet WHERE expires_at > 0 AND expires_at <= ?`).run(now);
+  for (const id of ids) {
+    markDirty('time_wallet', id);
+    mirrorRowDelete('time_wallet', id);
+  }
+  return ids.length;
 }
 
 /* ---------------- Cooldowns ---------------- */
@@ -2289,6 +2422,14 @@ module.exports = {
   isHidden,
   getAllUsers,
   leaderboard,
+  // Rank tracking / time-wallet
+  setRankStats,
+  addTimeWallet,
+  getTimeWalletBalance,
+  getTimeWalletRow,
+  spendTimeWallet,
+  sweepExpiredTimeWallet,
+  mirrorRowDelete,
   getCooldown,
   setCooldown,
   clearCooldown,

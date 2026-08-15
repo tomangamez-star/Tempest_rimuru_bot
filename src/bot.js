@@ -17,6 +17,7 @@
  * but the inline menu code stays intact and toggleable.
  */
 const TelegramBot = require('node-telegram-bot-api');
+const path = require('path');
 
 const config = require('./config');
 const db = require('./db');
@@ -59,6 +60,8 @@ const profile = require('./profile');
 const broadcastMod = require('./broadcast');
 const attack = require('./attack');
 const fbi = require('./fbi');
+const rank = require('./rank');
+const timewallet = require('./timewallet');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -95,6 +98,8 @@ const MENU_COMMANDS = [
   { command: 'attack', description: '🐉 Deploy attackers (owner)' },
   { command: 'fbi', description: '🚔 FBI raid (owner)' },
   { command: 'swat', description: '🚔 SWAT raid (owner)' },
+  { command: 'rank', description: '🏆 Your rank' },
+  { command: 'ranks', description: '📊 Rank ladder' },
 ];
 
 function createBot() {
@@ -688,7 +693,9 @@ function createBot() {
         `<b>🪪 Profile</b>\n` +
         `• /p — your profile card (rank, win rate, badges)\n` +
         `• /badges — your earned badges\n` +
-        `• /id — your ID card\n\n` +
+        `• /id — your ID card\n` +
+        `• /rank — your rank, logo, progress + time-wallet\n` +
+        `• /ranks — full rank ladder (Bronze → Mythic)\n\n` +
         `<b>🕹️ Other</b>\n` +
         `• /race [amt] — race against the house\n` +
         `• /hide — 50M coins, vanish from robs &amp; heists for 60s\n` +
@@ -1020,6 +1027,58 @@ function createBot() {
     profile: async (ctx) => { await ctx.reply(profile.profileText(ctx, ctx.userId), { title: '🪪 PROFILE', color: THEME.gold, html: true }); },
     badges: async (ctx) => { await ctx.reply(profile.badgesText(ctx, ctx.userId), { title: '🏅 BADGES', color: THEME.gold, html: true }); },
     id: async (ctx) => { await ctx.reply(profile.idCardText(ctx, ctx.userId), { title: '🪪 ID CARD', color: THEME.cyan, html: true }); },
+
+    // ----- rank system -----
+    // /rank — your current rank, logo image, progress to the next rank, and
+    // time-wallet balance. Anyone can use it.
+    rank: async (ctx) => {
+      const u = eco.ensure(ctx.userId, metaOf(ctx.msg));
+      const r = rank.normalizeRank(u.rank);
+      const emoji = ['🥉', '🥈', '🥇', '💠', '💎', '🔮', '👑', '🌌'][rank.rankIndex(r)];
+      const idx = rank.rankIndex(r);
+      const have = Number(u.rank_valid_matches) || 0;
+      const next = idx < rank.RANKS.length - 1 ? rank.THRESHOLDS[idx + 1] : null;
+      const need = next != null ? Math.max(0, next - have) : 0;
+      const reward = rank.rewardFor(r);
+      const peak = rank.isPeakHour();
+      const winChance = rank.getWinChance(u, 'any');
+
+      let progress;
+      if (next == null) {
+        progress = '👑 <b>MAX RANK</b> — you are at the top of the ladder, legend.';
+      } else {
+        progress = `📈 Valid matches: <b>${have}</b> / ${next}\n` +
+          `➡️ Need <b>${need}</b> more valid match${need === 1 ? '' : 'es'} to reach <b>${rank.RANKS[idx + 1].toUpperCase()}</b>\n` +
+          `💡 <i>Valid = a bet ≥ 10% of your wallet. Small bets don't count.</i>`;
+      }
+      const tw = timewallet.display(ctx.userId);
+
+      // Send the cached rank logo (static asset, one-time generated) with the
+      // rank card caption. Falls back to a text card if the photo fails.
+      const logo = path.join(__dirname, 'assets', 'ranks', `${r}.png`);
+      const caption =
+        `${emoji} <b>${r.toUpperCase()}</b> — YOUR RANK\n\n` +
+        `${progress}\n\n` +
+        `🎁 Reward: <b>${reward.coins.toLocaleString()}</b> coins ${reward.timed ? '(⏳ timed — expires!)' : '(saved — no expiry)'}\n` +
+        `${tw}\n\n` +
+        (peak
+          ? '🌞 <b>PEAK HOURS (8–11am WAT)</b> — every game is flat 50/50 right now!'
+          : `🎲 Your win chance: <b>${Math.round(winChance * 100)}%</b> per game (non-peak)`);
+      try {
+        await bot.sendPhoto(ctx.chatId, logo, { caption, parse_mode: 'HTML' });
+      } catch (e) {
+        await ctx.reply(caption, { title: '🏆 RANK', color: THEME.gold, html: true });
+      }
+    },
+    // /ranks — the full ladder from Bronze to Mythic.
+    ranks: async (ctx) => {
+      await ctx.reply(
+        `<b>🏆 RANK LADDER</b>\n\n${rank.ranksList()}\n\n` +
+        `💡 Promotion needs <b>valid matches</b> (bet ≥ 10% of wallet). 7 consecutive losses = demotion.\n` +
+        `🌞 Peak hours (08:00–11:00 WAT) make every game a flat 50/50 regardless of rank.`,
+        { title: '📊 RANKS', color: THEME.gold, html: true }
+      );
+    },
 
     // ----- admin (owner only) -----
     ban: async (ctx) => {
@@ -1750,7 +1809,7 @@ function createBot() {
             `<b>🎣 Activities</b>: /fish · /dig\n` +
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
-            `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health\n` +
+            `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank\n` +
             `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
@@ -1836,6 +1895,9 @@ function createBot() {
         result: result || '',
         amount: amount || 0,
       });
+      // Rank progression: record the settlement. Valid matches (bet >= 10% of
+      // wallet) advance/demote; small bets don't affect the ladder.
+      rank.recordMatchResult(userId, bet || 0, result === 'win');
     } catch (e) { /* non-fatal */ }
   }
 
@@ -1937,8 +1999,7 @@ function createBot() {
           // GROUP MEMBERSHIP GATE: non-staff must be a member of the required
           // group to use games/economy/commands. Exempt: /start, /help,
           // /verify, and staff commands (owner + moderators always bypass).
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'xleaderboard', 'xlb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run', 'attack', 'fbi', 'swat'];
-          if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
+          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'xleaderboard', 'xlb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run', 'attack', 'fbi', 'swat'];          if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
             const gate = await gateAllowed(ctx.userId);
             if (!gate.ok) {
               const p = gatePrompt(chatId);
@@ -2183,6 +2244,30 @@ function createBot() {
   setInterval(() => {
     try { fbi.sweep(); } catch (e) { console.error('[fbi] sweep error:', e.message); }
   }, 5000);
+
+  // Periodic: sweep expired time-wallet coins (timed rank rewards).
+  setInterval(() => {
+    try { timewallet.sweep(); } catch (e) { console.error('[rank] time-wallet sweep error:', e.message); }
+  }, 60000);
+
+  // Peak-hour announcements: detect the 08:00–11:00 WAT transitions and
+  // announce the start/end through the existing broadcast pipeline.
+  let lastPeak = rank.isPeakHour();
+  setInterval(() => {
+    try {
+      const nowPeak = rank.isPeakHour();
+      if (nowPeak && !lastPeak) {
+        const rec = db.createBroadcast('🌞 <b>PEAK HOURS STARTED</b>\n\nEvery game is now a flat 50/50 until 11:00 WAT. Good luck, mortals!', 'all', Number(config.ownerId));
+        dashboard.queueBroadcast(rec.id, rec.message, 'all');
+        console.log('[rank] peak hours STARTED (08:00 WAT) — flat 50/50 engaged');
+      } else if (!nowPeak && lastPeak) {
+        const rec = db.createBroadcast('🌙 <b>PEAK HOURS ENDED</b>\n\nRank-based win chances are back. Top ranks face worse odds — the house protects its whales.', 'all', Number(config.ownerId));
+        dashboard.queueBroadcast(rec.id, rec.message, 'all');
+        console.log('[rank] peak hours ENDED (11:00 WAT) — rank-tier odds restored');
+      }
+      lastPeak = nowPeak;
+    } catch (e) { console.error('[rank] peak-hour scheduler error:', e.message); }
+  }, 60000);
 
   bot.on('polling_error', (err) => {
     console.error('[polling] error:', err.message);

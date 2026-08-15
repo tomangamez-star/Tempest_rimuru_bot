@@ -9,6 +9,7 @@
  */
 const config = require('../config');
 const { fmt, shuffle, esc } = require('../utils');
+const rank = require('../rank');
 
 const sessions = new Map();
 
@@ -95,6 +96,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     const winnings = currentPayout(s);
     s.alive = false;
     eco.creditWallet(userId, winnings);
+    rank.recordMatchResult(userId, s.bet, winnings > s.bet);
     await editMsg(`${render(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'HTML' });
     await answerCb(`💰 Cashed out ${fmt(winnings)}`);
     sessions.delete(userId);
@@ -124,6 +126,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
   } else {
     // Bust — lose initial bet + accumulated
     s.alive = false;
+    rank.recordMatchResult(userId, s.bet, false);
     const text = `${render(s)}\n\n❌ <b>BUST!</b> Next card was <b>${esc(cardStr(next))}</b>. You lost ${fmt(s.bet)}.`;
     await editMsg(text, { parse_mode: 'HTML' });
     await answerCb('❌ Wrong guess!');

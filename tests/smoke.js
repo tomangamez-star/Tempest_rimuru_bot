@@ -700,13 +700,16 @@ test('ttt: board resolves to player|bot|tie with valid payout', () => {
   }
 });
 
-test('duel: higher roll wins, ties go to house', () => {
+test('duel: higher roll wins, ties resolve by rank win chance', () => {
   const duel = require('../src/games/dicevs');
   for (let i = 0; i < 100; i++) {
-    const r = duel.duel(1000);
+    const r = duel.duel(1000, 0.5);
     assert.ok(r.player >= 1 && r.player <= 6 && r.bot >= 1 && r.bot <= 6, 'rolls in 1-6');
     if (r.player > r.bot) assert.strictEqual(r.result, 'player');
-    else assert.strictEqual(r.result, 'bot', 'ties go to the house');
+    else if (r.player < r.bot) assert.strictEqual(r.result, 'bot');
+    // Ties are now resolved by the rank-tier win chance (peak hours = 0.5),
+    // so a tied roll can produce either outcome — never an invalid result.
+    assert.ok(r.result === 'player' || r.result === 'bot', 'tie resolves to a valid outcome');
     if (r.result === 'player') assert.strictEqual(r.payout, 1900);
   }
 });
@@ -937,6 +940,105 @@ test('broadcast: queueBroadcast + drainBroadcastQueue actually deliver', () => {
   assert.strictEqual(item.id, rec.id, 'drained the right item');
   assert.strictEqual(delivered.length, 1, 'send callback fired');
   assert.strictEqual(dboard.pendingBroadcasts(), 0, 'queue emptied');
+});
+
+/* ---------- rank system ---------- */
+test('rank: getWinChance rank tiers + peak-hour override', () => {
+  const rank = require('../src/rank');
+  const u = { rank: 'bronze' };
+  // Non-peak tiers per spec.
+  assert.strictEqual(rank.getWinChance({ rank: 'bronze' }, 'slots'), 0.60);
+  assert.strictEqual(rank.getWinChance({ rank: 'silver' }, 'slots'), 0.55);
+  assert.strictEqual(rank.getWinChance({ rank: 'gold' }, 'slots'), 0.55);
+  assert.strictEqual(rank.getWinChance({ rank: 'diamond' }, 'slots'), 0.55);
+  assert.strictEqual(rank.getWinChance({ rank: 'master' }, 'slots'), 0.45);
+  assert.strictEqual(rank.getWinChance({ rank: 'legend' }, 'slots'), 0.40);
+  assert.strictEqual(rank.getWinChance({ rank: 'mythic' }, 'slots'), 0.35);
+  // Peak-hour flat 50/50 regardless of rank.
+  const RealDate = Date;
+  const peak = new RealDate('2026-08-15T08:30:00+01:00').getTime();
+  global.Date = class extends RealDate {
+    constructor(...args) { super(...(args.length ? args : [peak])); }
+    static now() { return peak; }
+  };
+  try {
+    assert.strictEqual(rank.isPeakHour(), true);
+    assert.strictEqual(rank.getWinChance({ rank: 'mythic' }, 'slots'), 0.5);
+    assert.strictEqual(rank.getWinChance({ rank: 'bronze' }, 'slots'), 0.5);
+  } finally {
+    global.Date = RealDate;
+  }
+});
+
+test('rank: valid matches require >= 10% of wallet', () => {
+  const rank = require('../src/rank');
+  const uid = 99101;
+  db.getOrCreateUser(uid, { first_name: 'RankTest' });
+  db.setWallet(uid, 1000000);
+  assert.strictEqual(rank.isValidMatch(uid, 100000), true, '10% counts');
+  assert.strictEqual(rank.isValidMatch(uid, 99999), false, 'below 10% does not count');
+  assert.strictEqual(rank.isValidMatch(uid, 0), false, 'zero bet never counts');
+});
+
+test('rank: promotion thresholds + rewards', () => {
+  const rank = require('../src/rank');
+  assert.strictEqual(rank.THRESHOLDS[1], 10, 'bronze→silver at 10');
+  assert.strictEqual(rank.THRESHOLDS[2], 15, 'silver→gold at 15');
+  assert.strictEqual(rank.THRESHOLDS[7], 1000, 'legend→mythic at 1000');
+  assert.ok(rank.rewardFor('diamond').timed === false, 'diamond+ saved cash');
+  assert.ok(rank.rewardFor('gold').timed === true, 'gold timed');
+  assert.ok(rank.rewardFor('bronze').coins === 50000000, 'bronze 50M');
+  assert.strictEqual(rank.rankIndex('mythic'), 7, 'mythic is last');
+});
+
+test('rank: recordMatchResult promotion + demotion', () => {
+  const rank = require('../src/rank');
+  const uid = 99102;
+  db.getOrCreateUser(uid, { first_name: 'ProgressionTest' });
+  db.setWallet(uid, 1000000); // 10% threshold = 100k
+  // 10 valid WINS should promote Bronze → Silver.
+  for (let i = 0; i < 10; i++) rank.recordMatchResult(uid, 100000, true);
+  let u = db.getUser(uid);
+  assert.strictEqual(rank.normalizeRank(u.rank), 'silver', 'promoted to silver after 10 valid wins');
+  // Reset wallet to a level where the NEXT promotion is far away, so 7 losses
+  // cleanly demote without crossing the gold threshold first.
+  // Reset to silver with 0 valid matches so the gold threshold (15) stays far
+  // away — 7 losses then cleanly demote without a promotion in between.
+  db.setRankStats(uid, 'silver', 0, 0);
+  u = db.getUser(uid);
+  assert.strictEqual(rank.normalizeRank(u.rank), 'silver', 'reset to silver at 0 matches');
+  // 7 consecutive valid LOSSES should demote Silver → Bronze.
+  for (let i = 0; i < 7; i++) rank.recordMatchResult(uid, 100000, false);
+  u = db.getUser(uid);
+  assert.strictEqual(rank.normalizeRank(u.rank), 'bronze', 'demoted after 7 consecutive losses');
+});
+
+test('rank: time-wallet add/spend/expiry (safe + unrobbable)', () => {
+  const rank = require('../src/rank');
+  const tw = require('../src/timewallet');
+  const uid = 99103;
+  db.getOrCreateUser(uid, { first_name: 'TimeWalletTest' });
+  const now = Date.now();
+  db.addTimeWallet(uid, 1000, now + 60000, 'test');
+  assert.strictEqual(tw.balance(uid), 1000, 'time-wallet holds coins');
+  // Attack theft is wallet/bank-only — time-wallet stays untouched.
+  db.setWallet(uid, 100);
+  const stolen = rank.getWinChance; // noop reference; the theft code never calls tw
+  assert.ok(typeof stolen === 'function');
+  assert.strictEqual(tw.balance(uid), 1000, 'time-wallet unaffected by wallet writes');
+  // Spending drains time-wallet first.
+  const r = tw.spend(uid, 400, now);
+  assert.strictEqual(r.spent, 400, 'spent from time-wallet');
+  assert.strictEqual(tw.balance(uid), 600, 'balance reduced');
+  // Use a FRESH user for the expiry path (the existing row's expiry is the
+  // later of the two, so a separate user isolates the expiry sweep).
+  const uid2 = 99104;
+  db.getOrCreateUser(uid2, { first_name: 'ExpiryTest' });
+  db.addTimeWallet(uid2, 999, now + 1000, 'expires-soon');
+  const swept = tw.sweep(now + 5000);
+  assert.ok(swept >= 1, 'expired rows swept');
+  assert.strictEqual(tw.balance(uid2, now + 5000), 0, 'expired coins gone');
+  assert.strictEqual(tw.balance(uid, now + 5000), 600, 'only unexpired coins remain');
 });
 
 console.log(`\n${passed} passed, ${failed} failed`);

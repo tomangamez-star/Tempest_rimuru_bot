@@ -6,12 +6,17 @@
  */
 const config = require('../config');
 const { fmt, randInt } = require('../utils');
+const rank = require('../rank');
 
-/** Pure logic: { player, bot, result, payout } */
-function duel(bet) {
+/** Pure logic: { player, bot, result, payout }. Ties resolve toward the
+ *  player's rank-tier win chance (peak hours = flat 50/50). */
+function duel(bet, winChance = 0.5) {
   const player = randInt(1, 6);
   const bot = randInt(1, 6);
-  const result = player > bot ? 'player' : 'bot'; // ties → house
+  let result;
+  if (player > bot) result = 'player';
+  else if (player < bot) result = 'bot';
+  else result = Math.random() < winChance ? 'player' : 'bot';
   const payout = result === 'player' ? Math.floor(bet * 1.9) : 0;
   return { player, bot, result, payout, bet };
 }
@@ -29,7 +34,7 @@ async function play(ctx) {
   if (!charge.ok) return reply(charge.message);
   cd.startGame(userId, 'duel', config.perGameCooldownMs);
 
-  const r = duel(bet);
+  const r = duel(bet, rank.getWinChance(userId, 'duel'));
   let net = -bet;
   let text;
   if (r.result === 'player') {

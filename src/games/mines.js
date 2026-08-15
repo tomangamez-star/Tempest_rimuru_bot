@@ -17,6 +17,7 @@
  */
 const config = require('../config');
 const { fmt, shuffle, randInt } = require('../utils');
+const rank = require('../rank');
 
 // In-memory game sessions (SQLite would be overkill; resets on restart are fine)
 const sessions = new Map();
@@ -180,6 +181,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
     // 💥 BOOM — lose everything (initial bet already charged).
     // The hidden 4th mine is never shown: keep ONE mine cell unmarked.
     s.alive = false;
+    rank.recordMatchResult(userId, s.bet, false);
     const mineCells = [...s.mines];
     const hidden = s.hiddenMine === null ? mineCells[randInt(0, mineCells.length - 1)] : s.hiddenMine;
     s.hiddenMine = hidden;
@@ -204,6 +206,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
     s.alive = false;
     const winnings = currentWorth(s);
     eco.creditWallet(userId, winnings);
+    rank.recordMatchResult(userId, s.bet, true);
     await editMsg(statusText(s, true), { parse_mode: 'HTML', alwaysShowMarkup: true });
     await answerCb(`💎 All safe cells! +${fmt(winnings)}`);
     await reply(
@@ -230,6 +233,7 @@ async function onCash(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
   const winnings = currentWorth(s);
   s.alive = false;
   eco.creditWallet(userId, winnings);
+  rank.recordMatchResult(userId, s.bet, winnings > s.bet);
   await editMsg(
     `${statusText(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`,
     { parse_mode: 'HTML', alwaysShowMarkup: true }

@@ -5,10 +5,13 @@
  */
 const config = require('../config');
 const { fmt } = require('../utils');
+const rank = require('../rank');
 
-/** Pure logic: { flip, win, payout, bet } */
-function flipCoin(bet, choice) {
-  const flip = Math.random() < 0.5 ? 'heads' : 'tails';
+/** Pure logic: { flip, win, payout, bet }.
+ *  `winChance` (player win odds) comes from the rank system; peak hours are
+ *  flat 50/50, otherwise the rank tier applies. */
+function flipCoin(bet, choice, winChance = 0.5) {
+  const flip = Math.random() < winChance ? choice : (choice === 'heads' ? 'tails' : 'heads');
   const win = flip === choice;
   return { flip, win, payout: win ? bet * config.coinflip.mult : 0, bet };
 }
@@ -30,7 +33,7 @@ async function play(ctx) {
   if (!charge.ok) return reply(charge.message);
   cd.startGame(userId, 'coinflip', config.perGameCooldownMs);
 
-  const r = flipCoin(bet.amount, norm);
+  const r = flipCoin(bet.amount, norm, rank.getWinChance(userId, 'coinflip'));
   let net = -bet.amount;
   let text;
   if (r.win) {

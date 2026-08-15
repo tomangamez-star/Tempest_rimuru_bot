@@ -6,6 +6,7 @@
  */
 const config = require('../config');
 const { fmt } = require('../utils');
+const rank = require('../rank');
 
 const MOVES = ['rock', 'paper', 'scissors'];
 const ALIASES = { r: 'rock', p: 'paper', s: 'scissors', rock: 'rock', paper: 'paper', scissors: 'scissors' };
@@ -20,10 +21,12 @@ function judge(player, house) {
   return 'house';
 }
 
-/** Pure logic: { player, house, result, payout } — tie pays half back. */
-function playRps(player, bet) {
+/** Pure logic: { player, house, result, payout } — tie pays half back.
+ *  `winChance` is the rank-tier player-win odds; ties resolve toward it. */
+function playRps(player, bet, winChance = 0.5) {
   const house = MOVES[Math.floor(Math.random() * 3)];
-  const result = judge(player, house);
+  let result = judge(player, house);
+  if (result === 'tie') result = Math.random() < winChance ? 'player' : 'house';
   let payout = 0;
   if (result === 'player') payout = Math.floor(bet * 1.9);   // ~95% of double (house keeps 5%)
   else if (result === 'tie') payout = Math.floor(bet * 0.5); // push pays half back
@@ -48,7 +51,7 @@ async function play(ctx) {
   if (!charge.ok) return reply(charge.message);
   cd.startGame(userId, 'rps', config.perGameCooldownMs);
 
-  const r = playRps(player, bet);
+  const r = playRps(player, bet, rank.getWinChance(userId, 'rps'));
   let net = -bet;
   let text;
   if (r.result === 'player') {

@@ -15,6 +15,23 @@ function ensure(userId, meta) {
   return db.getOrCreateUser(userId, meta);
 }
 
+/** Pay coins from wallet (for games). Returns { ok, message }. */
+function chargeWallet(userId, amount, what = 'bet') {
+  const u = ensure(userId);
+  const amt = Math.max(0, Math.floor(Number(amount) || 0));
+  // TIME-WALLET integration: drain timed coins first (they expire otherwise),
+  // then the regular wallet covers the rest.
+  const tw = db.getTimeWalletBalance ? db.getTimeWalletBalance(userId) : 0;
+  const fromTw = Math.min(tw, amt);
+  const fromWallet = amt - fromTw;
+  if (fromWallet > 0 && u.wallet < fromWallet) {
+    return { ok: false, message: `❌ You need ${fmt(amt)} for this ${what} — your wallet has ${fmt(u.wallet)}${fromTw ? ` (+ ${fmt(fromTw)} timed)` : ''}.` };
+  }
+  if (fromTw > 0) db.spendTimeWallet(userId, fromTw);
+  if (fromWallet > 0) db.addWallet(userId, -fromWallet);
+  return { ok: true, fromTw, fromWallet };
+}
+
 function netWorth(userId) {
   return db.getNetWorth(userId);
 }
@@ -100,16 +117,6 @@ function transfer(fromId, toId, rawAmount) {
   db.addBank(fromId, -amt);
   db.addBank(toId, amt);
   return { ok: true, amount: amt, message: `🏦 **Transferred** ${fmt(amt)} from your bank to <a href="tg://user?id=${toId}">user</a>.\nYour bank: ${fmt(from.bank - amt)}` };
-}
-
-/** Pay coins from wallet (for games). Returns { ok, message }. */
-function chargeWallet(userId, amount, what = 'bet') {
-  const u = ensure(userId);
-  if (u.wallet < amount) {
-    return { ok: false, message: `❌ You need ${fmt(amount)} for this ${what} — your wallet has ${fmt(u.wallet)}.` };
-  }
-  db.addWallet(userId, -amount);
-  return { ok: true };
 }
 
 /** Credit winnings to wallet. Returns new wallet. */

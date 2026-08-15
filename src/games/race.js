@@ -15,6 +15,7 @@
  */
 const config = require('../config');
 const { fmt, shuffle, pick, randInt } = require('../utils');
+const rank = require('../rank');
 
 // In-memory pending bets: userId -> { bet, color? } (color set when picked)
 const sessions = new Map();
@@ -41,10 +42,21 @@ function colorKeyboard(userId) {
 
 /**
  * Run a race: shuffle the 4 cars into a finishing order, return the
- * ranked list [{key,label,place}] (place 1..4).
+ * ranked list [{key,label,place}] (place 1..4). `winChance` is the player's
+ * rank-tier win odds — it biases the player's car toward a top-2 finish
+ * (0.5 = fair 2/4 chance, higher = better odds, lower = whale tax).
  */
-function runRace() {
-  const order = shuffle(CARS.slice());
+function runRace(winChance = 0.5, pickedColor = null) {
+  let order = shuffle(CARS.slice());
+  if (pickedColor) {
+    // Fair top-2 chance for a 4-car race is 0.5; scale from the rank odds.
+    const top2 = 0.5 + (winChance - 0.5) * 0.4; // ±20% at the extremes
+    if (Math.random() < top2) {
+      const mine = CARS.find((c) => c.key === pickedColor);
+      order = order.filter((c) => c.key !== pickedColor);
+      order.splice(Math.random() < 0.5 ? 0 : 1, 0, mine);
+    }
+  }
   return order.map((car, i) => ({ ...car, place: i + 1 }));
 }
 
@@ -105,7 +117,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
   const car = CARS.find((c) => c.key === color);
   s.color = color;
 
-  const ranked = runRace();
+  const ranked = runRace(rank.getWinChance(userId, 'race'), color);
   const mine = ranked.find((c) => c.key === color);
   const mult = payoutFor(mine.place);
   const winnings = Math.floor(s.bet * mult);
@@ -113,6 +125,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
   const won = mult > 0;
 
   if (won) eco.creditWallet(userId, winnings);
+  rank.recordMatchResult(userId, s.bet, won);
 
   const lines = [
     `🏁 <b>RACE RESULT</b> — you bet ${fmt(s.bet)} on ${car.label}\n\n`,
