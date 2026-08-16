@@ -385,8 +385,28 @@ const config = {
     waifuPicsUrl: 'https://api.waifu.pics/sfw/waifu',
   },
 
+  // ===================== ANIME HUNT =====================
+  // Fully-isolated character-collection feature (no economy/rank/game hooks).
+  // Data source: Jikan API v4 — free, public, NO API key required.
+  //   - /v4/random/characters for spawns
+  //   - /v4/characters?q=<name> for /char (alias /whois)
+  // Character data is CACHED in Postgres (hunt_cache); random spawns pull from
+  // the cached unclaimed pool first, then top up from the API. Rarity is
+  // data-driven from Jikan favorites (⚪<500 · 🔵≥500 · 🟣≥5k · 🟠≥20k · 🔴≥50k).
+  // Rate limits: every outbound call sleeps rateLimitMs (1s) + hard timeout.
+  hunt: {
+    enabled: String(process.env.HUNT_ENABLED || 'true').toLowerCase() !== 'false',
+    claimWindowMs: 15 * 60 * 1000, // 15 minutes to claim, then it expires
+    autoSpawnIntervalMs: 60 * 60 * 1000, // hourly auto-spawn in GROUPS ONLY (skip when one is live)
+    fetchTimeoutMs: 10000,         // hard timeout on outbound API fetch
+    rateLimitMs: 1000,             // courtesy delay between Jikan calls
+    userAgent: 'RimuruTempestCasino/1.0 (+https://github.com/tomangamez-star/Tempest_rimuru_bot)',
+    baseUrl: 'https://api.jikan.moe/v4',
+    randomUrl: 'https://api.jikan.moe/v4/random/characters',
+    searchUrl: 'https://api.jikan.moe/v4/characters',
+  },
+
   // ===================== RANK SYSTEM =====================
-  // Bronze → Silver → Gold → Platinum → Diamond → Master → Legend → Mythic.
   // Promotion requires VALID matches (bet >= validMatchPct of wallet). Seven
   // consecutive losses demote one rank. During peak hours (08:00–11:00 WAT /
   // UTC+1) every game is flat 50/50; otherwise rank tier sets the player's

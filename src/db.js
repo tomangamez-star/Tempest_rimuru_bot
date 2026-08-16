@@ -220,6 +220,41 @@ CREATE TABLE IF NOT EXISTS waifu_spawn (
   expires_at   INTEGER NOT NULL,
   claimed      INTEGER NOT NULL DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS hunt_cache (
+  character_id TEXT PRIMARY KEY,
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  anime        TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  bio          TEXT DEFAULT '',
+  favorites    INTEGER NOT NULL DEFAULT 0,
+  rarity       TEXT DEFAULT 'common',
+  cached_at    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hunt_claims (
+  character_id TEXT PRIMARY KEY,
+  user_id      INTEGER NOT NULL,
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  rarity       TEXT DEFAULT 'common',
+  claimed_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hunt_spawn (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  character_id TEXT DEFAULT '',
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  rarity       TEXT DEFAULT 'common',
+  spawned_at   INTEGER NOT NULL,
+  expires_at   INTEGER NOT NULL,
+  claimed      INTEGER NOT NULL DEFAULT 0,
+  chat_id      INTEGER NOT NULL DEFAULT 0
+);
 `);
 
 // ---- Safe migration for EXISTING SQLite DBs (CREATE IF NOT EXISTS won't add the column) ----
@@ -479,6 +514,41 @@ CREATE TABLE IF NOT EXISTS waifu_spawn (
   spawned_at   BIGINT NOT NULL,
   expires_at   BIGINT NOT NULL,
   claimed      SMALLINT NOT NULL DEFAULT 0
+);
+
+CREATE TABLE IF NOT EXISTS hunt_cache (
+  character_id TEXT PRIMARY KEY,
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  anime        TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  bio          TEXT DEFAULT '',
+  favorites    BIGINT NOT NULL DEFAULT 0,
+  rarity       TEXT DEFAULT 'common',
+  cached_at    BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hunt_claims (
+  character_id TEXT PRIMARY KEY,
+  user_id      BIGINT NOT NULL,
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  rarity       TEXT DEFAULT 'common',
+  claimed_at   BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS hunt_spawn (
+  id           SMALLINT PRIMARY KEY CHECK (id = 1),
+  character_id TEXT DEFAULT '',
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  rarity       TEXT DEFAULT 'common',
+  spawned_at   BIGINT NOT NULL,
+  expires_at   BIGINT NOT NULL,
+  claimed      SMALLINT NOT NULL DEFAULT 0,
+  chat_id      BIGINT NOT NULL DEFAULT 0
 );
 `;
 
@@ -795,6 +865,9 @@ const TABLE_COLS = {
   settings: 'key, value, updated_at',
   waifu_claims: 'character_id, user_id, name, series, image_url, claimed_at',
   waifu_spawn: 'id, character_id, name, series, image_url, spawned_at, expires_at, claimed',
+  hunt_cache: 'character_id, name, series, anime, image_url, bio, favorites, rarity, cached_at',
+  hunt_claims: 'character_id, user_id, name, series, image_url, rarity, claimed_at',
+  hunt_spawn: 'id, character_id, name, series, image_url, rarity, spawned_at, expires_at, claimed, chat_id',
 };
 
 function sqliteRows(table) {
@@ -826,6 +899,9 @@ const TABLE_PKS = {
   settings: ['key'],
   waifu_claims: ['character_id'],
   waifu_spawn: ['id'],
+  hunt_cache: ['character_id'],
+  hunt_claims: ['character_id'],
+  hunt_spawn: ['id'],
 };
 
 /**
@@ -2590,6 +2666,247 @@ function clearActiveSpawn() {
   );
 }
 
+/* ---------------- Anime Hunt (fully isolated feature) ---------------- */
+
+function safeParseJson(s) {
+  try {
+    const v = JSON.parse(String(s || '[]'));
+    return Array.isArray(v) ? v : [];
+  } catch (e) {
+    return [];
+  }
+}
+
+function mapHuntClaimRow(r) {
+  return {
+    character_id: String(r.character_id),
+    user_id: Number(r.user_id),
+    name: r.name || '',
+    series: r.series || '',
+    image_url: r.image_url || '',
+    rarity: r.rarity || 'common',
+    claimed_at: Number(r.claimed_at) || 0,
+  };
+}
+
+/** Upsert a character into the hunt cache (avoid re-hitting the API). */
+function cacheHuntCharacter(char) {
+  if (!char || !char.character_id) return null;
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO hunt_cache (character_id, name, series, anime, image_url, bio, favorites, rarity, cached_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(character_id) DO UPDATE SET
+       name = excluded.name,
+       series = excluded.series,
+       anime = excluded.anime,
+       image_url = excluded.image_url,
+       bio = excluded.bio,
+       favorites = excluded.favorites,
+       rarity = excluded.rarity,
+       cached_at = excluded.cached_at`
+  ).run(
+    String(char.character_id),
+    String(char.name || ''),
+    String(char.series || ''),
+    JSON.stringify(Array.isArray(char.anime) ? char.anime : []),
+    String(char.image_url || ''),
+    String(char.bio || ''),
+    Number(char.favorites) || 0,
+    String(char.rarity || 'common'),
+    now
+  );
+  queuePgWrite('hunt_cache', () =>
+    pgQueryWithTimeout(
+      `INSERT INTO hunt_cache (character_id, name, series, anime, image_url, bio, favorites, rarity, cached_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+       ON CONFLICT (character_id) DO UPDATE SET
+         name = EXCLUDED.name,
+         series = EXCLUDED.series,
+         anime = EXCLUDED.anime,
+         image_url = EXCLUDED.image_url,
+         bio = EXCLUDED.bio,
+         favorites = EXCLUDED.favorites,
+         rarity = EXCLUDED.rarity,
+         cached_at = EXCLUDED.cached_at`,
+      [String(char.character_id), String(char.name || ''), String(char.series || ''),
+       JSON.stringify(Array.isArray(char.anime) ? char.anime : []), String(char.image_url || ''),
+       String(char.bio || ''), Number(char.favorites) || 0,
+       String(char.rarity || 'common'), now]
+    )
+  );
+  return char;
+}
+
+/** One cached character by id (enriches claimed-character detail cards). */
+function getCachedHuntCharacter(characterId) {
+  const row = db.prepare('SELECT * FROM hunt_cache WHERE character_id = ?').get(String(characterId || ''));
+  if (!row) return null;
+  return {
+    character_id: String(row.character_id),
+    name: row.name || '',
+    series: row.series || '',
+    anime: safeParseJson(row.anime),
+    image_url: row.image_url || '',
+    bio: row.bio || '',
+    favorites: Number(row.favorites) || 0,
+    rarity: row.rarity || 'common',
+    cached_at: Number(row.cached_at) || 0,
+  };
+}
+
+/** Random pool of cached, NOT-yet-claimed characters (for spawns). */
+function getHuntPool(limit = 1) {
+  const n = Math.max(1, Math.min(50, Number(limit) || 1));
+  return db.prepare(
+    `SELECT * FROM hunt_cache
+     WHERE character_id NOT IN (SELECT character_id FROM hunt_claims)
+     ORDER BY RANDOM() LIMIT ?`
+  ).all(n).map((r) => ({
+    character_id: String(r.character_id),
+    name: r.name || '',
+    series: r.series || '',
+    anime: safeParseJson(r.anime),
+    image_url: r.image_url || '',
+    bio: r.bio || '',
+    favorites: Number(r.favorites) || 0,
+    rarity: r.rarity || 'common',
+  }));
+}
+
+/** True when a character_id has already been claimed by anyone. */
+function isHuntCharacterClaimed(characterId) {
+  const row = db.prepare('SELECT 1 FROM hunt_claims WHERE character_id = ?').get(String(characterId || ''));
+  return !!row;
+}
+
+/** Persist a hunt claim. Returns the inserted row, or null on duplicate. */
+function claimHuntCharacter(userId, char) {
+  const id = String((char && char.character_id) || '');
+  if (!id) return null;
+  const now = Date.now();
+  let row;
+  try {
+    db.prepare(
+      'INSERT INTO hunt_claims (character_id, user_id, name, series, image_url, rarity, claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?)'
+    ).run(id, userId, String(char.name || ''), String(char.series || ''), String(char.image_url || ''), String(char.rarity || 'common'), now);
+    row = db.prepare('SELECT * FROM hunt_claims WHERE character_id = ?').get(id);
+  } catch (e) {
+    return null; // duplicate claim (PRIMARY KEY)
+  }
+  queuePgWrite('hunt_claims', () =>
+    pgQueryWithTimeout(
+      `INSERT INTO hunt_claims (character_id, user_id, name, series, image_url, rarity, claimed_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (character_id) DO NOTHING`,
+      [id, userId, String(char.name || ''), String(char.series || ''), String(char.image_url || ''), String(char.rarity || 'common'), now]
+    )
+  );
+  return row;
+}
+
+/** A user's claimed hunt characters (newest first). */
+function getHuntCollection(userId) {
+  return db.prepare('SELECT * FROM hunt_claims WHERE user_id = ? ORDER BY claimed_at DESC').all(userId)
+    .map(mapHuntClaimRow);
+}
+
+/** One of a user's claimed characters by 1-based position (same order as /characters). */
+function getHuntCharacterByIndex(userId, n) {
+  const idx = Number(n);
+  if (!Number.isInteger(idx) || idx < 1) return null;
+  const rows = db.prepare(
+    'SELECT * FROM hunt_claims WHERE user_id = ? ORDER BY claimed_at DESC LIMIT 1 OFFSET ?'
+  ).all(userId, idx - 1);
+  if (!rows.length) return null;
+  return mapHuntClaimRow(rows[0]);
+}
+
+/** Top hunters by claimed count (most first) for /clb. */
+function getHuntLeaderboard(limit = 10) {
+  const n = Math.max(1, Math.min(100, Number(limit) || 10));
+  return db.prepare(
+    `SELECT h.user_id AS user_id, u.username AS username, u.first_name AS first_name, COUNT(*) AS count
+     FROM hunt_claims h
+     LEFT JOIN users u ON u.user_id = h.user_id
+     GROUP BY h.user_id, u.username, u.first_name
+     ORDER BY count DESC, h.user_id ASC
+     LIMIT ?`
+  ).all(n).map((r) => ({
+    user_id: Number(r.user_id),
+    username: r.username || '',
+    first_name: r.first_name || '',
+    name: r.first_name || r.username || `User ${r.user_id}`,
+    count: Number(r.count) || 0,
+  }));
+}
+
+/** Set the single active hunt spawn row (id = 1). */
+function setActiveHunt(char, expiresAt, chatId) {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO hunt_spawn (id, character_id, name, series, image_url, rarity, spawned_at, expires_at, claimed, chat_id)
+     VALUES (1, ?, ?, ?, ?, ?, ?, ?, 0, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       character_id = excluded.character_id,
+       name = excluded.name,
+       series = excluded.series,
+       image_url = excluded.image_url,
+       rarity = excluded.rarity,
+       spawned_at = excluded.spawned_at,
+       expires_at = excluded.expires_at,
+       claimed = excluded.claimed,
+       chat_id = excluded.chat_id`
+  ).run(
+    String(char.character_id || ''), String(char.name || ''), String(char.series || ''),
+    String(char.image_url || ''), String(char.rarity || 'common'), now, expiresAt || 0, Number(chatId) || 0
+  );
+  queuePgWrite('hunt_spawn', () =>
+    pgQueryWithTimeout(
+      `INSERT INTO hunt_spawn (id, character_id, name, series, image_url, rarity, spawned_at, expires_at, claimed, chat_id)
+       VALUES (1, $1, $2, $3, $4, $5, $6, $7, 0, $8)
+       ON CONFLICT (id) DO UPDATE SET
+         character_id = EXCLUDED.character_id,
+         name = EXCLUDED.name,
+         series = EXCLUDED.series,
+         image_url = EXCLUDED.image_url,
+         rarity = EXCLUDED.rarity,
+         spawned_at = EXCLUDED.spawned_at,
+         expires_at = EXCLUDED.expires_at,
+         claimed = EXCLUDED.claimed,
+         chat_id = EXCLUDED.chat_id`,
+      [String(char.character_id || ''), String(char.name || ''), String(char.series || ''),
+       String(char.image_url || ''), String(char.rarity || 'common'), now, expiresAt || 0, Number(chatId) || 0]
+    )
+  );
+  return getActiveHunt();
+}
+
+/** The currently-active (unclaimed) hunt spawn row, or null. */
+function getActiveHunt() {
+  const row = db.prepare('SELECT * FROM hunt_spawn WHERE id = 1').get();
+  if (!row) return null;
+  return {
+    character_id: String(row.character_id || ''),
+    name: row.name || '',
+    series: row.series || '',
+    image_url: row.image_url || '',
+    rarity: row.rarity || 'common',
+    spawned_at: Number(row.spawned_at) || 0,
+    expires_at: Number(row.expires_at) || 0,
+    claimed: Number(row.claimed) || 0,
+    chat_id: Number(row.chat_id) || 0,
+  };
+}
+
+/** Clear the active hunt spawn row. */
+function clearActiveHunt() {
+  db.prepare('DELETE FROM hunt_spawn WHERE id = 1').run();
+  queuePgWrite('hunt_spawn', () =>
+    pgQueryWithTimeout('DELETE FROM hunt_spawn WHERE id = 1', [])
+  );
+}
+
 function close() {
   if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
   if (reinitTimer) { clearTimeout(reinitTimer); reinitTimer = null; }
@@ -2707,6 +3024,18 @@ module.exports = {
   getActiveSpawn,
   markSpawnClaimed,
   clearActiveSpawn,
+  // Anime Hunt (fully isolated feature)
+  cacheHuntCharacter,
+  getCachedHuntCharacter,
+  getHuntPool,
+  isHuntCharacterClaimed,
+  claimHuntCharacter,
+  getHuntCollection,
+  getHuntCharacterByIndex,
+  getHuntLeaderboard,
+  setActiveHunt,
+  getActiveHunt,
+  clearActiveHunt,
   // Persistence
   initPersistence,
   hydrateFromPg,

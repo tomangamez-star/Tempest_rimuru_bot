@@ -64,6 +64,7 @@ const fbi = require('./fbi');
 const rank = require('./rank');
 const timewallet = require('./timewallet');
 const waifu = require('./waifu');
+const hunt = require('./hunt');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -102,10 +103,15 @@ const MENU_COMMANDS = [
   { command: 'swat', description: '🚔 SWAT raid (owner)' },
   { command: 'rank', description: '🏆 Your rank' },
   { command: 'ranks', description: '📊 Rank ladder' },
-  { command: 'waifu', description: '💝 Spawn a waifu' },
+  { command: 'waifu', description: '💝 Spawn a waifu (owner)' },
   { command: 'collection', description: '💝 Your waifu collection' },
   { command: 'wlb', description: '💝 Waifu leaderboard' },
   { command: 'viewwaifu', description: '💝 View a waifu by number' },
+  { command: 'hunt', description: '⚔️ Start an anime hunt (owner)' },
+  { command: 'char', description: '⚔️ Search an anime character' },
+  { command: 'characters', description: '⚔️ Your character collection' },
+  { command: 'viewchar', description: '⚔️ View a character by number' },
+  { command: 'clb', description: '⚔️ Character leaderboard' },
 ];
 
 function createBot() {
@@ -114,6 +120,9 @@ function createBot() {
     onlyFirstMatch: false,
     filepath: false,
   });
+
+  // sendPhoto helper used by /viewwaifu and /viewchar (photo-first, text fallback).
+  const depsPhoto = (chatId, imageUrl, opts) => bot.sendPhoto(chatId, imageUrl, opts);
 
   /* ---------- helpers ---------- */
 
@@ -721,11 +730,17 @@ function createBot() {
         `• /xleaderboard [n] (alias /xlb) — full networth list of ALL players, 1–100 (staff only)\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>💝 Waifu collection</b>\n` +
-        `• /waifu (alias /wspawn) — spawn a random character card with a Claim button\n` +
+        `• /waifu (alias /wspawn) — spawn a random character card with a Claim button (owner only)\n` +
         `• /collection (alias /waifus) — your claimed characters (numbered)\n` +
         `• /viewwaifu [number] (alias /vw) — view one claimed character by number\n` +
         `• /character [name] — details of one claimed character\n` +
         `• /wlb — top waifu collectors\n\n` +
+        `<b>⚔️ Anime Hunt</b>\n` +
+        `• /hunt (alias /shunt) — start an anime hunt, spawn a random character (owner only)\n` +
+        `• /char [name] (alias /whois) — search a character and see their info (anyone)\n` +
+        `• /characters — your claimed characters (numbered)\n` +
+        `• /viewchar [number] (alias /vc) — view one claimed character by number\n` +
+        `• /clb [n] — top character hunters (default 10, max 100)\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -1096,10 +1111,12 @@ function createBot() {
     // ----- waifu collection (fully isolated feature) -----
     // /waifu (alias /wspawn) — spawn a random character card with a Claim button.
     waifu: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can spawn a waifu. 👑', { title: '💝 WAIFU', color: '#FF80AB' });
       const r = await waifu.spawn({ chatId: ctx.chatId, userId: ctx.userId });
       if (r && !r.ok) await ctx.reply(r.message, { title: '💝 WAIFU', color: '#FF80AB', html: true });
     },
     wspawn: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can spawn a waifu. 👑', { title: '💝 WAIFU', color: '#FF80AB' });
       const r = await waifu.spawn({ chatId: ctx.chatId, userId: ctx.userId });
       if (r && !r.ok) await ctx.reply(r.message, { title: '💝 WAIFU', color: '#FF80AB', html: true });
     },
@@ -1132,6 +1149,48 @@ function createBot() {
     },
     vw: async (ctx) => {
       await viewWaifu(ctx);
+    },
+
+    // ----- Anime Hunt (fully isolated feature) -----
+    // /hunt (alias /shunt) — spawn a random anime character (owner only).
+    hunt: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can start a hunt. 👑', { title: '⚔️ ANIME HUNT', color: THEME.gold });
+      const r = await hunt.spawn({ chatId: ctx.chatId, userId: ctx.userId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+    },
+    shunt: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply('Only the King can start a hunt. 👑', { title: '⚔️ ANIME HUNT', color: THEME.gold });
+      const r = await hunt.spawn({ chatId: ctx.chatId, userId: ctx.userId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+    },
+    // /char <name> (alias /whois) — search Jikan and show a character card.
+    char: async (ctx) => {
+      const name = (ctx.args || []).join(' ').trim();
+      const r = await hunt.searchAndShow(name, { chatId: ctx.chatId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+    },
+    whois: async (ctx) => {
+      const name = (ctx.args || []).join(' ').trim();
+      const r = await hunt.searchAndShow(name, { chatId: ctx.chatId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+    },
+    // /characters — the user's entire character collection (numbered).
+    characters: async (ctx) => {
+      const rows = db.getHuntCollection(ctx.userId);
+      await ctx.reply(hunt.collectionCaption(rows), { title: '⚔️ COLLECTION', color: THEME.gold, html: true });
+    },
+    // /viewchar <n> (alias /vc) — view character #n in the collection.
+    viewchar: async (ctx) => {
+      await viewChar(ctx);
+    },
+    vc: async (ctx) => {
+      await viewChar(ctx);
+    },
+    // /clb [n] — character leaderboard (top collectors by count, max 100).
+    clb: async (ctx) => {
+      const n = Math.min(100, Math.max(1, parseInt((ctx.args || [])[0], 10) || 10));
+      const rows = db.getHuntLeaderboard(n);
+      await ctx.reply(hunt.leaderboardCaption(rows, n), { title: '⚔️ CHAR LB', color: THEME.gold, html: true });
     },
 
     // ----- admin (owner only) -----
@@ -1789,6 +1848,40 @@ function createBot() {
 
   /* ---------- callback routing ---------- */
 
+  /** /viewwaifu <number> (alias /vw) — send that waifu's photo + details. */
+  async function viewWaifu(ctx) {
+    const n = parseInt((ctx.args || [])[0], 10);
+    const row = db.getUserCharacterByIndex(ctx.userId, n);
+    if (!row) return ctx.reply('No waifu at that number. Use <code>/collection</code> to see your list.', { title: '💝 WAIFU', color: '#FF80AB', html: true });
+    if (depsPhoto) {
+      try {
+        await depsPhoto(ctx.chatId, row.image_url, { caption: waifu.detailCaption(row), parse_mode: 'HTML' });
+        return;
+      } catch (e) {
+        console.warn('[waifu] view sendPhoto failed:', e.message);
+      }
+    }
+    await ctx.reply(waifu.detailCaption(row), { title: '💝 WAIFU', color: '#FF80AB', html: true });
+  }
+
+  /** /viewchar <number> (alias /vc) — send that character's photo + details. */
+  async function viewChar(ctx) {
+    const n = parseInt((ctx.args || [])[0], 10);
+    const row = db.getHuntCharacterByIndex(ctx.userId, n);
+    if (!row) return ctx.reply('No character at that number. Use <code>/characters</code> to see your list.', { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+    const cached = db.getCachedHuntCharacter(row.character_id);
+    const full = cached || row;
+    if (depsPhoto) {
+      try {
+        await depsPhoto(ctx.chatId, row.image_url, { caption: hunt.detailCaption(full, { claimedAt: row.claimed_at }), parse_mode: 'HTML' });
+        return;
+      } catch (e) {
+        console.warn('[hunt] view sendPhoto failed:', e.message);
+      }
+    }
+    await ctx.reply(hunt.detailCaption(full, { claimedAt: row.claimed_at }), { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+  }
+
   async function onCallbackQuery(query) {
     const data = String(query.data || '');
     const chatId = query.message?.chat?.id;
@@ -1865,6 +1958,7 @@ function createBot() {
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank\n` +
             `<b>💝</b> /waifu · /collection · /viewwaifu · /wlb\n` +
+            `<b>⚔️</b> /hunt · /char · /characters · /viewchar · /clb\n` +
             `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
@@ -1932,6 +2026,10 @@ function createBot() {
       }
       if (data === 'waifu:claim' || data.startsWith('waifu:claim')) {
         await waifu.claim(userId, { chatId, messageId, from, answerCb });
+        return;
+      }
+      if (data === 'hunt:claim' || data.startsWith('hunt:claim')) {
+        await hunt.claim(userId, { chatId, messageId, from, answerCb });
         return;
       }
       await answerCb('Unknown button.');
@@ -2295,6 +2393,18 @@ function createBot() {
     console.error('[waifu] wiring failed:', e.message);
   }
 
+  // Anime Hunt: attach the live bot so hunt spawns / views can send photos
+  // with the CLAIM CHARACTER button. Fully isolated — no economy.
+  try {
+    hunt.attach({
+      reply: (chatId, text, opts) => reply(chatId, text, opts),
+      sendPhoto: (chatId, imageUrl, opts) => bot.sendPhoto(chatId, imageUrl, opts),
+      answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
+    });
+  } catch (e) {
+    console.error('[hunt] wiring failed:', e.message);
+  }
+
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);
 
@@ -2302,6 +2412,11 @@ function createBot() {
   try {
     waifu.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
   } catch (e) { console.error('[waifu] auto-spawn wiring failed:', e.message); }
+
+  // Anime Hunt hourly auto-spawn: every 60m in GROUPS ONLY (never DMs).
+  try {
+    hunt.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
+  } catch (e) { console.error('[hunt] auto-spawn wiring failed:', e.message); }
 
   // Periodic: expire penalties (every 30s)
   setInterval(() => {
@@ -2324,6 +2439,11 @@ function createBot() {
   // Periodic: expire any stale waifu spawn (safety sweep).
   setInterval(() => {
     try { waifu.expireIfNeeded(); } catch (e) { console.error('[waifu] sweep error:', e.message); }
+  }, 30000);
+
+  // Periodic: expire any stale anime hunt spawn (safety sweep).
+  setInterval(() => {
+    try { hunt.expireIfNeeded(); } catch (e) { console.error('[hunt] sweep error:', e.message); }
   }, 30000);
 
   // Periodic: sweep expired time-wallet coins (timed rank rewards).
