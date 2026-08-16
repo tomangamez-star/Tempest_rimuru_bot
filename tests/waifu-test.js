@@ -49,11 +49,11 @@ test('waifu: normalizeCharacter handles nekos and waifu.pics payloads', () => {
   );
   assert.ok(nekos, 'nekos card');
   assert.strictEqual(nekos.name, 'Artist');
-  assert.strictEqual(nekos.series, 'https://pixiv/1');
+  assert.strictEqual(nekos.series, '', 'source URL is stripped');
 
   const wp = waifu.normalizeCharacter({ url: 'https://img/2.png' }, 'waifupics');
   assert.ok(wp, 'waifu.pics card');
-  assert.strictEqual(wp.name, 'Unknown Waifu');
+  assert.ok(typeof wp.name === 'string' && wp.name.length > 0, 'waifu.pics gets a curated name');
   assert.strictEqual(wp.series, '');
 
   assert.strictEqual(waifu.normalizeCharacter({}, 'nekos'), null, 'no url → null');
@@ -139,7 +139,8 @@ test('waifu: collectionCaption + detailCaption render', () => {
   assert.ok(full.includes('Re:Zero'), 'lists series');
   const detail = waifu.detailCaption(rows[0]);
   assert.ok(detail.includes('Rem'), 'detail name');
-  assert.ok(detail.includes('https://img/r.png'), 'detail image link');
+  assert.ok(!detail.includes('https://img/r.png'), 'image URL is hidden');
+  assert.ok(!detail.includes('http'), 'no links leak into detail caption');
 });
 
 test('waifu: claim markup has gameplay-critical Claim button', () => {

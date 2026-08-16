@@ -378,6 +378,7 @@ const config = {
   waifu: {
     enabled: String(process.env.WAIFU_ENABLED || 'true').toLowerCase() !== 'false',
     claimWindowMs: 15 * 60 * 1000, // 15 minutes to claim, then it expires
+    autoSpawnIntervalMs: 60 * 60 * 1000, // hourly auto-spawn (skip when one is live)
     fetchTimeoutMs: 10000,         // hard timeout on outbound API fetch
     userAgent: 'RimuruTempestCasino/1.0 (+https://github.com/tomangamez-star/Tempest_rimuru_bot)',
     nekosBestUrl: 'https://nekos.best/api/v2/waifu',

@@ -2488,6 +2488,44 @@ function getCharacterByName(userId, name) {
   return rows.find((r) => String(r.name || '').toLowerCase().includes(q)) || null;
 }
 
+/** Top collectors by claimed count (most first) for /wlb. */
+function getWaifuLeaderboard(limit = 10) {
+  const n = Math.max(1, Math.min(100, Number(limit) || 10));
+  return db.prepare(
+    `SELECT w.user_id AS user_id, u.username AS username, u.first_name AS first_name, COUNT(*) AS count
+     FROM waifu_claims w
+     LEFT JOIN users u ON u.user_id = w.user_id
+     GROUP BY w.user_id, u.username, u.first_name
+     ORDER BY count DESC, w.user_id ASC
+     LIMIT ?`
+  ).all(n).map((r) => ({
+    user_id: Number(r.user_id),
+    username: r.username || '',
+    first_name: r.first_name || '',
+    name: r.first_name || r.username || `User ${r.user_id}`,
+    count: Number(r.count) || 0,
+  }));
+}
+
+/** One of a user's claimed characters by 1-based position (same order as /collection). */
+function getUserCharacterByIndex(userId, n) {
+  const idx = Number(n);
+  if (!Number.isInteger(idx) || idx < 1) return null;
+  const rows = db.prepare(
+    'SELECT * FROM waifu_claims WHERE user_id = ? ORDER BY claimed_at DESC LIMIT 1 OFFSET ?'
+  ).all(userId, idx - 1);
+  if (!rows.length) return null;
+  const r = rows[0];
+  return {
+    character_id: String(r.character_id),
+    user_id: Number(r.user_id),
+    name: r.name || '',
+    series: r.series || '',
+    image_url: r.image_url || '',
+    claimed_at: Number(r.claimed_at) || 0,
+  };
+}
+
 /** Set the single active spawn row (id = 1). */
 function setActiveSpawn(char, expiresAt) {
   const now = Date.now();
@@ -2663,6 +2701,8 @@ module.exports = {
   claimCharacter,
   getUserCollection,
   getCharacterByName,
+  getWaifuLeaderboard,
+  getUserCharacterByIndex,
   setActiveSpawn,
   getActiveSpawn,
   markSpawnClaimed,

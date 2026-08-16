@@ -104,6 +104,8 @@ const MENU_COMMANDS = [
   { command: 'ranks', description: '📊 Rank ladder' },
   { command: 'waifu', description: '💝 Spawn a waifu' },
   { command: 'collection', description: '💝 Your waifu collection' },
+  { command: 'wlb', description: '💝 Waifu leaderboard' },
+  { command: 'viewwaifu', description: '💝 View a waifu by number' },
 ];
 
 function createBot() {
@@ -720,8 +722,10 @@ function createBot() {
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
         `<b>💝 Waifu collection</b>\n` +
         `• /waifu (alias /wspawn) — spawn a random character card with a Claim button\n` +
-        `• /collection (alias /waifus) — your claimed characters\n` +
-        `• /character [name] — details of one claimed character\n\n` +
+        `• /collection (alias /waifus) — your claimed characters (numbered)\n` +
+        `• /viewwaifu [number] (alias /vw) — view one claimed character by number\n` +
+        `• /character [name] — details of one claimed character\n` +
+        `• /wlb — top waifu collectors\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -1114,6 +1118,20 @@ function createBot() {
       if (!name) return ctx.reply('Usage: <code>/character &lt;name&gt;</code>', { title: '💝 CHARACTER', color: '#FF80AB', html: true });
       const row = db.getCharacterByName(ctx.userId, name);
       await ctx.reply(waifu.detailCaption(row), { title: '💝 CHARACTER', color: '#FF80AB', html: true });
+    },
+
+    // /wlb — waifu collection leaderboard (most collected first).
+    wlb: async (ctx) => {
+      const rows = db.getWaifuLeaderboard(10);
+      await ctx.reply(waifu.leaderboardCaption(rows), { title: '💝 WAIFU LB', color: '#FF80AB', html: true });
+    },
+
+    // /viewwaifu <number> (alias /vw) — image + details for one collection slot.
+    viewwaifu: async (ctx) => {
+      await viewWaifu(ctx);
+    },
+    vw: async (ctx) => {
+      await viewWaifu(ctx);
     },
 
     // ----- admin (owner only) -----
@@ -1846,7 +1864,7 @@ function createBot() {
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank\n` +
-            `<b>💝</b> /waifu · /collection\n` +
+            `<b>💝</b> /waifu · /collection · /viewwaifu · /wlb\n` +
             `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
@@ -2279,6 +2297,11 @@ function createBot() {
 
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);
+
+  // Waifu hourly auto-spawn: every 60m (if no live spawn), announce to groups.
+  try {
+    waifu.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
+  } catch (e) { console.error('[waifu] auto-spawn wiring failed:', e.message); }
 
   // Periodic: expire penalties (every 30s)
   setInterval(() => {

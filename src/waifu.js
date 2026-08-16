@@ -4,13 +4,22 @@
  *
  * FULLY ISOLATED: no coin rewards, no rank progression, no game-stat or
  * economy hooks. It has its own Postgres tables (waifu_claims, waifu_spawn)
- * and its own commands (/waifu, /wspawn, /collection, /waifus, /character).
+ * and its own commands (/waifu, /wspawn, /collection, /waifus, /character,
+ * /viewwaifu, /vw, /wlb).
  *
  * Character source (no API key): nekos.best /api/v2/waifu (image + artist +
  * source metadata) is primary; waifu.pics /sfw/waifu (image URL only) is the
  * automatic fallback. Every response is normalized to a canonical character
  * card and its identity is derived from the image URL, so the same image can
  * never be claimed twice.
+ *
+ * URL/LINK POLICY: image URLs, source URLs and artist links are NEVER shown
+ * in captions or messages. The image URL is kept only as an internal field so
+ * the bot can fetch the photo bytes for sendPhoto.
+ *
+ * NAMES: APIs don't reliably return a real English character name, so every
+ * card gets a clean name — the API value is used only when it validates as a
+ * readable English name, otherwise a curated anime-name is assigned.
  *
  * Persistence goes through the existing db layer (waifu_* helpers), so
  * claims and the active spawn survive redeploys via the v4 mirror pipeline.
@@ -19,6 +28,59 @@
 const config = require('./config');
 const db = require('./db');
 const crypto = require('crypto');
+
+/* ================= CURATED CHARACTER NAMES (no API key, always clean English) ================= */
+
+const CHARACTER_NAMES = [
+  'Rem', 'Ram', 'Emilia', 'Asuna Yuuki', 'Mikasa Ackerman', 'Zero Two',
+  'Hinata Hyuga', 'Nezuko Kamado', 'Mai Sakurajima', 'Chika Fujiwara',
+  'Rias Gremory', 'Yor Forger', 'Aqua', 'Megumin', 'Darkness', 'Raphtalia',
+  'Holo', 'Saber', 'Rin Tohsaka', 'Sakura Haruno', 'Ino Yamanaka', 'Temari',
+  'Erza Scarlet', 'Lucy Heartfilia', 'Mirajane Strauss', 'Wendy Marvell',
+  'Nami', 'Nico Robin', 'Boa Hancock', 'Bulma', 'Android 18', 'Chi-Chi',
+  'Videl', 'Tsunade', 'Kushina Uzumaki', 'Mei Terumi', 'Konan',
+  'Orihime Inoue', 'Rukia Kuchiki', 'Yoruichi Shihoin', 'Rangiku Matsumoto',
+  'Momo Hinamori', 'Hiyori Sarugaki', 'Nelliel Tu Odelschwanck',
+  'Tier Harribel', 'Retsu Unohana', 'Soifon', 'Nanao Ise', 'Isane Kotetsu',
+  'Tohru', 'Kanna Kamui', 'Lucoa', 'Elma', 'Shion', 'Shuna', 'Milim Nava',
+  'Ramiris', 'Testarossa', 'Ultima', 'Carrera', 'Sistina', 'Tione Hiryute',
+  'Ais Wallenstein', 'Hestia', 'Ryuu Lion', 'Liliruca Arde', 'Eina Tulle',
+  'Syr Flover', 'Haruhime', 'Wiz', 'Yunyun', 'Iris', 'Claire Kagenou',
+  'Alexia Midgar', 'Beta', 'Alpha', 'Albedo', 'Shalltear Bloodfallen',
+  'Aura Bella Fiora', 'Mare Bello Fiore', 'CZ2128 Delta', 'Narberal Gamma',
+  'Solution Epsilon', 'Entoma Vasilissa Zeta', 'Zesshi Zetsumei', 'Makima',
+  'Power', 'Kobeni Higashiyama', 'Asa Mitaka', 'Reze', 'Rikka Takanashi',
+  'Shouko Nishimiya', 'Yui Hirasawa', 'Mio Akiyama', 'Ritsu Tainaka',
+  'Tsumugi Kotobuki', 'Azusa Nakano', 'Sawako Yamanaka', 'Miku Nakano',
+  'Nino Nakano', 'Ichika Nakano', 'Yotsuba Nakano', 'Itsuki Nakano',
+  'Yumeko Jabami', 'Mary Saotome', 'Kirari Momobami', 'Kaguya Shinomiya',
+  'Ai Hayasaka', 'Kei Shirogane', 'Hina Amano', 'Nagisa Furukawa',
+  'Tomoyo Sakagami', 'Kyou Fujibayashi', 'Kotomi Ichinose', 'Fuko Ibuki',
+  'Ushio Okazaki', 'Akane Tendo', 'Shampoo', 'Ukyo Kuonji', 'Kasumi Tendo',
+  'Nabiki Tendo', 'Haruhi Suzumiya', 'Yuki Nagato', 'Mikuru Asahina',
+  'Tsuruya', 'Sango', 'Kagome Higurashi', 'Rin Shima', 'Nadeshiko Kagamihara',
+  'Aoi Inuyama', 'Chizuru Ichinose', 'Sumi Sakurasawa', 'Mami Nanami',
+];
+
+const CLEAN_NAME_RE = /^[A-Za-z][A-Za-z .'-]{1,40}$/;
+
+/** True when the API returned a usable English name (not gibberish/URLs). */
+function isCleanEnglishName(s) {
+  return CLEAN_NAME_RE.test(String(s || '').trim());
+}
+
+/** Pick a stable, readable name from the curated list. */
+function randomCharacterName() {
+  return CHARACTER_NAMES[Math.floor(Math.random() * CHARACTER_NAMES.length)];
+}
+
+/** Series text is only shown when it is a real name, never a URL/link. */
+function displaySeries(s) {
+  const t = String(s || '').trim();
+  if (!t) return '';
+  if (/^https?:\/\//i.test(t)) return '';
+  return t;
+}
 
 /* ================= PURE LOGIC (testable, no Telegram / network) ================= */
 
@@ -32,6 +94,9 @@ function characterIdFor(imageUrl) {
  * `source` is 'nekos' or 'waifupics'. Returns null when unusable.
  *   nekos.best → { artist_name, artist_href, source_url, url }
  *   waifu.pics → { url }
+ *
+ * URL fields (source_url, artist_href) are intentionally dropped — the bot
+ * never displays links. The image URL is kept only for sendPhoto.
  */
 function normalizeCharacter(raw, source) {
   if (!raw || typeof raw !== 'object') return null;
@@ -39,21 +104,18 @@ function normalizeCharacter(raw, source) {
   if (!imageUrl) return null;
 
   let name = '';
-  let series = '';
   if (source === 'nekos') {
-    name = String(raw.artist_name || '').trim() || 'Unknown Artist';
-    series = String(raw.source_url || '').trim();
+    const candidate = String(raw.artist_name || '').trim();
+    name = isCleanEnglishName(candidate) ? candidate : randomCharacterName();
   } else {
-    name = 'Unknown Waifu';
-    series = '';
+    name = randomCharacterName();
   }
 
   return {
     character_id: characterIdFor(imageUrl),
     name,
-    series,
+    series: '',
     image_url: imageUrl,
-    artist_href: String(raw.artist_href || '').trim(),
   };
 }
 
@@ -76,14 +138,13 @@ function esc(s) {
   return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
 }
 
-/** HTML caption for a spawned character card. */
+/** HTML caption for a spawned character card (no links shown). */
 function cardCaption(char, spawn, claimerName = null) {
   const lines = [
     `💝 <b>WAIFU DROPPED</b>`,
     ``,
     `🎨 <b>${esc(char.name)}</b>`,
   ];
-  if (char.series) lines.push(`🔗 Source: ${esc(char.series)}`);
   lines.push(``);
   if (claimerName) {
     lines.push(`✅ Claimed by <b>${esc(claimerName)}</b>`);
@@ -93,26 +154,41 @@ function cardCaption(char, spawn, claimerName = null) {
   return lines.join('\n');
 }
 
-/** HTML for a user's collection list. */
+/** HTML for a user's collection list (numbered, no links). */
 function collectionCaption(rows) {
   if (!rows.length) {
     return `💝 <b>YOUR WAIFU COLLECTION</b>\n\nYou haven't claimed anyone yet. Use /waifu to start your collection!`;
   }
-  const list = rows.map((r, i) =>
-    `${i + 1}️⃣ <b>${esc(r.name || 'Unknown')}</b>${r.series ? ` — ${esc(r.series)}` : ''}`
-  ).join('\n');
-  return `💝 <b>YOUR WAIFU COLLECTION</b>\n\n${list}\n\n📚 <b>${rows.length}</b> character${rows.length === 1 ? '' : 's'} claimed.`;
+  const list = rows.map((r, i) => {
+    const series = displaySeries(r.series);
+    return `${i + 1}. <b>${esc(r.name || 'Unknown')}</b>${series ? ` — ${esc(series)}` : ''}`;
+  }).join('\n');
+  return `💝 <b>YOUR WAIFU COLLECTION</b>\n\n${list}\n\n📚 <b>${rows.length}</b> character${rows.length === 1 ? '' : 's'} claimed.\n\nUse /viewwaifu &lt;number&gt; to view one.`;
 }
 
-/** HTML for a single claimed character's detail. */
+/** HTML for a single claimed character's detail (no links shown). */
 function detailCaption(row) {
   if (!row) return `💔 Not found.`;
+  const series = displaySeries(row.series);
   return (
     `💝 <b>${esc(row.name || 'Unknown')}</b>\n\n` +
-    (row.series ? `🔗 Source: ${esc(row.series)}\n` : '') +
-    `🕒 Claimed: ${new Date(row.claimed_at).toISOString().slice(0, 10)}\n` +
-    `🖼️ <a href="${esc(row.image_url)}">Image link</a>`
+    (series ? `📺 Series: ${esc(series)}\n` : '') +
+    `🕒 Claimed: ${new Date(row.claimed_at).toISOString().slice(0, 10)}`
   );
+}
+
+/** HTML for the collection-count leaderboard (/wlb). */
+function leaderboardCaption(rows) {
+  if (!rows.length) {
+    return `💝 <b>WAIFU LEADERBOARD</b>\n\nNobody has claimed a waifu yet. Be the first!`;
+  }
+  const list = rows.map((r, i) => {
+    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
+    const name = esc(r.name || r.first_name || r.username || `User ${r.user_id}`);
+    const count = Number(r.count) || 0;
+    return `${medal} <b>${name}</b> — ${count} waifu${count === 1 ? '' : 's'}`;
+  }).join('\n');
+  return `💝 <b>WAIFU COLLECTION LEADERBOARD</b>\n\n${list}`;
 }
 
 /** The Claim inline keyboard (gameplay-critical — always rendered). */
@@ -312,6 +388,51 @@ function expireIfNeeded(now = Date.now()) {
   return 0;
 }
 
+/* ================= AUTO-SPAWN (hourly, announced to groups) ================= */
+
+let autoSpawnTimer = null;
+
+/**
+ * Hourly auto-spawn tick: skip when a live spawn already exists, otherwise
+ * fetch a fresh character, persist it as the active spawn, and send the
+ * claimable photo to every known group chat.
+ */
+async function autoSpawnTick(env = {}) {
+  expireIfNeeded();
+  if (isSpawnClaimable(db.getActiveSpawn())) return;
+
+  const card = await fetchCharacter();
+  if (!card) return;
+
+  const expiresAt = Date.now() + config.waifu.claimWindowMs;
+  db.setActiveSpawn(card, expiresAt);
+  const spawnRow = db.getActiveSpawn();
+  const caption = cardCaption(card, spawnRow);
+  const markup = claimMarkup();
+
+  const groupIds = (typeof env.getChatIds === 'function' ? env.getChatIds() : [])
+    .filter((cid) => Number(cid) < 0);
+
+  for (const gid of groupIds) {
+    await sendPhoto(gid, card.image_url, caption, markup);
+  }
+}
+
+/**
+ * Start the hourly auto-spawn loop. Returns the interval handle (or null when
+ * disabled). Idempotent — repeated calls return the existing timer.
+ */
+function startAutoSpawn(bot, env = {}) {
+  if (autoSpawnTimer) return autoSpawnTimer;
+  if (!config.waifu.enabled) return null;
+  const intervalMs = config.waifu.autoSpawnIntervalMs || (60 * 60 * 1000);
+  autoSpawnTimer = setInterval(() => {
+    autoSpawnTick(env).catch((e) => console.warn('[waifu] auto-spawn error:', e.message));
+  }, intervalMs);
+  autoSpawnTimer.unref && autoSpawnTimer.unref();
+  return autoSpawnTimer;
+}
+
 /** Expose state for tests + debug. */
 function state() {
   return {
@@ -322,6 +443,9 @@ function state() {
 
 module.exports = {
   // pure
+  CHARACTER_NAMES,
+  isCleanEnglishName,
+  randomCharacterName,
   characterIdFor,
   normalizeCharacter,
   isSpawnClaimable,
@@ -329,6 +453,7 @@ module.exports = {
   cardCaption,
   collectionCaption,
   detailCaption,
+  leaderboardCaption,
   claimMarkup,
   // API fetch
   fetchCharacter,
@@ -339,6 +464,8 @@ module.exports = {
   spawn,
   claim,
   expireIfNeeded,
+  startAutoSpawn,
+  autoSpawnTick,
   state,
   _clear: () => {
     db.clearActiveSpawn();
