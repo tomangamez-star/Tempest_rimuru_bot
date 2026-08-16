@@ -200,6 +200,26 @@ CREATE TABLE IF NOT EXISTS settings (
   value TEXT NOT NULL,
   updated_at INTEGER NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS waifu_claims (
+  character_id TEXT PRIMARY KEY,
+  user_id      INTEGER NOT NULL,
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  claimed_at   INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS waifu_spawn (
+  id           INTEGER PRIMARY KEY CHECK (id = 1),
+  character_id TEXT DEFAULT '',
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  spawned_at   INTEGER NOT NULL,
+  expires_at   INTEGER NOT NULL,
+  claimed      INTEGER NOT NULL DEFAULT 0
+);
 `);
 
 // ---- Safe migration for EXISTING SQLite DBs (CREATE IF NOT EXISTS won't add the column) ----
@@ -439,6 +459,26 @@ CREATE TABLE IF NOT EXISTS settings (
   key        TEXT PRIMARY KEY,
   value      TEXT NOT NULL,
   updated_at BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS waifu_claims (
+  character_id TEXT PRIMARY KEY,
+  user_id      BIGINT NOT NULL,
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  claimed_at   BIGINT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS waifu_spawn (
+  id           SMALLINT PRIMARY KEY CHECK (id = 1),
+  character_id TEXT DEFAULT '',
+  name         TEXT DEFAULT '',
+  series       TEXT DEFAULT '',
+  image_url    TEXT DEFAULT '',
+  spawned_at   BIGINT NOT NULL,
+  expires_at   BIGINT NOT NULL,
+  claimed      SMALLINT NOT NULL DEFAULT 0
 );
 `;
 
@@ -753,6 +793,8 @@ const TABLE_COLS = {
   redeem_redemptions: 'code, user_id, redeemed_at',
   backups: 'id, filename, data, user_count, created_by, created_at',
   settings: 'key, value, updated_at',
+  waifu_claims: 'character_id, user_id, name, series, image_url, claimed_at',
+  waifu_spawn: 'id, character_id, name, series, image_url, spawned_at, expires_at, claimed',
 };
 
 function sqliteRows(table) {
@@ -782,6 +824,8 @@ const TABLE_PKS = {
   redeem_redemptions: ['code', 'user_id'], // composite primary key
   backups: ['id'],
   settings: ['key'],
+  waifu_claims: ['character_id'],
+  waifu_spawn: ['id'],
 };
 
 /**
@@ -2390,6 +2434,124 @@ function schedulePgRetry() {
   reinitTimer.unref && reinitTimer.unref();
 }
 
+/* ---------------- Waifu collection (fully isolated feature) ---------------- */
+
+/** True when a character_id has already been claimed by anyone. */
+function isCharacterClaimed(characterId) {
+  const row = db.prepare('SELECT 1 FROM waifu_claims WHERE character_id = ?').get(String(characterId || ''));
+  return !!row;
+}
+
+/** Persist a claim. Returns the inserted/updated row, or null on duplicate. */
+function claimCharacter(userId, char) {
+  const id = String((char && char.character_id) || '');
+  if (!id) return null;
+  const now = Date.now();
+  let row;
+  try {
+    db.prepare(
+      'INSERT INTO waifu_claims (character_id, user_id, name, series, image_url, claimed_at) VALUES (?, ?, ?, ?, ?, ?)'
+    ).run(id, userId, String(char.name || ''), String(char.series || ''), String(char.image_url || ''), now);
+    row = db.prepare('SELECT * FROM waifu_claims WHERE character_id = ?').get(id);
+  } catch (e) {
+    return null; // duplicate claim (PRIMARY KEY)
+  }
+  queuePgWrite('waifu_claims', () =>
+    pgQueryWithTimeout(
+      `INSERT INTO waifu_claims (character_id, user_id, name, series, image_url, claimed_at)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (character_id) DO NOTHING`,
+      [id, userId, String(char.name || ''), String(char.series || ''), String(char.image_url || ''), now]
+    )
+  );
+  return row;
+}
+
+/** A user's claimed characters (newest first). */
+function getUserCollection(userId) {
+  return db.prepare('SELECT * FROM waifu_claims WHERE user_id = ? ORDER BY claimed_at DESC').all(userId)
+    .map((r) => ({
+      character_id: String(r.character_id),
+      user_id: Number(r.user_id),
+      name: r.name || '',
+      series: r.series || '',
+      image_url: r.image_url || '',
+      claimed_at: Number(r.claimed_at) || 0,
+    }));
+}
+
+/** Find one of a user's claimed characters by (case-insensitive) name. */
+function getCharacterByName(userId, name) {
+  const q = String(name || '').trim().toLowerCase();
+  if (!q) return null;
+  const rows = getUserCollection(userId);
+  return rows.find((r) => String(r.name || '').toLowerCase().includes(q)) || null;
+}
+
+/** Set the single active spawn row (id = 1). */
+function setActiveSpawn(char, expiresAt) {
+  const now = Date.now();
+  db.prepare(
+    `INSERT INTO waifu_spawn (id, character_id, name, series, image_url, spawned_at, expires_at, claimed)
+     VALUES (1, ?, ?, ?, ?, ?, ?, 0)
+     ON CONFLICT(id) DO UPDATE SET
+       character_id = excluded.character_id,
+       name = excluded.name,
+       series = excluded.series,
+       image_url = excluded.image_url,
+       spawned_at = excluded.spawned_at,
+       expires_at = excluded.expires_at,
+       claimed = excluded.claimed`
+  ).run(String(char.character_id || ''), String(char.name || ''), String(char.series || ''), String(char.image_url || ''), now, expiresAt || 0);
+  queuePgWrite('waifu_spawn', () =>
+    pgQueryWithTimeout(
+      `INSERT INTO waifu_spawn (id, character_id, name, series, image_url, spawned_at, expires_at, claimed)
+       VALUES (1, $1, $2, $3, $4, $5, $6, 0)
+       ON CONFLICT (id) DO UPDATE SET
+         character_id = EXCLUDED.character_id,
+         name = EXCLUDED.name,
+         series = EXCLUDED.series,
+         image_url = EXCLUDED.image_url,
+         spawned_at = EXCLUDED.spawned_at,
+         expires_at = EXCLUDED.expires_at,
+         claimed = EXCLUDED.claimed`,
+      [String(char.character_id || ''), String(char.name || ''), String(char.series || ''), String(char.image_url || ''), now, expiresAt || 0]
+    )
+  );
+  return getActiveSpawn();
+}
+
+/** The currently-active (unclaimed) spawn row, or null. */
+function getActiveSpawn() {
+  const row = db.prepare('SELECT * FROM waifu_spawn WHERE id = 1').get();
+  if (!row) return null;
+  return {
+    character_id: String(row.character_id || ''),
+    name: row.name || '',
+    series: row.series || '',
+    image_url: row.image_url || '',
+    spawned_at: Number(row.spawned_at) || 0,
+    expires_at: Number(row.expires_at) || 0,
+    claimed: Number(row.claimed) || 0,
+  };
+}
+
+/** Mark the active spawn claimed (or clear it entirely). */
+function markSpawnClaimed(claimed = true) {
+  db.prepare('UPDATE waifu_spawn SET claimed = ? WHERE id = 1').run(claimed ? 1 : 0);
+  queuePgWrite('waifu_spawn', () =>
+    pgQueryWithTimeout('UPDATE waifu_spawn SET claimed = $1 WHERE id = 1', [claimed ? 1 : 0])
+  );
+}
+
+/** Clear the active spawn row. */
+function clearActiveSpawn() {
+  db.prepare('DELETE FROM waifu_spawn WHERE id = 1').run();
+  queuePgWrite('waifu_spawn', () =>
+    pgQueryWithTimeout('DELETE FROM waifu_spawn WHERE id = 1', [])
+  );
+}
+
 function close() {
   if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
   if (reinitTimer) { clearTimeout(reinitTimer); reinitTimer = null; }
@@ -2496,6 +2658,15 @@ module.exports = {
   setSetting,
   getBotPaused,
   setBotPaused,
+  // Waifu collection (fully isolated feature)
+  isCharacterClaimed,
+  claimCharacter,
+  getUserCollection,
+  getCharacterByName,
+  setActiveSpawn,
+  getActiveSpawn,
+  markSpawnClaimed,
+  clearActiveSpawn,
   // Persistence
   initPersistence,
   hydrateFromPg,

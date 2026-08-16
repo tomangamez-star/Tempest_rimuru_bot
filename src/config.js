@@ -368,6 +368,22 @@ const config = {
     fineMax: 1000000000000,              // hard ceiling (sane cap)
   },
 
+  // ===================== WAIFU COLLECTION =====================
+  // Fully-isolated character-collection feature (no economy/rank/game hooks).
+  // Fetches a random anime character image + metadata from a free, no-auth
+  // API on demand, posts it with a Claim button, and persists claims to
+  // Postgres (via the normal mirror pipeline) so collections survive redeploys.
+  //   - primary: nekos.best (image + artist/source metadata)
+  //   - fallback: waifu.pics (image URL only; name/series synthesized)
+  waifu: {
+    enabled: String(process.env.WAIFU_ENABLED || 'true').toLowerCase() !== 'false',
+    claimWindowMs: 15 * 60 * 1000, // 15 minutes to claim, then it expires
+    fetchTimeoutMs: 10000,         // hard timeout on outbound API fetch
+    userAgent: 'RimuruTempestCasino/1.0 (+https://github.com/tomangamez-star/Tempest_rimuru_bot)',
+    nekosBestUrl: 'https://nekos.best/api/v2/waifu',
+    waifuPicsUrl: 'https://api.waifu.pics/sfw/waifu',
+  },
+
   // ===================== RANK SYSTEM =====================
   // Bronze → Silver → Gold → Platinum → Diamond → Master → Legend → Mythic.
   // Promotion requires VALID matches (bet >= validMatchPct of wallet). Seven

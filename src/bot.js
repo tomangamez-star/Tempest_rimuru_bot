@@ -63,6 +63,7 @@ const attack = require('./attack');
 const fbi = require('./fbi');
 const rank = require('./rank');
 const timewallet = require('./timewallet');
+const waifu = require('./waifu');
 const dashboard = require('./dashboard/server');
 
 // In-memory heist timers (leaderId -> timeout)
@@ -101,6 +102,8 @@ const MENU_COMMANDS = [
   { command: 'swat', description: '🚔 SWAT raid (owner)' },
   { command: 'rank', description: '🏆 Your rank' },
   { command: 'ranks', description: '📊 Rank ladder' },
+  { command: 'waifu', description: '💝 Spawn a waifu' },
+  { command: 'collection', description: '💝 Your waifu collection' },
 ];
 
 function createBot() {
@@ -715,6 +718,10 @@ function createBot() {
         `• /FBI (alias /SWAT) — reply to raid a user's home (owner only, case-sensitive escape)\n` +
         `• /xleaderboard [n] (alias /xlb) — full networth list of ALL players, 1–100 (staff only)\n` +
         `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
+        `<b>💝 Waifu collection</b>\n` +
+        `• /waifu (alias /wspawn) — spawn a random character card with a Claim button\n` +
+        `• /collection (alias /waifus) — your claimed characters\n` +
+        `• /character [name] — details of one claimed character\n\n` +
         `<b>🏆 /lb</b> — top 10 richest\n` +
         `<b>📜 /menu</b> — interactive menu\n` +
         `☰ <i>The menu button next to the text box has all commands.</i>\n` +
@@ -1080,6 +1087,33 @@ function createBot() {
         `🌞 Peak hours (08:00–11:00 WAT) make every game a flat 50/50 regardless of rank.`,
         { title: '📊 RANKS', color: THEME.gold, html: true }
       );
+    },
+
+    // ----- waifu collection (fully isolated feature) -----
+    // /waifu (alias /wspawn) — spawn a random character card with a Claim button.
+    waifu: async (ctx) => {
+      const r = await waifu.spawn({ chatId: ctx.chatId, userId: ctx.userId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '💝 WAIFU', color: '#FF80AB', html: true });
+    },
+    wspawn: async (ctx) => {
+      const r = await waifu.spawn({ chatId: ctx.chatId, userId: ctx.userId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '💝 WAIFU', color: '#FF80AB', html: true });
+    },
+    // /collection (alias /waifus) — show the user's claimed characters.
+    collection: async (ctx) => {
+      const rows = db.getUserCollection(ctx.userId);
+      await ctx.reply(waifu.collectionCaption(rows), { title: '💝 COLLECTION', color: '#FF80AB', html: true });
+    },
+    waifus: async (ctx) => {
+      const rows = db.getUserCollection(ctx.userId);
+      await ctx.reply(waifu.collectionCaption(rows), { title: '💝 COLLECTION', color: '#FF80AB', html: true });
+    },
+    // /character <name> — show details of one claimed character.
+    character: async (ctx) => {
+      const name = (ctx.args || []).join(' ').trim();
+      if (!name) return ctx.reply('Usage: <code>/character &lt;name&gt;</code>', { title: '💝 CHARACTER', color: '#FF80AB', html: true });
+      const row = db.getCharacterByName(ctx.userId, name);
+      await ctx.reply(waifu.detailCaption(row), { title: '💝 CHARACTER', color: '#FF80AB', html: true });
     },
 
     // ----- admin (owner only) -----
@@ -1812,6 +1846,7 @@ function createBot() {
             `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
             `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
             `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank\n` +
+            `<b>💝</b> /waifu · /collection\n` +
             `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop\n` +
             `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: '❓ HELP', color: THEME.gold, html: true });
@@ -1875,6 +1910,10 @@ function createBot() {
       }
       if (data.startsWith('ttt:')) {
         await tictactoe.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
+        return;
+      }
+      if (data === 'waifu:claim' || data.startsWith('waifu:claim')) {
+        await waifu.claim(userId, { chatId, messageId, from, answerCb });
         return;
       }
       await answerCb('Unknown button.');
@@ -2226,6 +2265,18 @@ function createBot() {
     console.error('[fbi] wiring failed:', e.message);
   }
 
+  // Waifu collection: attach the live bot so /waifu can send photos with a
+  // Claim button and the callback answer helper. Fully isolated — no economy.
+  try {
+    waifu.attach({
+      reply: (chatId, text, opts) => reply(chatId, text, opts),
+      sendPhoto: (chatId, imageUrl, opts) => bot.sendPhoto(chatId, imageUrl, opts),
+      answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
+    });
+  } catch (e) {
+    console.error('[waifu] wiring failed:', e.message);
+  }
+
   bot.on('message', onMessage);
   bot.on('callback_query', onCallbackQuery);
 
@@ -2246,6 +2297,11 @@ function createBot() {
   setInterval(() => {
     try { fbi.sweep(); } catch (e) { console.error('[fbi] sweep error:', e.message); }
   }, 5000);
+
+  // Periodic: expire any stale waifu spawn (safety sweep).
+  setInterval(() => {
+    try { waifu.expireIfNeeded(); } catch (e) { console.error('[waifu] sweep error:', e.message); }
+  }, 30000);
 
   // Periodic: sweep expired time-wallet coins (timed rank rewards).
   setInterval(() => {
