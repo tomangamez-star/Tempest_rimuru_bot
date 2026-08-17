@@ -73,6 +73,23 @@ const heistTimers = new Map();
 
 // Health/debug state for /debug (staff-only)
 let lastError = null;
+
+// Tracks message_ids of Rimuru AI's own replies. Used to detect genuine
+// "replying to Rimuru" so the AI doesn't get triggered by replies to
+// ordinary bot output (game results, errors, etc. — those also default
+// to a "RIMURU" header when no custom title is passed, so checking
+// `from.is_bot` alone falsely matched almost any bot message). Bounded
+// so it can't grow forever.
+const rimuruMessageIds = new Set();
+const RIMURU_ID_CAP = 500;
+function markRimuruMessage(messageId) {
+  if (messageId == null) return;
+  rimuruMessageIds.add(messageId);
+  if (rimuruMessageIds.size > RIMURU_ID_CAP) {
+    const first = rimuruMessageIds.values().next().value;
+    rimuruMessageIds.delete(first);
+  }
+}
 let commitHash = null;
 try {
   commitHash =
@@ -885,7 +902,7 @@ function createBot() {
     },
     coinflipstreak: async (ctx) => {
       const r = await cfstreak.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaPf(ctx.msg), 'cfstreak', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'cfstreak', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
       return r;
     },
     num: async (ctx) => {
@@ -1463,7 +1480,8 @@ function createBot() {
 
     const isReplyToBot = msg.reply_to_message &&
       msg.reply_to_message.from &&
-      msg.reply_to_message.from.is_bot === true;
+      msg.reply_to_message.from.is_bot === true &&
+      rimuruMessageIds.has(msg.reply_to_message.message_id);
     if (rimuru.shouldTrigger(text) || isReplyToBot) {
       if (!isStaff(userId)) {
         const gate = await gateAllowed(userId);
@@ -1482,7 +1500,9 @@ function createBot() {
           isOwner: owner, isStaff: isStaff(userId),
         });
         const textPromise = reply(chatId, ans, { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
-        await stickerAfterText(chatId, textPromise);
+        const sent = await textPromise;
+        if (sent && sent.message_id != null) markRimuruMessage(sent.message_id);
+        await stickerAfterText(chatId, Promise.resolve(sent));
       } catch (e) {
         console.error('[rimuru] reply error:', e.message);
         lastError = e;
