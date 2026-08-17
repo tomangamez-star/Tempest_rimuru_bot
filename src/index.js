@@ -122,31 +122,62 @@ async function main() {
   // BEFORE initPersistence() starts any SQLite→PG write pipeline. Only the
   // process that OWNS the lock may mirror; a standby (Render deploy overlap /
   // stale instance) is set read-only so its stale local cache can never be
-  // pushed up over the primary's fresh writes (the periodic rollback source).
+  // pushed up over the primary's fresh writes ( the periodic rollback source).
   // ── Durability: hydrate SQLite from Postgres FIRST ────────────────────
-  // initPersistence() connects to Postgres, creates/migrates tables, sets
-  // pgReady=true, and hydrates the local SQLite cache from the durable store.
-  // It does NOT start the SQLite→PG write pipeline (syncEnabled defaults to
-  // false / fail-closed) — the advisory lock below decides who may write.
-  const persisted = await db.initPersistence();
+  // Earlier code expected db.initPersistence(). The current db.js exposes
+  // initPg/ensurePgTables/startRecoveryLoop/startMirrorLoop instead. Use
+  // those functions where available and preserve the same degraded-mode
+  // behavior instead of calling a nonexistent initPersistence().
+
+  // Helper to safely call optional setSyncEnabled
+  const safeSetSyncEnabled = (v) => { if (db.setSyncEnabled) try { db.setSyncEnabled(v); } catch (e) { /* ignore */ } };
+
+  let persisted = { enabled: false, hydrated: 0 };
+  if (db.initPersistence) {
+    // If the module provides the old compatibility function, use it.
+    try {
+      persisted = await db.initPersistence();
+    } catch (e) {
+      console.warn('[db] initPersistence() compatibility wrapper failed:', e.message);
+      persisted = { enabled: false, hydrated: 0 };
+    }
+  } else if (db.initPg) {
+    // Use the newer API: attempt to initialize Postgres, create tables,
+    // and start recovery/mirror loops. We cannot meaningfully report a
+    // hydrated row count here (older initPersistence returned that), so
+    // hydrate count remains 0.
+    const ok = await db.initPg();
+    if (ok) {
+      if (db.ensurePgTables) await db.ensurePgTables();
+      if (db.startRecoveryLoop) db.startRecoveryLoop();
+      if (db.startMirrorLoop) db.startMirrorLoop();
+      const info = db.syncInfo ? db.syncInfo() : {};
+      persisted.enabled = !!info.configured;
+      persisted.hydrated = 0;
+    } else {
+      const info = db.syncInfo ? db.syncInfo() : { configured: false };
+      if (info.configured && !info.ready) {
+        // Durable persistence is mandatory in production. Keep HTTP health alive
+        // but do not start the bot or accept economy writes until PG is ready.
+        standby = true;
+        safeSetSyncEnabled(false);
+        // DATABASE_URL is set but Postgres is not connected yet — say it LOUDLY.
+        console.error(
+          '❌❌❌ POSTGRES PERSISTENCE IS DOWN ❌❌❌\n' +
+          'DATABASE_URL is set but the bot could NOT connect to Postgres.\n' +
+          'Balances will NOT survive redeploys until this is fixed.\n' +
+          `  host=${info.host} port=${info.port} failures=${info.failures} lastError=${info.lastPgError}\n` +
+          'Retrying in the background every 15s — check the Render env var value.'
+        );
+      }
+    }
+  } else {
+    // No Postgres/init API available — treat as SQLite-only.
+    persisted = { enabled: false, hydrated: 0 };
+  }
+
   if (persisted.enabled) {
     console.log(`✅ Postgres persistence ON — data survives redeploys (hydrated ${persisted.hydrated} rows).`);
-  } else {
-    const info = db.syncInfo();
-    if (info.configured && !info.ready) {
-      // Durable persistence is mandatory in production. Keep HTTP health alive
-      // but do not start the bot or accept economy writes until PG is ready.
-      standby = true;
-      db.setSyncEnabled(false);
-      // DATABASE_URL is set but Postgres is not connected yet — say it LOUDLY.
-      console.error(
-        '❌❌❌ POSTGRES PERSISTENCE IS DOWN ❌❌❌\n' +
-        'DATABASE_URL is set but the bot could NOT connect to Postgres.\n' +
-        'Balances will NOT survive redeploys until this is fixed.\n' +
-        `  host=${info.host} port=${info.port} failures=${info.failures} lastError=${info.lastPgError}\n` +
-        'Retrying in the background every 15s — check the Render env var value.'
-      );
-    }
   }
 
   // ── HARD single-instance guard: acquire the Postgres advisory lock AFTER ─
@@ -157,7 +188,7 @@ async function main() {
   try {
     if (!standby && db.acquireInstanceLock) {
       standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
-      db.setSyncEnabled(!standby);
+      safeSetSyncEnabled(!standby);
       if (standby) {
         console.warn(
           `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
@@ -168,12 +199,12 @@ async function main() {
       }
     } else {
       // No lock support (SQLite-only dev): enable writes for the sole instance.
-      db.setSyncEnabled(true);
+      safeSetSyncEnabled(true);
     }
   } catch (e) {
     console.error('[instance] advisory lock check failed — treating as STANDBY (writes disabled) to prevent stale overwrites:', e.message);
     standby = true;
-    db.setSyncEnabled(false);
+    safeSetSyncEnabled(false);
   }
 
 
@@ -242,7 +273,7 @@ async function main() {
       const acquired = await db.acquireInstanceLock(PG_LOCK_KEY);
       if (acquired) {
         standby = false;
-        db.setSyncEnabled(true);
+        safeSetSyncEnabled(true);
         if (primaryRetryTimer) {
           clearInterval(primaryRetryTimer);
           primaryRetryTimer = null;
