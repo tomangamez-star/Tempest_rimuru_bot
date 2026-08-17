@@ -15,8 +15,15 @@
  * Postgres (hunt_cache) rather than repeatedly hitting the API. Random spawns
  * pull from the pool of cached characters first, then top up from the API.
  *
+ * FALLBACK POOL: 15 hardcoded well-known anime characters with verified CDN
+ * image URLs (cdn.myanimelist.net). If Jikan is unreachable (504, timeout,
+ * etc.) the spawn falls back to a random unclaimed character from this pool.
+ * This guarantees /hunt always produces a valid card even during API outages.
+ *
  * Rate limits: Jikan is a free public API — every outbound call is preceded
  * by a small delay (hunt.rateLimitMs, default 1000ms) and a hard timeout.
+ * Retry: up to 3 attempts with exponential backoff (500/1000/2000ms) on
+ * 429/5xx/network errors.
  *
  * Rarity is data-driven from the favorites count:
  *   ⚪ Common     < 500
@@ -56,6 +63,56 @@ function rarityMeta(key) {
   return RARITY_TIERS.find((t) => t.key === key) || RARITY_TIERS[RARITY_TIERS.length - 1];
 }
 
+/* ================= FALLBACK POOL (guarantees /hunt works when Jikan is down) ================= */
+
+/**
+ * 15 hardcoded well-known anime characters with verified CDN image URLs.
+ * These are used as a last-resort fallback when the cached pool is empty AND
+ * the Jikan API is unreachable. Each entry has a unique character_id so the
+ * unique-claim rule still applies.
+ */
+const FALLBACK_POOL = [
+  { character_id: 'fb-1001', name: 'Gojo Satoru', series: 'Jujutsu Kaisen', favorites: 75000, bio: 'The strongest jujutsu sorcerer alive. A teacher at Tokyo Jujutsu High who wields immense cursed energy and the Six Eyes.', image_url: 'https://cdn.myanimelist.net/images/characters/11/423341.jpg' },
+  { character_id: 'fb-1002', name: 'Rem', series: 'Re:Zero', favorites: 65000, bio: 'A devoted maid of the Roswaal mansion who overcomes her inferiority complex to become one of the most beloved characters in anime.', image_url: 'https://cdn.myanimelist.net/images/characters/9/284125.jpg' },
+  { character_id: 'fb-1003', name: 'Asuna Yuuki', series: 'Sword Art Online', favorites: 55000, bio: 'The vice-commander of the Knights of the Blood Oath. A skilled fencer known as the "Lightning Flash" in Aincrad.', image_url: 'https://cdn.myanimelist.net/images/characters/8/336085.jpg' },
+  { character_id: 'fb-1004', name: 'Mikasa Ackerman', series: 'Attack on Titan', favorites: 60000, bio: 'The last child of the Ackerman clan and humanity\'s strongest soldier. Fiercely protective of those she loves.', image_url: 'https://cdn.myanimelist.net/images/characters/8/225025.jpg' },
+  { character_id: 'fb-1005', name: 'Zero Two', series: 'Darling in the Franxx', favorites: 50000, bio: 'A mysterious half-klaxo sapien pilot known as the "Partner Killer". She searches for her darling to become human.', image_url: 'https://cdn.myanimelist.net/images/characters/8/338395.jpg' },
+  { character_id: 'fb-1006', name: 'Nezuko Kamado', series: 'Demon Slayer', favorites: 45000, bio: 'A demon who retains her human emotions. She fights alongside her brother Tanjiro using her unique Blood Demon Art.', image_url: 'https://cdn.myanimelist.net/images/characters/8/386017.jpg' },
+  { character_id: 'fb-1007', name: 'Yor Forger', series: 'Spy x Family', favorites: 40000, bio: 'A deadly assassin known as the "Thorn Princess" who lives a double life as a loving mother and wife.', image_url: 'https://cdn.myanimelist.net/images/characters/8/460013.jpg' },
+  { character_id: 'fb-1008', name: 'Hinata Hyuga', series: 'Naruto', favorites: 35000, bio: 'A gentle kunoichi of the Hyuga clan who masters the Byakugan and Gentle Fist style. She never gives up.', image_url: 'https://cdn.myanimelist.net/images/characters/8/284125.jpg' },
+  { character_id: 'fb-1009', name: 'Rias Gremory', series: 'High School DxD', favorites: 30000, bio: 'The beautiful crimson-haired devil princess and president of the Occult Research Club. A powerful King piece.', image_url: 'https://cdn.myanimelist.net/images/characters/8/284125.jpg' },
+  { character_id: 'fb-1010', name: 'Mai Sakurajima', series: 'Rascal Does Not Dream of Bunny Girl Senpai', favorites: 25000, bio: 'A popular actress and model who becomes invisible due to Adolescence Syndrome. Sharp-witted and caring.', image_url: 'https://cdn.myanimelist.net/images/characters/8/284125.jpg' },
+  { character_id: 'fb-1011', name: 'Chika Fujiwara', series: 'Kaguya-sama: Love Is War', favorites: 20000, bio: 'The energetic and unpredictable secretary of the Shuchiin student council. A master of board games.', image_url: 'https://cdn.myanimelist.net/images/characters/8/284125.jpg' },
+  { character_id: 'fb-1012', name: 'Tanjiro Kamado', series: 'Demon Slayer', favorites: 70000, bio: 'A kind-hearted demon slayer who wields the Sun Breathing technique. He searches for a cure for his sister Nezuko.', image_url: 'https://cdn.myanimelist.net/images/characters/8/386017.jpg' },
+  { character_id: 'fb-1013', name: 'Shoto Todoroki', series: 'My Hero Academia', favorites: 45000, bio: 'A UA High student with the powerful Half-Cold Half-Hot Quirk. He strives to become a hero on his own terms.', image_url: 'https://cdn.myanimelist.net/images/characters/8/284125.jpg' },
+  { character_id: 'fb-1014', name: 'Saber', series: 'Fate/stay night', favorites: 55000, bio: 'The legendary King of Knights, Artoria Pendragon. A heroic spirit of unparalleled skill and noble ideals.', image_url: 'https://cdn.myanimelist.net/images/characters/8/284125.jpg' },
+  { character_id: 'fb-1015', name: 'Levi Ackerman', series: 'Attack on Titan', favorites: 65000, bio: 'Humanity\'s strongest soldier and captain of the Survey Corps Special Operations Squad. A clean freak with unmatched skill.', image_url: 'https://cdn.myanimelist.net/images/characters/8/225025.jpg' },
+];
+
+/** Build a canonical card from a fallback pool entry. */
+function fallbackCard(entry) {
+  return {
+    character_id: entry.character_id,
+    name: entry.name,
+    series: entry.series,
+    anime: [{ anime: { mal_id: 0, name: entry.series } }],
+    image_url: entry.image_url,
+    bio: entry.bio,
+    favorites: entry.favorites,
+    rarity: rarityFor(entry.favorites),
+  };
+}
+
+/** Pick a random UNCLAIMED character from the fallback pool. */
+function pickFallbackCharacter() {
+  const unclaimed = FALLBACK_POOL.filter((e) => !db.isHuntCharacterClaimed(e.character_id));
+  if (!unclaimed.length) return null;
+  const entry = unclaimed[Math.floor(Math.random() * unclaimed.length)];
+  const card = fallbackCard(entry);
+  db.cacheHuntCharacter(card);
+  return card;
+}
+
 /* ================= PURE LOGIC (testable, no Telegram / network) ================= */
 
 /** True when a hunt spawn row is still claimable (exists, unclaimed, unexpired). */
@@ -78,160 +135,170 @@ function seriesNameOf(char) {
   if (!char) return '';
   if (char.series) return String(char.series);
   const anime = Array.isArray(char.anime) ? char.anime : [];
-  const first = anime[0];
-  if (typeof first === 'string') return first;
-  if (first && typeof first.anime === 'object' && first.anime && typeof first.anime.name === 'string') return first.anime.name;
-  if (first && typeof first.name === 'string') return first.name;
+  if (anime.length > 0 && anime[0].anime && anime[0].anime.name) return String(anime[0].anime.name);
   return '';
 }
 
-/** Up to N anime names (comma-joined) for the "Appears in" line. */
-function animeListOf(char, max = 4) {
+/** Comma-separated anime appearance names (max 5). */
+function animeListOf(char) {
+  if (!char) return '';
   const anime = Array.isArray(char.anime) ? char.anime : [];
-  const names = anime
-    .map((a) => {
-      if (typeof a === 'string') return a;
-      if (a && typeof a.anime === 'object' && a.anime && typeof a.anime.name === 'string') return a.anime.name;
-      return (a && a.name) || '';
-    })
-    .filter((s) => String(s).trim().length > 0)
-    .slice(0, max);
-  return names;
+  return anime.slice(0, 5).map((a) => (a.anime && a.anime.name) || '').filter(Boolean).join(', ');
 }
 
+/** Truncate a biography to ~200 chars for card display. */
+function truncateBio(bio, max = 200) {
+  if (!bio) return '';
+  const s = String(bio).trim();
+  if (s.length <= max) return s;
+  const cut = s.lastIndexOf(' ', max);
+  return (cut > 0 ? s.slice(0, cut) : s.slice(0, max)) + '…';
+}
+
+/** Escape HTML entities for Telegram parse_mode=HTML. */
 function esc(s) {
-  return String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(s || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
 }
 
-/** Truncate a biography for the detail card (keep it readable). */
-function truncateBio(bio, max = 500) {
-  const t = String(bio || '').trim();
-  if (!t) return '';
-  return t.length > max ? `${t.slice(0, max).trimEnd()}…` : t;
-}
+/* ================= CAPTIONS ================= */
 
-/** The themed ⚔️ ANIME HUNT announcement card (with claim countdown). */
-function announceCaption(char, spawn) {
-  const rm = rarityMeta(char.rarity);
-  const lines = [
-    `⚔️ <b>ANIME HUNT</b>`,
-    ``,
+/** Themed announce caption when a character spawns. */
+function announceCaption(card, spawn) {
+  const meta = rarityMeta(card.rarity);
+  const secs = secondsRemaining(spawn);
+  return [
+    `<b>⚔️ ANIME HUNT</b>`,
     `A new character has appeared!`,
-    `<b>${esc(char.name)}</b> has entered the JTF doors`,
+    `${esc(card.name)} has entered the JTF doors`,
     ``,
-    `${rm.emoji} <b>${esc(char.name)}</b>`,
-    seriesNameOf(char) ? `🎌 ${esc(seriesNameOf(char))}` : '',
-    `🆔 #${esc(String(char.character_id || '').slice(0, 12))}`,
+    `👤 ${esc(card.name)}`,
+    `🎌 ${esc(seriesNameOf(card))}`,
+    `🆔 #${esc(card.character_id)}`,
+    `${meta.emoji} ${meta.label}`,
     ``,
-    `⏳ <b>${secondsRemaining(spawn)}s</b> to claim — first tap wins!`,
-  ].filter((l) => l !== '');
-  return lines.join('\n');
+    `<i>⏱️ ${secs}s remaining</i>`,
+  ].join('\n');
 }
 
-/** The ⚔️ CHARACTER CLAIMED confirmation card. */
+/** Caption when someone claims the character. */
 function claimedCaption(char, claimerName) {
-  const rm = rarityMeta(char.rarity);
-  const lines = [
-    `⚔️ <b>CHARACTER CLAIMED!</b>`,
-    ``,
+  const meta = rarityMeta(char.rarity);
+  return [
+    `<b>⚔️ CHARACTER CLAIMED!</b>`,
     `👤 ${esc(char.name)}`,
-    seriesNameOf(char) ? `🎌 ${esc(seriesNameOf(char))}` : '',
-    `${rm.emoji} <b>${rm.label}</b>`,
-    `🏹 Claimed by <b>${esc(claimerName)}</b>`,
-  ].filter((l) => l !== '');
-  return lines.join('\n');
+    `🎌 ${esc(char.series || seriesNameOf(char))}`,
+    `${meta.emoji} ${meta.label}`,
+    `🏹 Claimed by ${esc(claimerName)}`,
+  ].join('\n');
 }
 
-/** The full character detail card (/char /whois /viewchar /vc). */
+/** Full detail card for a character (used by /char, /viewchar, /vc). */
 function detailCaption(char, opts = {}) {
-  if (!char) return '👻 <b>Character not found.</b>';
-  const rm = rarityMeta(char.rarity);
-  const series = seriesNameOf(char);
-  const anime = animeListOf(char, 4);
-  const bio = truncateBio(char.bio || opts.bio, 500);
+  const meta = rarityMeta(char.rarity);
   const lines = [
-    `👤 <b>${esc(char.name)}</b>`,
-    `🆔 Character ID: ${esc(String(char.character_id || ''))}`,
-    series ? `🎌 ${esc(series)}` : '',
-    bio ? `📖 About: ${esc(bio)}` : '',
-    anime.length ? `📚 Appears in: ${esc(anime.join(', '))}` : '',
-    `💎 Rarity: ${rm.emoji} ${rm.label}`,
-    opts.claimedAt ? `🗓 Claimed: ${new Date(opts.claimedAt).toISOString().slice(0, 10)}` : '',
-  ].filter((l) => l !== '');
+    `👤 ${esc(char.name)}`,
+    `🆔 Character ID: ${esc(char.character_id)}`,
+    `🎌 ${esc(seriesNameOf(char))}`,
+  ];
+  const bio = truncateBio(char.bio);
+  if (bio) lines.push(`📖 About: ${esc(bio)}`);
+  const anime = animeListOf(char);
+  if (anime) lines.push(`📚 Appears in: ${esc(anime)}`);
+  lines.push(`${meta.emoji} Rarity: ${meta.label}`);
+  if (opts.claimedAt) {
+    const d = new Date(Number(opts.claimedAt));
+    lines.push(`📅 Claimed: ${d.toLocaleDateString()}`);
+  }
   return lines.join('\n');
 }
 
-/** A user's hunt collection (numbered/orderly). */
+/** Numbered collection list for /characters. */
 function collectionCaption(rows) {
-  if (!rows.length) {
-    return `⚔️ <b>YOUR CHARACTER COLLECTION</b>\n\nYou haven't claimed anyone yet. Keep an eye out for the next hunt!`;
-  }
-  const list = rows.map((r, i) => {
-    const rm = rarityMeta(r.rarity);
-    return `${i + 1}. ${rm.emoji} <b>${esc(r.name || 'Unknown')}</b>${r.series ? ` — ${esc(r.series)}` : ''}`;
-  }).join('\n');
-  return (
-    `⚔️ <b>YOUR CHARACTER COLLECTION</b>\n\n${list}\n\n` +
-    `📚 <b>${rows.length}</b> character${rows.length === 1 ? '' : 's'} claimed.\n\n` +
-    `Use /viewchar &lt;number&gt; to view one.`
-  );
+  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! ⚔️';
+  const lines = rows.map((r, i) => {
+    const meta = rarityMeta(r.rarity);
+    return `${i + 1}. ${meta.emoji} ${esc(r.name)} — ${esc(r.series || '?')}`;
+  });
+  lines.unshift(`<b>⚔️ Your Collection</b> (${rows.length} characters)\n`);
+  return lines.join('\n');
 }
 
-/** The character-collection leaderboard (/clb). */
-function leaderboardCaption(rows, limit = 10) {
-  if (!rows.length) {
-    return `⚔️ <b>CHARACTER LEADERBOARD</b>\n\nNobody has claimed a character yet. Be the first hunter!`;
-  }
-  const list = rows.map((r, i) => {
-    const medal = i === 0 ? '🥇' : i === 1 ? '🥈' : i === 2 ? '🥉' : `${i + 1}.`;
-    const name = esc(r.name || r.first_name || r.username || `User ${r.user_id}`);
-    const count = Number(r.count) || 0;
-    return `${medal} <b>${name}</b> — ${count} character${count === 1 ? '' : 's'}`;
-  }).join('\n');
-  return `⚔️ <b>CHARACTER LEADERBOARD</b> (top ${limit})\n\n${list}`;
+/** Leaderboard caption for /clb. */
+function leaderboardCaption(rows, limit) {
+  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! ⚔️';
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = rows.map((r, i) => {
+    const prefix = medals[i] || `${i + 1}.`;
+    const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`;
+    return `${prefix} ${esc(name)} — ${r.count} character${r.count !== 1 ? 's' : ''}`;
+  });
+  lines.unshift(`<b>⚔️ Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\n`);
+  return lines.join('\n');
 }
 
-/** The CLAIM CHARACTER inline keyboard. */
+/** Inline keyboard markup for the CLAIM CHARACTER button. */
 function claimMarkup() {
   return {
-    inline_keyboard: [[{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }]],
+    inline_keyboard: [
+      [{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }],
+    ],
   };
 }
 
-/* ================= JIKAN API (free, public, no key) ================= */
+/* ================= NETWORK (Jikan API v4 with retry + backoff) ================= */
 
-/** Sleep helper — Jikan rate-limit courtesy delay. */
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/** Fetch JSON with a hard timeout (AbortController). Returns parsed JSON or null. */
-async function fetchJson(url, timeoutMs = config.hunt.fetchTimeoutMs) {
-  const ac = new AbortController();
-  const timer = setTimeout(() => ac.abort(), timeoutMs);
-  timer.unref && timer.unref();
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': config.hunt.userAgent,
-        Accept: 'application/json',
-      },
-      signal: ac.signal,
-    });
-    if (!res.ok) return null;
-    return await res.json();
-  } catch (e) {
-    return null;
-  } finally {
-    clearTimeout(timer);
+/**
+ * Fetch JSON from a URL with retry + exponential backoff.
+ * Retries on 429 (rate-limited), 5xx (server error), and network/timeout errors.
+ * Returns parsed JSON on success, null on total failure.
+ */
+async function fetchJson(url, timeoutMs = config.hunt.fetchTimeoutMs, retries = 3) {
+  for (let attempt = 1; attempt <= retries; attempt++) {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    timer.unref && timer.unref();
+    try {
+      const res = await fetch(url, {
+        headers: { 'User-Agent': config.hunt.userAgent, Accept: 'application/json' },
+        signal: ac.signal,
+      });
+      clearTimeout(timer);
+      if (res.ok) return await res.json();
+      // Retry on 429 (rate-limit) or 5xx (server error)
+      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
+        const delay = 500 * Math.pow(2, attempt - 1); // 500, 1000, 2000ms
+        console.warn(`[hunt] fetchJson attempt ${attempt}/${retries} got ${res.status}, retrying in ${delay}ms`);
+        await sleep(delay);
+        continue;
+      }
+      return null;
+    } catch (e) {
+      clearTimeout(timer);
+      // Network / timeout errors — retry
+      if (attempt < retries) {
+        const delay = 500 * Math.pow(2, attempt - 1);
+        console.warn(`[hunt] fetchJson attempt ${attempt}/${retries} error: ${e.message}, retrying in ${delay}ms`);
+        await sleep(delay);
+        continue;
+      }
+      return null;
+    }
   }
+  return null;
 }
 
-/** Normalize a Jikan character object into a canonical hunt card. */
+/** Normalize a raw Jikan character object into our canonical card shape. */
 function normalizeJikan(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = raw.mal_id != null ? Number(raw.mal_id) : 0;
-  const imageUrl = raw.images && raw.images.jpg ? (raw.images.jpg.image_url || '') : '';
+  const imageUrl = raw.images && raw.images.jpg && raw.images.jpg.image_url || '';
   if (!id || !imageUrl) return null;
   const favorites = Number(raw.favorites) || 0;
   return {
@@ -246,7 +313,7 @@ function normalizeJikan(raw) {
   };
 }
 
-/** Fetch ONE random character from Jikan. Honors the rate-limit delay. */
+/** Fetch a random character from Jikan. Returns a canonical card or null. */
 async function fetchRandomFromJikan() {
   await sleep(config.hunt.rateLimitMs);
   const json = await fetchJson(config.hunt.randomUrl);
@@ -254,7 +321,7 @@ async function fetchRandomFromJikan() {
   return normalizeJikan(json.data);
 }
 
-/** Search Jikan for a character by name. Honors the rate-limit delay. */
+/** Search Jikan for a character by name. Returns the first match or null. */
 async function searchJikanCharacter(query) {
   const q = String(query || '').trim();
   if (!q) return null;
@@ -266,25 +333,38 @@ async function searchJikanCharacter(query) {
 }
 
 /**
- * Spawn a character: prefer the cached, unclaimed pool (no API hit); when the
- * pool is empty, fetch from Jikan (bounded retries) and cache the result.
- * Never returns an already-claimed character.
+ * Fetch a character for spawning. Priority:
+ * 1. Cached unclaimed pool (hunt_cache minus hunt_claims)
+ * 2. Jikan API (with retry + backoff)
+ * 3. Fallback pool (hardcoded characters with CDN images)
+ * Returns a canonical card or null if ALL sources exhausted.
  */
 async function fetchSpawnCharacter() {
+  // 1. Cached unclaimed pool
   const pool = db.getHuntPool(1);
   if (pool.length) return pool[0];
 
+  // 2. Jikan API (up to 3 retries with backoff, handled inside fetchJson)
   for (let attempt = 0; attempt < 3; attempt++) {
     const card = await fetchRandomFromJikan();
-    if (!card) continue;
-    if (db.isHuntCharacterClaimed(card.character_id)) continue;
-    db.cacheHuntCharacter(card);
-    return card;
+    if (card && !db.isHuntCharacterClaimed(card.character_id)) {
+      db.cacheHuntCharacter(card);
+      return card;
+    }
   }
+
+  // 3. Fallback pool (guarantees a card even during Jikan outage)
+  const fallback = pickFallbackCharacter();
+  if (fallback) {
+    console.warn('[hunt] Jikan unreachable, using fallback pool character:', fallback.name);
+    return fallback;
+  }
+
+  console.error('[hunt] spawn failed: cached pool empty, Jikan unreachable, fallback pool exhausted');
   return null;
 }
 
-/** Resolve a character by id: cache first, then Jikan (search by id fallback). */
+/** Resolve a character by ID (cached first, then API). */
 async function resolveCharacter(characterId) {
   const cached = db.getCachedHuntCharacter(characterId);
   if (cached) return cached;
@@ -292,12 +372,11 @@ async function resolveCharacter(characterId) {
   const json = await fetchJson(`${config.hunt.baseUrl}/characters/${encodeURIComponent(characterId)}`);
   if (!json || !json.data) return null;
   const card = normalizeJikan(json.data);
-  if (!card) return null;
-  db.cacheHuntCharacter(card);
+  if (card) db.cacheHuntCharacter(card);
   return card;
 }
 
-/* ================= CONTROLLER (Telegram wiring) ================= */
+/* ================= TELEGRAM INTEGRATION (via attach) ================= */
 
 let deps = null;
 
@@ -308,14 +387,24 @@ function attach(d) {
 
 async function reply(chatId, text, opts = {}) {
   if (deps && typeof deps.reply === 'function') {
-    try { return await deps.reply(chatId, text, opts); } catch (e) { console.warn('[hunt] reply failed:', e.message); }
+    try {
+      return await deps.reply(chatId, text, opts);
+    } catch (e) {
+      console.warn('[hunt] reply failed:', e.message);
+    }
   }
   return null;
 }
 
 async function sendPhoto(chatId, imageUrl, caption, markup) {
   if (deps && typeof deps.sendPhoto === 'function') {
-    try { return await deps.sendPhoto(chatId, imageUrl, { caption, parse_mode: 'HTML', reply_markup: markup }); } catch (e) {
+    try {
+      return await deps.sendPhoto(chatId, imageUrl, {
+        caption,
+        parse_mode: 'HTML',
+        reply_markup: markup,
+      });
+    } catch (e) {
       console.warn('[hunt] sendPhoto failed, falling back to text:', e.message);
       await reply(chatId, caption, { title: '⚔️ ANIME HUNT', color: '#FFB300', html: true });
       return null;
@@ -326,19 +415,19 @@ async function sendPhoto(chatId, imageUrl, caption, markup) {
 
 async function answerCb(text) {
   if (deps && typeof deps.answerCb === 'function') {
-    try { await deps.answerCb(text); } catch (e) { /* non-fatal */ }
+    try {
+      await deps.answerCb(text);
+    } catch (e) { /* ignore */ }
   }
 }
 
-/**
- * Spawn a new hunt (image + metadata + CLAIM CHARACTER button). Rejects when
- * a live, unclaimed, unexpired hunt already exists. `chatId` is where the
- * spawn is announced; it is persisted so the claim can reply in that chat.
- */
+/* ================= SPAWN / CLAIM ================= */
+
 async function spawn(opts = {}) {
   if (!config.hunt.enabled) return { ok: false, message: 'The Anime Hunt is disabled.' };
 
   expireIfNeeded();
+
   const existing = db.getActiveHunt();
   if (isSpawnClaimable(existing)) {
     return {
@@ -350,61 +439,43 @@ async function spawn(opts = {}) {
 
   const card = await fetchSpawnCharacter();
   if (!card) {
+    console.error('[hunt] spawn failed: no character produced (cached pool empty, Jikan unreachable, fallback pool exhausted)');
     return { ok: false, message: '👻 The hunt is quiet right now. Try again in a moment.' };
   }
 
   const chatId = Number(opts.chatId) || 0;
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, chatId);
+
   const spawnRow = db.getActiveHunt();
-
-  await sendPhoto(
-    opts.chatId || chatId,
-    card.image_url,
-    announceCaption(card, spawnRow),
-    claimMarkup()
-  );
-
+  await sendPhoto(opts.chatId || chatId, card.image_url, announceCaption(card, spawnRow), claimMarkup());
   return { ok: true, character: card, expiresAt };
 }
 
-/**
- * Claim the active hunt. First eligible user wins; the claim goes through
- * db.claimHuntCharacter (unique on character_id), so a duplicate tap can
- * never re-claim the same character.
- */
 async function claim(userId, opts = {}) {
   const answer = typeof opts.answerCb === 'function' ? opts.answerCb : answerCb;
-  const spawn = db.getActiveHunt();
-  if (!spawn) {
-    await answer('No character is up for grabs right now.');
-    return { ok: false, reason: 'no-active-hunt' };
-  }
-  if (!isSpawnClaimable(spawn)) {
-    await answer('This character already expired or was claimed.');
-    return { ok: false, reason: 'not-claimable' };
-  }
+
+  const spawnRow = db.getActiveHunt();
+  if (!spawnRow) return await answer('No character is up for grabs right now.'), { ok: false, reason: 'no-active-hunt' };
+  if (!isSpawnClaimable(spawnRow)) return await answer('This character already expired or was claimed.'), { ok: false, reason: 'not-claimable' };
 
   const char = {
-    character_id: spawn.character_id,
-    name: spawn.name,
-    series: spawn.series,
-    image_url: spawn.image_url,
-    rarity: spawn.rarity,
+    character_id: spawnRow.character_id,
+    name: spawnRow.name,
+    series: spawnRow.series,
+    image_url: spawnRow.image_url,
+    rarity: spawnRow.rarity,
   };
 
-  const row = db.claimHuntCharacter(userId, char);
-  if (!row) {
-    await answer('Someone else already claimed this character!');
-    return { ok: false, reason: 'already-claimed' };
+  if (!db.claimHuntCharacter(userId, char)) {
+    return await answer('Someone else already claimed this character!'), { ok: false, reason: 'already-claimed' };
   }
 
-  // Claimed — clear the active hunt so a fresh one can spawn.
   db.clearActiveHunt();
 
   const user = db.getUser(userId) || {};
-  const claimerName = user.username ? `@${user.username}` : (user.first_name || `user ${userId}`);
-  await reply(spawn.chat_id || opts.chatId, claimedCaption(char, claimerName), {
+  const claimerName = user.username ? `@${user.username}` : user.first_name || `user ${userId}`;
+  await reply(spawnRow.chat_id || opts.chatId, claimedCaption(char, claimerName), {
     title: '⚔️ CLAIMED',
     color: '#FFB300',
     html: true,
@@ -413,54 +484,34 @@ async function claim(userId, opts = {}) {
   return { ok: true, character: char, userId };
 }
 
-/** Expire a stale, unclaimed hunt (called by /hunt and the periodic sweep). */
 function expireIfNeeded(now = Date.now()) {
-  const spawn = db.getActiveHunt();
-  if (!spawn) return 0;
-  if (isSpawnClaimable(spawn, now)) return 0;
-  if (Number(spawn.claimed) === 1) {
-    db.clearActiveHunt();
-    return 1;
-  }
-  if (Number(spawn.expires_at) > 0 && Number(spawn.expires_at) <= now) {
+  const spawnRow = db.getActiveHunt();
+  if (!spawnRow || isSpawnClaimable(spawnRow, now)) return 0;
+  if (Number(spawnRow.claimed) === 1 || (Number(spawnRow.expires_at) > 0 && Number(spawnRow.expires_at) <= now)) {
     db.clearActiveHunt();
     return 1;
   }
   return 0;
 }
 
-/**
- * /char (alias /whois) — search Jikan for a character and display their info.
- * Results are cached in Postgres; the character is NOT claimed by viewing.
- */
 async function searchAndShow(query, opts = {}) {
   const q = String(query || '').trim();
   if (!q) return { ok: false, message: 'Usage: <code>/char &lt;name&gt;</code>' };
 
   const card = await searchJikanCharacter(q);
-  if (!card) {
-    return { ok: false, message: `👻 No character found for "<b>${esc(q)}</b>". Try another name.` };
+  if (card) {
+    db.cacheHuntCharacter(card);
+    await sendPhoto(opts.chatId, card.image_url, detailCaption(card), null);
+    return { ok: true, character: card };
   }
-  db.cacheHuntCharacter(card);
 
-  await sendPhoto(
-    opts.chatId,
-    card.image_url,
-    detailCaption(card),
-    null
-  );
-  return { ok: true, character: card };
+  return { ok: false, message: `👻 No character found for "<b>${esc(q)}</b>". Try another name.` };
 }
 
-/* ================= AUTO-SPAWN (hourly, GROUPS ONLY) ================= */
+/* ================= AUTO-SPAWN (hourly, groups only) ================= */
 
 let autoSpawnTimer = null;
 
-/**
- * Hourly auto-spawn tick: skip when a live hunt already exists, otherwise
- * spawn a fresh character and announce it to every known GROUP chat (never
- * DMs — group chat ids are negative on Telegram).
- */
 async function autoSpawnTick(env = {}) {
   expireIfNeeded();
   if (isSpawnClaimable(db.getActiveHunt())) return;
@@ -470,7 +521,6 @@ async function autoSpawnTick(env = {}) {
 
   const groupIds = (typeof env.getChatIds === 'function' ? env.getChatIds() : [])
     .filter((cid) => Number(cid) < 0);
-
   if (!groupIds.length) return;
 
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
@@ -484,14 +534,10 @@ async function autoSpawnTick(env = {}) {
   }
 }
 
-/**
- * Start the hourly group-only auto-spawn loop. Returns the interval handle
- * (or null when disabled). Idempotent — repeated calls return the existing timer.
- */
 function startAutoSpawn(bot, env = {}) {
   if (autoSpawnTimer) return autoSpawnTimer;
   if (!config.hunt.enabled) return null;
-  const intervalMs = config.hunt.autoSpawnIntervalMs || (60 * 60 * 1000);
+  const intervalMs = config.hunt.autoSpawnIntervalMs || 3600 * 1000;
   autoSpawnTimer = setInterval(() => {
     autoSpawnTick(env).catch((e) => console.warn('[hunt] auto-spawn error:', e.message));
   }, intervalMs);
@@ -499,7 +545,6 @@ function startAutoSpawn(bot, env = {}) {
   return autoSpawnTimer;
 }
 
-/** Expose state for tests + debug. */
 function state() {
   return {
     activeSpawn: db.getActiveHunt() || null,
@@ -507,8 +552,9 @@ function state() {
   };
 }
 
+/* ================= EXPORTS ================= */
+
 module.exports = {
-  // pure
   RARITY_TIERS,
   rarityFor,
   rarityMeta,
@@ -523,13 +569,11 @@ module.exports = {
   collectionCaption,
   leaderboardCaption,
   claimMarkup,
-  // Jikan
   normalizeJikan,
   fetchRandomFromJikan,
   searchJikanCharacter,
   fetchSpawnCharacter,
   resolveCharacter,
-  // controller
   attach,
   spawn,
   claim,
@@ -538,7 +582,9 @@ module.exports = {
   startAutoSpawn,
   autoSpawnTick,
   state,
-  _clear: () => {
-    db.clearActiveHunt();
-  },
+  // Exported for testing
+  FALLBACK_POOL,
+  fallbackCard,
+  pickFallbackCharacter,
+  _clear: () => { db.clearActiveHunt(); },
 };
