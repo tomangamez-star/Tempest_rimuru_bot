@@ -885,7 +885,7 @@ function createBot() {
     },
     coinflipstreak: async (ctx) => {
       const r = await cfstreak.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'cfstreak', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
+      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaPf(ctx.msg), 'cfstreak', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
       return r;
     },
     num: async (ctx) => {
@@ -1527,7 +1527,7 @@ function createBot() {
       const target = item.target || 'all';
       const chats = new Set();
       try {
-        for (const cid of db.getSeenChatIds())) chats.add(Number(cid));
+        for (const cid of db.getSeenChatIds()) chats.add(Number(cid));
       } catch (e) { /* non-fatal */ }
       let list = [...chats];
       if (target === 'groups') list = list.filter((c) => c < 0);
