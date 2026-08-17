@@ -1,0 +1,1 @@
+I have the full memory.js content from the sandbox
