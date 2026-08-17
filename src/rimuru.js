@@ -102,7 +102,6 @@ async function reply(text, user) {
     return cannedReply(clean, handle, staff);
   }
 
-  const userKey = `user:${user.id}:info`;
   const messages = [
     { role: 'system', content: systemPrompt(staff) },
     { role: 'user', content: `(${handle}${user.isOwner ? ', the King' : staff ? ', staff' : ''} says) ${clean || '(just said your name)'}` },
