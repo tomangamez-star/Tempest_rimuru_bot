@@ -74,7 +74,7 @@ function shouldTrigger(text) {
 }
 
 /**
- * Get Rimuru's reply. Falls back to canned lines when Grop is unavailable/fails.
+ * Get Rimuru's reply. Falls back to canned lines when Groq is unavailable/fails.
  * @param {string} text user message
  * @param {object} user {id, first_name, username, isOwner, isStaff}
  */
@@ -122,7 +122,7 @@ async function reply(text, user) {
     if (!out) return `Hmph. Say something worth answering.`;
     // Save conversation context
     memory.remember(`conv:${user.id}:${Date.now()}`, `${handle}: ${clean} → ${out.slice(0, 100)}`, 'conversation');
-    // Ensure short — Grop is usually compliant; clip defensively
+    // Ensure short — Groq is usually compliant; clip defensively
     return out.length > 400 ? `${out.slice(0, 400)}…` : out;
   } catch (e) {
     console.warn('[rimuru] Groq error:', e.message);
