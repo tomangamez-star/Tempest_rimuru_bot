@@ -822,6 +822,17 @@ function getBotPaused() {
   return row ? row.value === 'true' : false;
 }
 
+// Generic key/value settings on the bot_state table (mirrored to Postgres).
+function getSetting(key) {
+  const row = prep('SELECT value FROM bot_state WHERE key = ?').get(key);
+  return row ? row.value : null;
+}
+
+function setSetting(key, value) {
+  prep('INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, datetime(\'now\')) ' +
+       'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')').run(key, value);
+}
+
 /* ===================== HIDE ===================== */
 
 function setHidden(userId, until) {
@@ -1148,6 +1159,7 @@ module.exports = {
   setMemory, getMemory, getMemoriesByCategory, deleteMemory,
   // Bot state
   setBotPaused, getBotPaused,
+  getSetting, setSetting,
   // Hide
   setHidden, isHidden,
   // Ping
