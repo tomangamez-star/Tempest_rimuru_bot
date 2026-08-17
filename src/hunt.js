@@ -94,42 +94,42 @@ function esc(s) {
 function announceCaption(card, spawn) {
   const meta = rarityMeta(card.rarity);
   const secs = secondsRemaining(spawn);
-  return `<b>\\u2694\\ufe0f ANIME HUNT</b>\\nxA new character has appeared!\\n${esc(card.name)} has entered the JTF doors\\n\\n<\ud83d\\udd64 ${esc(card.name)}\\n<\ud83c\\udf8c ${esc(seriesNameOf(card))}\\n<\ud83c\\udd94 #${esc(card.character_id)}\\n${meta.emoji} ${meta.label}\\n\\n<i>\\u23f1\\ufe0f ${secss remaining</i>`;
+  return `<b>⚔️ ANIME HUNT</b>\nA new character has appeared!\n${esc(card.name)} has entered the JTF doors\n\n🕔 ${esc(card.name)}\n🎬 ${esc(seriesNameOf(card))}\n🆔 #${esc(card.character_id)}\n${meta.emoji} ${meta.label}\n\n<i>⏱️ ${secs}s remaining</i>`;
 }
 
 function claimedCaption(char, claimerName) {
   const meta = rarityMeta(char.rarity);
-  return `<b>\\u2694\\ufe0f CHARACTER CLAIMED!</b>\\n\\ud83d\\udd64 ${esc(char.name)}\\n<\ud83c\\udf8c ${esc(char.series || seriesNameOf(char))}\\n${meta.emoji} ${meta.label}\\n\\ud83c\\udff9 Claimed by ${esc(claimerName)}`;
+  return `<b>⚔️ CHARACTER CLAIMED!</b>\n🕔 ${esc(char.name)}\n🎬 ${esc(char.series || seriesNameOf(char))}\n${meta.emoji} ${meta.label}\n🎯 Claimed by ${esc(claimerName)}`;
 }
 
 function detailCaption(char, opts = {}) {
   const meta = rarityMeta(char.rarity);
-  const lines = [`<\ud83d\\udd64 ${esc(char.name)}`, `<\ud83c\\udd94 Character ID: ${esc(char.character_id)}`, `<\ud83c\\udf8c ${esc(seriesNameOf(char))}`];
+  const lines = [`🕔 ${esc(char.name)}`, `🆔 Character ID: ${esc(char.character_id)}`, `🎬 ${esc(seriesNameOf(char))}`];
   const bio = truncateBio(char.bio);
-  if (bio) lines.push(`<\ud83d\\uddc6 About: ${esc(bio)}`);
+  if (bio) lines.push(`📖 About: ${esc(bio)}`);
   const anime = animeListOf(char);
-  if (anime) lines.push(`<\ud83d\\udcda Appears in: ${esc(anime)}`);
-  lines.push(${meta.emoji} Rarity: ${meta.label}`);
-  if (opts.claimedAt) lines.push(`<\ud83c\\udcc5 Claimed: ${new Date(Number(opts.claimedAt)).toLocaleDateString()}`);
-  return lines.join('\\n');
+  if (anime) lines.push(`📚 Appears in: ${esc(anime)}`);
+  lines.push(`${meta.emoji} Rarity: ${meta.label}`);
+  if (opts.claimedAt) lines.push(`📅 Claimed: ${new Date(Number(opts.claimedAt)).toLocaleDateString()}`);
+  return lines.join('\n');
 }
 
 function collectionCaption(rows) {
-  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! \\u2694\\ufe0f';
-  const lines = rows.map((r, i) => { const meta = rarityMeta(r.rarity); return `${i + 1}. ${meta.emoji} ${esc(r.name)} \\u2014 ${esc(r.series || '?')}`; });
-  lines.unshift(`<b>\\u2694\\ufe0f Your Collection</b> (${rows.length} characters)\\n`);
-  return lines.join('\\n');
+  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! ⚔️';
+  const lines = rows.map((r, i) => { const meta = rarityMeta(r.rarity); return `${i + 1}. ${meta.emoji} ${esc(r.name)} — ${esc(r.series || '?')}`; });
+  lines.unshift(`<b>⚔️ Your Collection</b> (${rows.length} characters)\n`);
+  return lines.join('\n');
 }
 
 function leaderboardCaption(rows, limit) {
-  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! \\u2694\\ufe0f';
-  const medals = ['\\ud83e\\udd47', '\\ud83e\\udd48', '\\ud83e\\udd49'];
-  const lines = rows.map((r, i) => { const prefix = medals[i] || `${i + 1}.`; const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`; return `${prefix} ${esc(name)} \\u2014 ${r.count} character${r.count !== 1 ? 's' : ''}`; });
-  lines.unshift(`<b>\\u2694\\ufe0f Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\\n`);
+  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! ⚔️';
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = rows.map((r, i) => { const prefix = medals[i] || `${i + 1}.`; const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`; return `${prefix} ${esc(name)} — ${r.count} character${r.count !== 1 ? 's' : ''}`; });
+  lines.unshift(`<b>⚔️ Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\n`);
   return lines.join('\\n');
 }
 
-function claimMarkup() { return { inline_keyboard: [[{ text: '\\u2694\\ufe0f CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
+function claimMarkup() { return { inline_keyboard: [[{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -272,7 +272,7 @@ async function autoSpawnTick(env = {}) {
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, groupIds[0]);
   const spawnRow = db.getActiveHunt();
-  for (const gid of groupIds) { await sendPhoto(gid, card.image_url, announceCaption(card, spawnRow), clainMarkup()); }
+  for (const gid of groupIds) { await sendPhoto(gid, card.image_url, announceCaption(card, spawnRow), claimMarkup()); }
 }
 
 function startAutoSpawn(bot, env = {}) {
@@ -289,7 +289,7 @@ function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: co
 module.exports = {
   RARITY_TIERS, rarityFor, rarityMeta, isSpawnClaimable, secondsRemaining,
   seriesNameOf, animeListOf, truncateBio, announceCaption, claimedCaption,
-  detailCaption, collectionCaption, leaderboardCaption, clainMarkup,
+  detailCaption, collectionCaption, leaderboardCaption, claimMarkup,
   normalizeJikan, fetchRandomFromJikan, searchJikanCharacter, fetchSpawnCharacter,
   resolveCharacter, attach, spawn, claim, expireIfNeeded, searchAndShow,
   startAutoSpawn, autoSpawnTick, state,
