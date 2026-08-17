@@ -1,7 +1,7 @@
 'use strict';
 /**
- * Rimuru Tempest Casino — Coin Flip 🪙
- * /cf [heads|tails] [amount]. Win = double (bet + winnings → payout 2x bet).
+ * Rimuru Tempest Casino — Coin Flip \ud83e\ude99
+ * /cf [heads|tails] [amount]. Win = double (bet + winnings \u2192 payout 2x bet).
  */
 const config = require('../config');
 const { fmt } = require('../utils');
@@ -20,7 +20,7 @@ async function play(ctx) {
   const { args, eco, cd, userId, reply } = ctx;
   const choice = String(args[0] || '').toLowerCase();
   if (!['h', 't', 'heads', 'tails', 'head', 'tail'].includes(choice)) {
-    return reply('🎩 Usage: `/cf [heads|tails] [amount]` — e.g. `/cf tails 5000`');
+    return reply('\ud83c\udfa9 Usage: `/cf [heads|tails] [amount]` \u2014 e.g. `/cf tails 5000`');
   }
   const norm = choice === 'h' || choice === 'heads' || choice === 'head' ? 'heads' : 'tails';
   const bet = parseBet(args[1], eco, userId);
@@ -39,19 +39,19 @@ async function play(ctx) {
   if (r.win) {
     eco.creditWallet(userId, r.payout);
     net = r.payout - bet.amount;
-    text = `🪙 The coin lands **${r.flip.toUpperCase()}**!\n\n✅ **DOUBLE!** You get ${fmt(r.payout)} (net +${fmt(net)}).`;
+    text = `\ud83e\ude99 The coin lands **${r.flip.toUpperCase()}**!\n\n\u2705 **DOUBLE!** You get ${fmt(r.payout)} (net +${fmt(net)}).`;
   } else {
-    text = `🪙 The coin lands **${r.flip.toUpperCase()}**.\n\n❌ You picked ${norm}. Lost ${fmt(bet.amount)}.`;
+    text = `\ud83e\ude99 The coin lands **${r.flip.toUpperCase()}**.\n\n\u274c You picked ${norm}. Lost ${fmt(bet.amount)}.`;
   }
   const wallet = eco.balance(userId).wallet;
-  reply(`${text}\n👛 Wallet: ${fmt(wallet)}`);
-  return { won: r.win, net };
+  reply(`${text}\n\ud83d\udc5b Wallet: ${fmt(wallet)}`);
+  return { won: r.win, net, bet: bet.amount };
 }
 
 function parseBet(raw, eco, userId) {
   const n = Number(String(raw || '').replace(/,/g, ''));
   if (!raw || !Number.isFinite(n) || n <= 0) {
-    return { error: '🎩 Usage: `/cf [heads|tails] [amount]`' };
+    return { error: '\ud83c\udfa9 Usage: `/cf [heads|tails] [amount]`' };
   }
   return { amount: Math.floor(n) };
 }

@@ -17,14 +17,11 @@ try {
   Groq = require('groq-sdk');
   if (config.groqApiKey) {
     client = new Groq({ apiKey: config.groqApiKey });
+  } else {
+    console.warn('[rimuru] GROQ_API_KEY not set — Rimuru AI will use canned replies only');
   }
 } catch (e) {
   console.warn('[rimuru] groq-sdk not available — Rimuru AI will be offline:', e.message);
-}
-if (!client && config.groqApiKey) {
-  console.warn('[rimuru] groq-sdk loaded but client init failed — check GROQ_API_KEY');
-} else if (!client) {
-  console.warn('[rimuru] GROQ_API_KEY not set — Rimuru AI will use canned replies only');
 }
 
 const OWNER_NAME = 'King';
@@ -165,7 +162,7 @@ function cannedReply(text, handle, staff = false) {
       : `Leaving already? Fine. Don't spend it all in one place.`;
   }
   return staff
-    ? `Hmm? ${handle}, I didn't quite catch that. What's on your mind?`
+    ? `Hmm? ${handle}, what's on your mind?`
     : `Hmm? ${handle}, what's up?`;
 }
 
