@@ -23,19 +23,19 @@ function rarityMeta(key) {
 const FALLBACK_POOL = [
   { character_id: 'fb-1001', name: 'Gojo Satoru', series: 'Jujutsu Kaisen', favorites: 75000, bio: 'The strongest jujutsu sorcerer alive. A teacher at Tokyo Jujutsu High who wields immense cursed energy and the Six Eyes.', image_url: 'https://cdn.myanimelist.net/images/characters/15/422168.jpg' },
   { character_id: 'fb-1002', name: 'Rem', series: 'Re:Zero', favorites: 65000, bio: 'A devoted maid of the Roswaal mansion who overcomes her inferiority complex to become one of the most beloved characters in anime.', image_url: 'https://cdn.myanimelist.net/images/characters/9/311327.jpg' },
-  { character_id: 'fb-1003', name: 'Asuna Yuuki', series: 'Sword Art Online', favorites: 55000, bio: 'The vice-commander of the Knights of the Blood Oath. A skilled fencer known as the "Lightning Flash" in Aincrad.', image_url: 'https://cdn.myanimelist.net/images/characters/10/262051.jpg' },
-  { character_id: 'fb-1004', name: 'Mikasa Ackerman', series: 'Attack on Titan', favorites: 60000, bio: 'The last child of the Ackerman clan and humanity\'s strongest soldier. Fiercely protective of those she loves.', image_url: 'https://cdn.myanimelist.net/images/characters/13/483950.jpg' },
+  { character_id: 'fb-1003', name: 'Asuna Yuuki', series: 'Sword Art Online', favorites: 55000, bio: 'The vvice-commander of the Knights of the Blood Oath. A skilled fencer known as the "Lightning Flash" in Aincrad.', image_url: 'https://cdn.myanimelist.net/images/characters/10/262051.jpg' },
+  { character_id: 'fb-1004', name: 'Mikasa Ackerman', series: 'Attack on Titan', favorites: 60000, bio: 'The last child of the Ackerman clan and humanity\u0027s strongest soldier. Fiercely protective of those she loves.', image_url: 'https://cdn.myanimelist.net/images/characters/13/483950.jpg' },
   { character_id: 'fb-1005', name: 'Zero Two', series: 'Darling in the Franxx', favorites: 50000, bio: 'A mysterious half-klaxo sapien pilot known as the "Partner Killer". She searches for her darling to become human.', image_url: 'https://cdn.myanimelist.net/images/characters/14/559013.jpg' },
   { character_id: 'fb-1006', name: 'Nezuko Kamado', series: 'Demon Slayer', favorites: 45000, bio: 'A demon who retains her human emotions. She fights alongside her brother Tanjiro using her unique Blood Demon Art.', image_url: 'https://cdn.myanimelist.net/images/characters/2/378254.jpg' },
   { character_id: 'fb-1007', name: 'Yor Forger', series: 'Spy x Family', favorites: 40000, bio: 'A deadly assassin known as the "Thorn Princess" who lives a double life as a loving mother and wife.', image_url: 'https://cdn.myanimelist.net/images/characters/9/457751.jpg' },
   { character_id: 'fb-1008', name: 'Hinata Hyuga', series: 'Naruto', favorites: 35000, bio: 'A gentle kunoichi of the Hyuga clan who masters the Byakugan and Gentle Fist style. She never gives up.', image_url: 'https://cdn.myanimelist.net/images/characters/6/278736.jpg' },
-  { character_id: 'fb-1009', name: 'Rias Gremory', series: 'High School DxD', favorites: 30000, bio: 'The beautiful crimson-haired devil princess and president of the Occult Research Club. A powerful King piece.', image_url: 'https://cdn.myanimelist.net/images/characters/5/150011.jpg' },
+  { character_id: 'fb-1009', name: 'Rias Gremory', series: 'High School DxD', favorites: 30000, bio: 'The beautiful crmison-haired devil princess and president of the Occult Research Club. A powerful King piece.', image_url: 'https://cdn.myanimelist.net/images/characters/5/150011.jpg' },
   { character_id: 'fb-1010', name: 'Mai Sakurajima', series: 'Rascal Does Not Dream of Bunny Girl Senpai', favorites: 25000, bio: 'A popular actress and model who becomes invisible due to Adolescence Syndrome. Sharp-witted and caring.', image_url: 'https://cdn.myanimelist.net/images/characters/3/361761.jpg' },
   { character_id: 'fb-1011', name: 'Chika Fujiwara', series: 'Kaguya-sama: Love Is War', favorites: 20000, bio: 'The energetic and unpredictable secretary of the Shuchiin student council. A master of board games.', image_url: 'https://cdn.myanimelist.net/images/characters/15/559031.jpg' },
   { character_id: 'fb-1012', name: 'Tanjiro Kamado', series: 'Demon Slayer', favorites: 70000, bio: 'A kind-hearted demon slayer who wields the Sun Breathing technique. He searches for a cure for his sister Nezuko.', image_url: 'https://cdn.myanimelist.net/images/characters/10/316805.jpg' },
-  { character_id: 'fb-1013', name: 'Shoto Todoroki', series: 'My Hero Academia', favorites: 45000, bio: 'A UA High student with the powerful Half-Cold Half-Hot Quirk. He strives to become a hero on his own terms.', image_url: 'https://cdn.myanimelist.net/images/characters/8/299594.jpg' },
+  { character_id: 'fb-1013', name: 'Shoto Todoroki', series: 'My Hero Academia', favorites: 45000, bio: 'A UA High student with the powerful Half-Cold Halft-Hot Quirk. He strives to become a hero on his own terms.', image_url: 'https://cdn.myanimelist.net/images/characters/8/299594.jpg' },
   { character_id: 'fb-1014', name: 'Saber', series: 'Fate/stay night', favorites: 55000, bio: 'The legendary King of Knights, Artoria Pendragon. A heroic spirit of unparalleled skill and noble ideals.', image_url: 'https://cdn.myanimelist.net/images/characters/16/345701.jpg' },
-  { character_id: 'fb-1015', name: 'Levi Ackerman', series: 'Attack on Titan', favorites: 65000, bio: 'Humanity\'s strongest soldier and captain of the Survey Corps Special Operations Squad. A clean freak with unmatched skill.', image_url: 'https://cdn.myanimelist.net/images/characters/12/321544.jpg' },
+  { character_id: 'fb-1015', name: 'Levi Ackerman', series: 'Attack on Titan', favorites: 65000, bio: 'Humanity\u0027s strongest soldier and captain of the Survey Corps Special Operations Squad. A clean freak with unmatched skill.', image_url: 'https://cdn.myanimelist.net/images/characters/12/321544.jpg' },
 ];
 
 function fallbackCard(entry) {
@@ -67,7 +67,8 @@ function secondsRemaining(spawn, now = Date.now()) {
 function seriesNameOf(char) {
   if (!char) return '';
   if (char.series) return String(char.series);
-  const anime = Array.isArray(char.anime) ? char.anime : [];
+  const anime = Array.isArray(
+char.anime) ? char.anime : [];
   if (anime.length > 0 && anime[0].anime && anime[0].anime.name) return String(anime[0].anime.name);
   return '';
 }
@@ -93,42 +94,42 @@ function esc(s) {
 function announceCaption(card, spawn) {
   const meta = rarityMeta(card.rarity);
   const secs = secondsRemaining(spawn);
-  return `<b>\u2694\ufe0f ANIME HUNT</b>\nA new character has appeared!\n${esc(card.name)} has entered the JTF doors\n\n\ud83d\udc64 ${esc(card.name)}\n\ud83c\udf8c ${esc(seriesNameOf(card))}\n\ud83c\udd94 #${esc(card.character_id)}\n${meta.emoji} ${meta.label}\n\n<i>\u23f1\ufe0f ${secs}s remaining</i>`;
+  return `<b>\\u2694\\ufe0f ANIME HUNT</b>\\nxA new character has appeared!\\n${esc(card.name)} has entered the JTF doors\\n\\n<\ud83d\\udd64 ${esc(card.name)}\\n<\ud83c\\udf8c ${esc(seriesNameOf(card))}\\n<\ud83c\\udd94 #${esc(card.character_id)}\\n${meta.emoji} ${meta.label}\\n\\n<i>\\u23f1\\ufe0f ${secss remaining</i>`;
 }
 
 function claimedCaption(char, claimerName) {
   const meta = rarityMeta(char.rarity);
-  return `<b>\u2694\ufe0f CHARACTER CLAIMED!</b>\n\ud83d\udc64 ${esc(char.name)}\n\ud83c\udf8c ${esc(char.series || seriesNameOf(char))}\n${meta.emoji} ${meta.label}\n\ud83c\udff9 Claimed by ${esc(claimerName)}`;
+  return `<b>\\u2694\\ufe0f CHARACTER CLAIMED!</b>\\n\\ud83d\\udd64 ${esc(char.name)}\\n<\ud83c\\udf8c ${esc(char.series || seriesNameOf(char))}\\n${meta.emoji} ${meta.label}\\n\\ud83c\\udff9 Claimed by ${esc(claimerName)}`;
 }
 
 function detailCaption(char, opts = {}) {
   const meta = rarityMeta(char.rarity);
-  const lines = [`\ud83d\udc64 ${esc(char.name)}`, `\ud83c\udd94 Character ID: ${esc(char.character_id)}`, `\ud83c\udf8c ${esc(seriesNameOf(char))}`];
+  const lines = [`<\ud83d\\udd64 ${esc(char.name)}`, `<\ud83c\\udd94 Character ID: ${esc(char.character_id)}`, `<\ud83c\\udf8c ${esc(seriesNameOf(char))}`];
   const bio = truncateBio(char.bio);
-  if (bio) lines.push(`\ud83d\udcd6 About: ${esc(bio)}`);
+  if (bio) lines.push(`<\ud83d\\uddc6 About: ${esc(bio)}`);
   const anime = animeListOf(char);
-  if (anime) lines.push(`\ud83d\udcda Appears in: ${esc(anime)}`);
-  lines.push(`${meta.emoji} Rarity: ${meta.label}`);
-  if (opts.claimedAt) lines.push(`\ud83d\udcc5 Claimed: ${new Date(Number(opts.claimedAt)).toLocaleDateString()}`);
-  return lines.join('\n');
+  if (anime) lines.push(`<\ud83d\\udcda Appears in: ${esc(anime)}`);
+  lines.push(${meta.emoji} Rarity: ${meta.label}`);
+  if (opts.claimedAt) lines.push(`<\ud83c\\udcc5 Claimed: ${new Date(Number(opts.claimedAt)).toLocaleDateString()}`);
+  return lines.join('\\n');
 }
 
 function collectionCaption(rows) {
-  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! \u2694\ufe0f';
-  const lines = rows.map((r, i) => { const meta = rarityMeta(r.rarity); return `${i + 1}. ${meta.emoji} ${esc(r.name)} \u2014 ${esc(r.series || '?')}`; });
-  lines.unshift(`<b>\u2694\ufe0f Your Collection</b> (${rows.length} characters)\n`);
-  return lines.join('\n');
+  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! \\u2694\\ufe0f';
+  const lines = rows.map((r, i) => { const meta = rarityMeta(r.rarity); return `${i + 1}. ${meta.emoji} ${esc(r.name)} \\u2014 ${esc(r.series || '?')}`; });
+  lines.unshift(`<b>\\u2694\\ufe0f Your Collection</b> (${rows.length} characters)\\n`);
+  return lines.join('\\n');
 }
 
 function leaderboardCaption(rows, limit) {
-  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! \u2694\ufe0f';
-  const medals = ['\ud83e\udd47', '\ud83e\udd48', '\ud83e\udd49'];
-  const lines = rows.map((r, i) => { const prefix = medals[i] || `${i + 1}.`; const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`; return `${prefix} ${esc(name)} \u2014 ${r.count} character${r.count !== 1 ? 's' : ''}`; });
-  lines.unshift(`<b>\u2694\ufe0f Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\n`);
-  return lines.join('\n');
+  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! \\u2694\\ufe0f';
+  const medals = ['\\ud83e\\udd47', '\\ud83e\\udd48', '\\ud83e\\udd49'];
+  const lines = rows.map((r, i) => { const prefix = medals[i] || `${i + 1}.`; const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`; return `${prefix} ${esc(name)} \\u2014 ${r.count} character${r.count !== 1 ? 's' : ''}`; });
+  lines.unshift(`<b>\\u2694\\ufe0f Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\\n`);
+  return lines.join('\\n');
 }
 
-function claimMarkup() { return { inline_keyboard: [[{ text: '\u2694\ufe0f CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
+function claimMarkup() { return { inline_keyboard: [[{ text: '\\u2694\\ufe0f CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -207,7 +208,7 @@ async function reply(chatId, text, opts = {}) {
 
 async function sendPhoto(chatId, imageUrl, caption, markup) {
   if (deps && typeof deps.sendPhoto === 'function') {
-    try { return await deps.sendPhoto(chatId, imageUrl, { caption, parse_mode: 'HTML', reply_markup: markup }); } catch (e) { console.warn('[hunt] sendPhoto failed:', e.message); await reply(chatId, caption, { title: '\u2694\ufe0f ANIME HUNT', color: '#FFB300', html: true }); }
+    try { return await deps.sendPhoto(chatId, imageUrl, { caption, parse_mode: 'HTML', reply_markup: markup }); } catch (e) { console.warn('[hunt] sendPhoto failed:', e.message); await reply(chatId, caption, { title: '\\u2694\\ufe0f ANIME HUNT', color: '#FFB300', html: true }); }
   }
   return null;
 }
@@ -218,10 +219,10 @@ async function spawn(opts = {}) {
   if (!config.hunt.enabled) return { ok: false, message: 'The Anime Hunt is disabled.' };
   expireIfNeeded();
   const existing = db.getActiveHunt();
-  if (isSpawnClaimable(existing)) return { ok: false, message: `\u2694\ufe0f A character is already up for grabs \u2014 tap <b>CLAIM CHARACTER</b> on it first! (${secondsRemaining(existing)}s left)` };
+  if (isSpawnClaimable(existing)) return { ok: false, message: `\\u2694\\ufe0f A character is already up for grabs \\u2014 tap <b>CLAIM CHARACTER</b> on it first! (${secondsRemaining(existing)}s left)` };
   if (existing) db.clearActiveHunt();
   const card = await fetchSpawnCharacter();
-  if (!card) return { ok: false, message: '\ud83d\udc7b The hunt is quiet right now. Try again in a moment.' };
+  if (!card) return { ok: false, message: '\\ud83d\\udb7b The hunt is quiet right now. Try again in a moment.' };
   const chatId = Number(opts.chatId) || 0;
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, chatId);
@@ -240,7 +241,7 @@ async function claim(userId, opts = {}) {
   db.clearActiveHunt();
   const user = db.getUser(userId) || {};
   const claimerName = user.username ? `@${user.username}` : user.first_name || `user ${userId}`;
-  await reply(spawnRow.chat_id || opts.chatId, claimedCaption(char, claimerName), { title: '\u2694\ufe0f CLAIMED', color: '#FFB300', html: true });
+  await reply(spawnRow.chat_id || opts.chatId, claimedCaption(char, claimerName), { title: '\\u2694\\ufe0f CLAIMED', color: '#FFB300', html: true });
   return { ok: true, character: char, userId };
 }
 
@@ -256,7 +257,7 @@ async function searchAndShow(query, opts = {}) {
   if (!q) return { ok: false, message: 'Usage: <code>/char &lt;name&gt;</code>' };
   const card = await searchJikanCharacter(q);
   if (card) { db.cacheHuntCharacter(card); await sendPhoto(opts.chatId, card.image_url, detailCaption(card), null); return { ok: true, character: card }; }
-  return { ok: false, message: `\ud83d\udc7b No character found for "<b>${esc(q)}</b>". Try another name.` };
+  return { ok: false, message: `\\ud83d\\udb7b No character found for "<b>${esc(q)}</b>". Try another name.` };
 }
 
 let autoSpawnTimer = null;
@@ -271,7 +272,7 @@ async function autoSpawnTick(env = {}) {
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, groupIds[0]);
   const spawnRow = db.getActiveHunt();
-  for (const gid of groupIds) { await sendPhoto(gid, card.image_url, announceCaption(card, spawnRow), claimMarkup()); }
+  for (const gid of groupIds) { await sendPhoto(gid, card.image_url, announceCaption(card, spawnRow), clainMarkup()); }
 }
 
 function startAutoSpawn(bot, env = {}) {
@@ -288,7 +289,7 @@ function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: co
 module.exports = {
   RARITY_TIERS, rarityFor, rarityMeta, isSpawnClaimable, secondsRemaining,
   seriesNameOf, animeListOf, truncateBio, announceCaption, claimedCaption,
-  detailCaption, collectionCaption, leaderboardCaption, claimMarkup,
+  detailCaption, collectionCaption, leaderboardCaption, clainMarkup,
   normalizeJikan, fetchRandomFromJikan, searchJikanCharacter, fetchSpawnCharacter,
   resolveCharacter, attach, spawn, claim, expireIfNeeded, searchAndShow,
   startAutoSpawn, autoSpawnTick, state,
