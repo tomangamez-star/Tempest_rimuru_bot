@@ -189,6 +189,11 @@ async function main() {
         );
       } else {
         console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner (write pipeline enabled).`);
+        // ── FIX: Start the mirror loop so SQLite→Postgres writes are drained and
+        // periodically synchronized. Without this, queued writes are never sent to
+        // Postgres, causing user data to appear "regressed" on redeploy (stale or
+        // empty SQLite overwriting durable Postgres rows on the next hydration).
+        if (db.startMirrorLoop) db.startMirrorLoop();
       }
     } else {
       // No lock support (SQLite-only dev): enable writes for the sole instance.
