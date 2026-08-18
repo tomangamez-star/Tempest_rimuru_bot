@@ -118,33 +118,26 @@ async function main() {
   console.log(`🩺 Health server listening on :${config.port} (GET /health)`);
 
 
+  // ── HARD single-instance guard FIRST: acquire the Postgres advisory lock
+  // BEFORE initPersistence() starts any SQLite→PG write pipeline. Only the
+  // process that OWNS the lock may mirror; a standby (Render deploy overlap /
+  // stale instance) is set read-only so its stale local cache can never be
+  // pushed up over the primary's fresh writes (the periodic rollback source).
   // ── Durability: hydrate SQLite from Postgres FIRST ────────────────────
-  // Restored boot flow (was broken by 08b1aeb, which skipped hydration):
-  //   initPg() → ensurePgTables() → hydrateFromPg() → [advisory lock]
-  //   → setSyncEnabled(true) → startMirrorLoop().
-  // Hydration MUST complete before the mirror loop starts: without it, a
-  // fresh SQLite cache is empty and the first mirror would push an empty DB
-  // over the real Postgres rows (the rollback bug). The advisory lock below
-  // then decides which instance may run the write pipeline.
-
-  // Helper to safely call optional setSyncEnabled
-  const safeSetSyncEnabled = (v) => { if (db.setSyncEnabled) try { db.setSyncEnabled(v); } catch (e) { /* ignore */ } };
-
+  // initPersistence() connects to Postgres, creates/migrates tables, sets
+  // pgReady=true, and hydrates the local SQLite cache from the durable store.
+  // It does NOT start the SQLite→PG write pipeline (syncEnabled defaults to
+  // false / fail-closed) — the advisory lock below decides who may write.
   let persisted = { enabled: false, hydrated: 0 };
   if (db.initPersistence) {
-    // Restored: initPersistence() = initPg + ensurePgTables + hydrateFromPg.
-    // Hydration runs BEFORE any mirror write (startMirrorLoop is only started
-    // after the advisory lock is acquired below, so writes are gated).
     try {
       persisted = await db.initPersistence();
-      // startRecoveryLoop() keeps the bot alive if PG drops mid-run.
       if (db.startRecoveryLoop) db.startRecoveryLoop();
     } catch (e) {
       console.warn('[db] initPersistence() failed:', e.message);
       persisted = { enabled: false, hydrated: 0 };
     }
   } else if (db.initPg) {
-    // Fallback: newer API without the hydration entry point.
     const ok = await db.initPg();
     if (ok) {
       if (db.ensurePgTables) await db.ensurePgTables();
@@ -156,10 +149,8 @@ async function main() {
     } else {
       const info = db.syncInfo ? db.syncInfo() : { configured: false };
       if (info.configured && !info.ready) {
-        // Durable persistence is mandatory in production. Keep HTTP health alive
-        // but do not start the bot or accept economy writes until PG is ready.
         standby = true;
-        safeSetSyncEnabled(false);
+        if (db.setSyncEnabled) db.setSyncEnabled(false);
         console.error(
           '❌❌❌ POSTGRES PERSISTENCE IS DOWN ❌❌❌\n' +
           'DATABASE_URL is set but the bot could NOT connect to Postgres.\n' +
@@ -169,13 +160,17 @@ async function main() {
         );
       }
     }
-  } else {
-    // No Postgres/init API available — treat as SQLite-only.
-    persisted = { enabled: false, hydrated: 0 };
   }
 
+  const persistenceInfo = db.syncInfo ? db.syncInfo() : { configured: false };
   if (persisted.enabled) {
     console.log(`✅ Postgres persistence ON — data survives redeploys (hydrated ${persisted.hydrated} rows).`);
+  } else if (persistenceInfo.configured && persistenceInfo.ready) {
+    // Never let an unverified/stale SQLite cache become a Postgres writer.
+    // Hydration is a hard prerequisite for the normal write pipeline.
+    standby = true;
+    if (db.setSyncEnabled) db.setSyncEnabled(false);
+    console.error('❌ Postgres is reachable, but SQLite hydration was not verified; bot remains read-only until hydration succeeds.');
   }
 
   // ── HARD single-instance guard: acquire the Postgres advisory lock AFTER ─
@@ -186,13 +181,7 @@ async function main() {
   try {
     if (!standby && db.acquireInstanceLock) {
       standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
-      safeSetSyncEnabled(!standby);
-      // The mirror loop (SQLite→PG) may only run on the primary (lock holder).
-      // Starting it here — AFTER hydration AND lock acquisition — guarantees
-      // a standby's stale local cache can never overwrite the primary's rows.
-      if (!standby) {
-        if (db.startMirrorLoop) db.startMirrorLoop();
-      }
+      db.setSyncEnabled(!standby);
       if (standby) {
         console.warn(
           `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
@@ -203,12 +192,12 @@ async function main() {
       }
     } else {
       // No lock support (SQLite-only dev): enable writes for the sole instance.
-      safeSetSyncEnabled(true);
+      db.setSyncEnabled(true);
     }
   } catch (e) {
     console.error('[instance] advisory lock check failed — treating as STANDBY (writes disabled) to prevent stale overwrites:', e.message);
     standby = true;
-    safeSetSyncEnabled(false);
+    db.setSyncEnabled(false);
   }
 
 
@@ -274,11 +263,24 @@ async function main() {
   const tryBecomePrimary = async () => {
     if (!standby || bot || !db.acquireInstanceLock) return;
     try {
+      // If startup was held in standby because hydration failed, rehydrate
+      // from durable Postgres before ever enabling a write lock.
+      if (db.hydrateFromPg) {
+        const info = db.syncInfo ? db.syncInfo() : {};
+        if (info.configured && info.ready && !info.hydrated) {
+          const h = await db.hydrateFromPg();
+          if (!h || !h.enabled) return;
+        }
+      }
       const acquired = await db.acquireInstanceLock(PG_LOCK_KEY);
       if (acquired) {
+        const info = db.syncInfo ? db.syncInfo() : {};
+        if (info.configured && !info.hydrated) {
+          if (db.releaseInstanceLock) await db.releaseInstanceLock(PG_LOCK_KEY);
+          return;
+        }
         standby = false;
-        safeSetSyncEnabled(true);
-        if (db.startMirrorLoop) db.startMirrorLoop();
+        db.setSyncEnabled(true);
         if (primaryRetryTimer) {
           clearInterval(primaryRetryTimer);
           primaryRetryTimer = null;
