@@ -111,25 +111,25 @@ function detailCaption(char, opts = {}) {
   if (anime) lines.push(`📚 Appears in: ${esc(anime)}`);
   lines.push(`${meta.emoji} Rarity: ${meta.label}`);
   if (opts.claimedAt) lines.push(`📅 Claimed: ${new Date(Number(opts.claimedAt)).toLocaleDateString()}`);
-  return lines.join('\\n');
+  return lines.join('\n');
 }
 
 function collectionCaption(rows) {
-  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! \\u2694\\ufe0f';
-  const lines = rows.map((r, i) => { const meta = rarityMeta(r.rarity); return `${i + 1}. ${meta.emoji} ${esc(r.name)} \\u2014 ${esc(r.series || '?')}`; });
-  lines.unshift(`<b>\\u2694\\ufe0f Your Collection</b> (${rows.length} characters)\\n`);
-  return lines.join('\\n');
+  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! ⚔️';
+  const lines = rows.map((r, i) => { const meta = rarityMeta(r.rarity); return `${i + 1}. ${meta.emoji} ${esc(r.name)} — ${esc(r.series || '?')}`; });
+  lines.unshift(`<b>⚔️ Your Collection</b> (${rows.length} characters)\n`);
+  return lines.join('\n');
 }
 
 function leaderboardCaption(rows, limit) {
-  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! \\u2694\\ufe0f';
-  const medals = ['\\ud83e\\udd47', '\\ud83e\\udd48', '\\ud83e\\udd49'];
-  const lines = rows.map((r, i) => { const prefix = medals[i] || `${i + 1}.`; const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`; return `${prefix} ${esc(name)} \\u2014 ${r.count} character${r.count !== 1 ? 's' : ''}`; });
-  lines.unshift(`<b>\\u2694\\ufe0f Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\\n`);
+  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! ⚔️';
+  const medals = ['🥇', '🥈', '🥉'];
+  const lines = rows.map((r, i) => { const prefix = medals[i] || `${i + 1}.`; const name = r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`; return `${prefix} ${esc(name)} — ${r.count} character${r.count !== 1 ? 's' : ''}`; });
+  lines.unshift(`<b>⚔️ Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\n`);
   return lines.join('\\n');
 }
 
-function claimMarkup() { return { inline_keyboard: [[{ text: '\\u2694\\ufe0f CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
+function claimMarkup() { return { inline_keyboard: [[{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
