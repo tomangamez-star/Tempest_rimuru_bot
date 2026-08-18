@@ -87,7 +87,7 @@ if (PG_CONFIGURED) {
 /* ===================== TABLE REGISTRATION ===================== */
 
 const TABLE_COLS = {
-  users: 'user_id, username, first_name, wallet, bank, networth, rank, rank_valid_matches, rank_consecutive_losses, created_at, updated_at, status, status_until, hidden_until, last_seen',
+  users: 'user_id, username, first_name, wallet, bank, networth, rank, rank_valid_matches, rank_consecutive_losses, created_at, updated_at, status, status_reason, status_until, hidden_until, last_seen',
   game_history: 'id, user_id, username, game, bet, result, amount, played_at',
   cooldowns: 'user_id, action, expires_at',
   admin_users: 'user_id, username, role, password, added_by, added_at',
@@ -1469,15 +1469,124 @@ async function ensurePgTables() {
       if (name === 'key' && table === 'settings') return 'key TEXT PRIMARY KEY';
       if (c.includes('INTEGER') || c.includes('INT')) return `${name} BIGINT`;
       if (c.includes('TEXT')) return `${name} TEXT`;
+      if (/^(id|user_id|wallet|bank|networth|amount|bet|reward|pot|ticket_count|quantity|favorites|expires_at|started_at|claimed_at|created_at|updated_at|status_until|hidden_until|last_seen|rank_valid_matches|rank_consecutive_losses|sent_count|completions|starts_at|used_count|max_uses|attempts|completed|last_attempt|claimed|is_command|added_at|played_at|cached_at|ts|user_count|total_coins|suspect|row_count|backup_id|chat_id|expires_at|until)$/.test(name)) return `${name} BIGINT`;
       return `${name} TEXT`;
     });
     const pk = TABLE_PKS[table];
+    // The single-column PKs are already injected inline above (`... PRIMARY KEY`);
+    // appending `PRIMARY KEY (pk)` again would make Postgres throw
+    // "multiple primary keys for table ... are not allowed" and the table
+    // would NEVER be created (→ hydrateFromPg "relation does not exist" →
+    // permanent standby). Only append the table-level clause for COMPOSITE
+    // primary keys (cooldowns, inventory, game_sessions, mission_progress,
+    // redeem_redemptions, time_wallet, ...) which cannot be inline.
+    const isSingleColPk = pk.split(', ').length === 1;
+    const inlinePkCols = new Set(['id', 'user_id', 'code', 'character_id', 'key']);
+    const inlinePk = isSingleColPk && inlinePkCols.has(pk.split(', ')[0]);
     try {
-      await pgPool.query(`CREATE TABLE IF NOT EXISTS ${table} (${colDefs.join(', ')}, PRIMARY KEY (${pk}))`);
+      const ddl = inlinePk
+        ? `CREATE TABLE IF NOT EXISTS ${table} (${colDefs.join(', ')})`
+        : `CREATE TABLE IF NOT EXISTS ${table} (${colDefs.join(', ')}, PRIMARY KEY (${pk}))`;
+      await pgPool.query(ddl);
     } catch (e) {
       console.warn(`[db] ensurePgTables ${table}:`, e.message);
     }
   }
+  // Reconcile PRE-EXISTING Postgres tables (created by older bot versions)
+  // against the CURRENT schema: add any missing columns and copy legacy
+  // column data across renames. Non-destructive — never drops or alters
+  // existing columns/rows. Without this, hydrateFromPg's SELECT fails on a
+  // missing column (e.g. `networth`) and the bot stays stuck in standby /
+  // read-only forever (never acquires the advisory lock, never responds).
+  await migratePgColumns();
+}
+
+/* Per-column PG type/defaults for `ADD COLUMN IF NOT EXISTS` on legacy tables.
+ * Keyed by column NAME (applies to any table that has it). Only columns that
+ * may be missing on old installs are listed; everything else falls back to a
+ * plain BIGINT/TEXT add. */
+const PG_COLUMN_DEFAULTS = {
+  networth: 'BIGINT', // added nullable, backfilled from wallet+bank below
+  rank: "TEXT DEFAULT 'bronze'",
+  rank_valid_matches: 'BIGINT DEFAULT 0',
+  rank_consecutive_losses: 'BIGINT DEFAULT 0',
+  status: "TEXT DEFAULT ''",
+  status_reason: "TEXT DEFAULT ''",
+  status_until: 'BIGINT DEFAULT 0',
+  hidden_until: 'BIGINT DEFAULT 0',
+  last_seen: 'BIGINT DEFAULT 0',
+  wallet: 'BIGINT DEFAULT 0',
+  bank: 'BIGINT DEFAULT 0',
+  username: "TEXT DEFAULT ''",
+  first_name: "TEXT DEFAULT ''",
+  role: "TEXT DEFAULT 'mod'",
+  password: "TEXT DEFAULT ''",
+  sent_count: 'BIGINT DEFAULT 0',
+  active: 'BIGINT DEFAULT 1',
+  completions: 'BIGINT DEFAULT 0',
+  starts_at: 'BIGINT DEFAULT 0',
+  used_count: 'BIGINT DEFAULT 0',
+  creator_role: "TEXT DEFAULT ''",
+  leader_name: "TEXT DEFAULT ''",
+  target_name: "TEXT DEFAULT ''",
+  started_at: 'BIGINT DEFAULT 0',
+  chat_title: "TEXT DEFAULT ''",
+  text: "TEXT DEFAULT ''",
+  is_command: 'BIGINT DEFAULT 0',
+  created_at: 'BIGINT DEFAULT 0',
+  expires_at: 'BIGINT DEFAULT 0',
+  claimed: 'BIGINT DEFAULT 0',
+  amount: 'BIGINT DEFAULT 0',
+  max_uses: 'BIGINT DEFAULT 1',
+  favorites: 'BIGINT DEFAULT 0',
+  quantity: 'BIGINT DEFAULT 1',
+  ticket_count: 'BIGINT DEFAULT 0',
+  pot: 'BIGINT DEFAULT 0',
+  tickets: "TEXT DEFAULT '[]'",
+};
+
+/* Idempotent, non-destructive Postgres schema migration:
+ *  1. `ADD COLUMN IF NOT EXISTS` for every TABLE_COLS column that may be
+ *     missing on a legacy table (Postgres 9.6+ native — safe on every boot).
+ *  2. Backfill legacy column data across renames the old bot used, so no
+ *     pre-existing value is stranded or lost. Each statement is guarded: if
+ *     the legacy column doesn't exist it throws and is skipped (no-op).
+ */
+async function migratePgColumns() {
+  if (!pgReady || !pgPool) return;
+  for (const [table, cols] of Object.entries(TABLE_COLS)) {
+    const pkCols = new Set((TABLE_PKS[table] || '').split(', ').map((s) => s.trim()));
+    for (const c of cols.split(', ')) {
+      const [name] = c.split(' ');
+      if (pkCols.has(name)) continue; // PK columns already exist by definition
+      const def = PG_COLUMN_DEFAULTS[name] || (c.includes('INTEGER') || c.includes('INT') ? `BIGINT` : `TEXT`);
+      try {
+        await pgPool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${name} ${def}`);
+      } catch (e) {
+        // Column may exist with a different type, or the table is locked —
+        // non-fatal; hydration's null-safe row mapping covers the gap.
+        console.warn(`[db] migratePgColumns ${table}.${name}:`, e.message);
+      }
+    }
+  }
+  // ---- Legacy data reconciliation (each guarded; no-op when the legacy
+  // column doesn't exist on this install) ----
+  try {
+    // users.networth: legacy rows never wrote it → net worth = wallet + bank.
+    await pgPool.query(`UPDATE users SET networth = COALESCE(networth, wallet + bank, 500000) WHERE networth IS NULL`);
+  } catch (e) { console.warn('[db] networth backfill skipped:', e.message); }
+  try {
+    // chat_logs.message → text (old schema named it `message`).
+    await pgPool.query(`UPDATE chat_logs SET text = message WHERE (text IS NULL OR text = '') AND message IS NOT NULL AND message != ''`);
+  } catch (e) { console.warn('[db] chat_logs message→text copy skipped:', e.message); }
+  try {
+    // redeem_codes.uses → used_count (old schema named it `uses`).
+    await pgPool.query(`UPDATE redeem_codes SET used_count = uses WHERE (used_count IS NULL OR used_count = 0) AND uses IS NOT NULL AND uses > 0`);
+  } catch (e) { console.warn('[db] redeem_codes uses→used_count copy skipped:', e.message); }
+  try {
+    // lottery.jackpot/buyers/entries → pot/ticket_count/tickets (old names).
+    await pgPool.query(`UPDATE lottery SET pot = jackpot, ticket_count = buyers, tickets = entries WHERE (pot IS NULL OR pot = 0) AND jackpot IS NOT NULL`);
+  } catch (e) { console.warn('[db] lottery legacy-column copy skipped:', e.message); }
 }
 
 async function mirrorTable(table) {
@@ -1498,7 +1607,11 @@ async function mirrorTable(table) {
       ON CONFLICT (${conflictTarget})
       DO UPDATE SET ${upsertCols}`;
     for (const row of rows) {
-      const values = pkCols.map((c) => row[c]);
+      // Values for ALL columns (placeholders = colNames.length). The old code
+      // only sent pkCols values → bind-message count mismatch → every periodic
+      // fullMirror upsert silently failed and NO periodic write ever reached
+      // Postgres (only direct queuePgWrite drains worked).
+      const values = colNames.map((c) => row[c]);
       try {
         await pgPool.query(sql, values);
         pgWritesOk++;
@@ -1619,6 +1732,49 @@ async function startRecoveryLoop() {
  * Table-by-table: wipe the SQLite table, then insert PG rows.
  * Returns { enabled, hydrated } — hydrated = total rows copied.
  */
+/* Null-safe fallbacks for hydration rows: columns that may be MISSING or NULL
+ * on legacy Postgres rows get sane defaults so the whole hydration never
+ * aborts on one bad value. */
+const PG_ROW_FALLBACKS = {
+  networth: (r) => (r.wallet != null && r.bank != null ? Number(r.wallet) + Number(r.bank) : 500000),
+  rank: () => 'bronze',
+  rank_valid_matches: () => 0,
+  rank_consecutive_losses: () => 0,
+  status: () => '',
+  status_reason: () => '',
+  status_until: () => 0,
+  hidden_until: () => 0,
+  last_seen: () => 0,
+  wallet: () => 0,
+  bank: () => 0,
+  username: () => '',
+  first_name: () => '',
+  role: () => 'mod',
+  password: () => '',
+  sent_count: () => 0,
+  active: () => 1,
+  completions: () => 0,
+  starts_at: () => 0,
+  used_count: () => 0,
+  creator_role: () => '',
+  leader_name: () => '',
+  target_name: () => '',
+  started_at: () => 0,
+  chat_title: () => '',
+  text: () => '',
+  is_command: () => 0,
+  created_at: () => 0,
+  expires_at: () => 0,
+  claimed: () => 0,
+  amount: () => 0,
+  max_uses: () => 1,
+  favorites: () => 0,
+  quantity: () => 1,
+  ticket_count: () => 0,
+  pot: () => 0,
+  tickets: () => '[]',
+};
+
 async function hydrateFromPg() {
   if (!PG_CONFIGURED || !pgPool || !pgReady) {
     return { enabled: false, hydrated: 0 };
@@ -1630,20 +1786,43 @@ async function hydrateFromPg() {
       const pk = TABLE_PKS[table];
       if (!cols || !pk) continue;
       const colNames = cols.split(', ').map((c) => c.split(' ')[0]);
-      const res = await pgPool.query(`SELECT ${colNames.join(', ')} FROM ${table}`);
-      if (!res.rows.length) continue;
-      prep(`DELETE FROM ${table}`).run();
-      const placeholders = colNames.map(() => '?').join(', ');
-      // INSERT OR REPLACE: Postgres (source of truth) always wins over a stale
-      // local cache row. Plain INSERT would fail/duplicate; OR REPLACE keeps
-      // the durable PG value authoritative on every hydration.
-      const insert = prep(`INSERT OR REPLACE INTO ${table} (${colNames.join(', ')}) VALUES (${placeholders})`);
-      for (const row of res.rows) {
-        try {
-          insert.run(...colNames.map((c) => (row[c] === null || row[c] === undefined ? null : row[c])));
-          hydrated++;
-        } catch (e) {
-          // Row-level conflict (e.g. legacy PK) — skip, non-fatal.
+      try {
+        const res = await pgPool.query(`SELECT ${colNames.join(', ')} FROM ${table}`);
+        if (!res.rows.length) continue;
+        prep(`DELETE FROM ${table}`).run();
+        const placeholders = colNames.map(() => '?').join(', ');
+        // INSERT OR REPLACE: Postgres (source of truth) always wins over a stale
+        // local cache row. Plain INSERT would fail/duplicate; OR REPLACE keeps
+        // the durable PG value authoritative on every hydration.
+        const insert = prep(`INSERT OR REPLACE INTO ${table} (${colNames.join(', ')}) VALUES (${placeholders})`);
+        for (const row of res.rows) {
+          try {
+            const values = colNames.map((c) => {
+              const v = row[c];
+              if (v === null || v === undefined) {
+                const fb = PG_ROW_FALLBACKS[c];
+                return fb ? fb(row) : null;
+              }
+              return v;
+            });
+            insert.run(...values);
+            hydrated++;
+          } catch (e) {
+            // Row-level conflict (e.g. legacy PK) — skip, non-fatal.
+          }
+        }
+      } catch (e) {
+        // Table-level failure (e.g. a column still missing): log and continue
+        // with the other tables — never abort the whole hydration. The DELETE
+        // above runs only after a successful SELECT, so a failed table keeps
+        // its current local rows.
+        console.warn(`[db] hydrateFromPg ${table}:`, e.message);
+        if (table === 'users') {
+          // The critical table failed — stay read-only (fail-closed): a stale
+          // SQLite users cache must never be mirrored over durable PG rows.
+          console.error('[db] hydrateFromPg users FAILED — keeping the bot read-only (no mirror) to protect Postgres data.');
+          pgHydrated = false;
+          return { enabled: false, hydrated };
         }
       }
     }
