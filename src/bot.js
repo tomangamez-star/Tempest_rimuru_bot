@@ -1186,6 +1186,210 @@ function createBot() {
     },
   };
 
+  /**
+   * /broadcast (alias /bd) — queue a bot-wide announcement (staff).
+   */
+  async function handleBroadcast(ctx) {
+    const actor = metaOf(ctx.msg);
+    if (!isStaff(ctx.userId)) {
+      return ctx.reply('Only the King and his moderators can broadcast. 👑', { title: '📣 BROADCAST', color: THEME.red });
+    }
+    const text = (ctx.args || []).join(' ').trim();
+    if (!text) {
+      return ctx.reply(
+        `Usage: <code>/broadcast [message]</code>\n\nOwner may broadcast any message. Moderators must keep it relevant to the Rimuru bot (economy, games, events, commands, etc.).`,
+        { title: '📣 BROADCAST', color: THEME.cyan, html: true }
+      );
+    }
+
+    // Owner bypasses the content gate entirely; moderators are gated.
+    if (!ctx.isOwner) {
+      const verdict = await broadcastMod.isRelevant(text);
+      if (!verdict.ok) {
+        db.logActivity('mod', `Rejected broadcast from ${actor.username || ctx.userId}: ${text.slice(0, 80)} (${verdict.reason})`, { target: ctx.userId });
+        return ctx.reply(
+          `🚫 <b>BROADCAST REJECTED</b>\n\nThat message isn't relevant to the Rimuru bot (${verdict.reason}). Moderators can only broadcast about the bot, its economy, games, events, commands, or maintenance.`,
+          { title: '📣 BROADCAST', color: THEME.red, html: true }
+        );
+      }
+    }
+
+    const rec = db.createBroadcast(text, 'all', ctx.userId);
+    dashboard.queueBroadcast(rec.id, rec.message, 'all');
+    db.logActivity('broadcast', `Broadcast queued by ${actor.username || ctx.userId}: ${text.slice(0, 60)}`, { broadcast_id: rec.id });
+    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'broadcast', 0, `target=all`);
+    await ctx.reply(
+      `📣 <b>BROADCAST QUEUED</b> (#${rec.id})\n\nDelivering to all known users & groups…`,
+      { title: '📣 BROADCAST', color: THEME.gold, html: true }
+    );
+  }
+
+  /**
+   * /set (alias /s) — create an event / mission / giveaway that goes LIVE in
+   * the bot. Staff (owner + moderators) may use it. Usage:
+   *   /set [type] [title] | [description] | [reward]
+   */
+  async function handleSet(ctx) {
+    const actor = metaOf(ctx.msg);
+    if (!isStaff(ctx.userId)) {
+      return ctx.reply('Only the King and his moderators can set events. 👑', { title: '🎯 SET EVENT', color: THEME.red });
+    }
+
+    const args = (ctx.args || []).join(' ').trim();
+    if (!args) {
+      return ctx.reply(
+        `Usage: <code>/set [type] [title] | [description] | [reward]</code>\n\n` +
+        `Types: ${broadcastMod.EVENT_TYPES.join(', ')}\n` +
+        `Example: <code>/set mission Heist Rimuru and survive | Steal from the vault | 100000</code>\n\n` +
+        `The event goes live immediately (players use <code>/mission [id]</code>) and is announced to all chats.`,
+        { title: '🎯 SET EVENT', color: THEME.cyan, html: true }
+      );
+    }
+
+    // Parse: /set [type] [title | desc | reward] — type optional (defaults to mission).
+    let type = 'mission';
+    let rest = args;
+    const first = args.split(/\s+/)[0].toLowerCase();
+    if (broadcastMod.EVENT_TYPES.includes(first)) {
+      type = first;
+      rest = args.slice(first.length).trim();
+    }
+    if (!rest) {
+      return ctx.reply('Give the event a title: <code>/set mission Heist Rimuru | description | 100000</code>', { title: '🎯 SET EVENT', color: THEME.red, html: true });
+    }
+
+    const parts = rest.split('|').map((p) => p.trim());
+    const title = parts[0] || 'New event';
+    const description = parts[1] || '';
+    const reward = Math.max(0, Math.floor(Number(String(parts[2] || '').replace(/,/g, '')) || 0));
+
+    const ev = db.createEvent({
+      title,
+      description,
+      type,
+      reward,
+      ends_at: 0,
+      created_by: ctx.userId,
+    });
+    db.logActivity('event', `Event created via /set: ${title} (${type})`, { event_id: ev.id });
+    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'set_event', 0, `${type}: ${title} reward=${reward}`);
+
+    // Announce through the SAME queue so /set events are actually delivered.
+    try {
+      const rec = db.createBroadcast(broadcastMod.buildEventAnnouncement(ev), 'all', ctx.userId);
+      dashboard.queueBroadcast(rec.id, rec.message, 'all');
+      db.logActivity('broadcast', `Event announced via /set: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
+    } catch (e) {
+      console.error('[set] announce failed:', e.message);
+    }
+
+    await ctx.reply(
+      `✅ <b>EVENT LIVE</b> (#${ev.id})\n\n${broadcastMod.buildEventAnnouncement(ev)}\n\nPlayers use <code>/missions</code> and <code>/mission ${ev.id}</code>.`,
+      { title: '🎯 SET EVENT', color: THEME.gold, html: true }
+    );
+  }
+
+  /**
+   * /attack — manually trigger Rimuru's attack/security event (owner only).
+   */
+  async function handleAttack(ctx) {
+    if (!ctx.isOwner) {
+      return ctx.reply('Only Rimuru (the King) can trigger an attack. 🐉👑', { title: '🐉 ATTACK', color: THEME.red });
+    }
+    const replied = repliedUser(ctx.msg);
+    if (replied) {
+      const raw = String((ctx.args || [])[0] || '').trim();
+      const n = Math.floor(Number(raw.replace(/,/g, '')));
+      if (!Number.isFinite(n) || n < 1) {
+        return ctx.reply(
+          'Usage: reply to a user with <code>/attack [number]</code> — e.g. <code>/attack 100</code>.',
+          { title: '🐉 ATTACK', color: THEME.red, html: true }
+        );
+      }
+      const r = await attack.deployAgainst(replied.id, n, { chatId: ctx.chatId, actorId: ctx.userId });
+      if (r && !r.ok) await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
+      return;
+    }
+    const r = await attack.trigger({ manual: true, force: true, chatId: ctx.chatId, actorId: ctx.userId });
+    if (r && r.message && !r.targetId) {
+      return;
+    }
+    if (r && !r.ok) {
+      await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
+    }
+  }
+
+  /**
+   * /FBI (alias /SWAT) — owner replies to a user to raid their home (owner only).
+   */
+  async function handleFbi(ctx) {
+    if (!ctx.isOwner) {
+      return ctx.reply('Only the King can deploy the FBI. 🚔👑', { title: '🚔 FBI', color: THEME.red });
+    }
+    const replied = repliedUser(ctx.msg);
+    if (!replied) {
+      return ctx.reply(
+        'Reply to a user with <code>/FBI</code> (or <code>/SWAT</code>) to raid their home. 🚔',
+        { title: '🚔 FBI', color: THEME.red, html: true }
+      );
+    }
+    const r = await fbi.deployAgainst(replied.id, { chatId: ctx.chatId, actorId: ctx.userId });
+    if (r && !r.ok) await ctx.reply(r.message, { title: '🚔 FBI', color: THEME.red, html: true });
+  }
+
+  /** Schedule heist execution after the 60s open window. */
+  function scheduleHeist(ctx, heistRow) {
+    const timer = heistTimers.get(heistRow.leader_id);
+    if (timer) clearTimeout(timer);
+    const t = setTimeout(async () => {
+      const h = db.getHeist(heistRow.leader_id);
+      if (h && h.status === 'open') {
+        const res = heist.execute(heistRow.leader_id);
+        await reply(
+          ctx.msg.chat.id,
+          `⏰ <b>The heist window closed.</b>\n\n${res.message}`,
+          { title: '🏦 HEIST RESULT', color: THEME.red, html: true }
+        );
+      }
+      heistTimers.delete(heistRow.leader_id);
+    }, config.heist.openWindowMs);
+    heistTimers.set(heistRow.leader_id, t);
+  }
+
+  /** /viewwaifu <number> (alias /vw) — send that waifu's photo + details. */
+  async function viewWaifu(ctx) {
+    const n = parseInt((ctx.args || [])[0], 10);
+    const row = db.getUserCharacterByIndex(ctx.userId, n);
+    if (!row) return ctx.reply('No waifu at that number. Use <code>/collection</code> to see your list.', { title: '💝 WAIFU', color: '#FF80AB', html: true });
+    if (depsPhoto) {
+      try {
+        await depsPhoto(ctx.chatId, row.image_url, { caption: waifu.detailCaption(row), parse_mode: 'HTML' });
+        return;
+      } catch (e) {
+        console.warn('[waifu] view sendPhoto failed:', e.message);
+      }
+    }
+    await ctx.reply(waifu.detailCaption(row), { title: '💝 WAIFU', color: '#FF80AB', html: true });
+  }
+
+  /** /viewchar <number> (alias /vc) — send that character's photo + details. */
+  async function viewChar(ctx) {
+    const n = parseInt((ctx.args || [])[0], 10);
+    const row = db.getHuntCharacterByIndex(ctx.userId, n);
+    if (!row) return ctx.reply('No character at that number. Use <code>/characters</code> to see your list.', { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+    const cached = db.getCachedHuntCharacter(row.character_id);
+    const full = cached || row;
+    if (depsPhoto) {
+      try {
+        await depsPhoto(ctx.chatId, row.image_url, { caption: hunt.detailCaption(full, { claimedAt: row.claimed_at }), parse_mode: 'HTML' });
+        return;
+      } catch (e) {
+        console.warn('[hunt] view sendPhoto failed:', e.message);
+      }
+    }
+    await ctx.reply(hunt.detailCaption(full, { claimedAt: row.claimed_at }), { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
+  }
+
   /* ---------- callback routing ---------- */
 
   async function onCallbackQuery(query) {

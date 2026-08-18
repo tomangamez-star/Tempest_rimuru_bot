@@ -118,42 +118,41 @@ async function main() {
   console.log(`🩺 Health server listening on :${config.port} (GET /health)`);
 
 
-  // ── HARD single-instance guard FIRST: acquire the Postgres advisory lock
-  // BEFORE initPersistence() starts any SQLite→PG write pipeline. Only the
-  // process that OWNS the lock may mirror; a standby (Render deploy overlap /
-  // stale instance) is set read-only so its stale local cache can never be
-  // pushed up over the primary's fresh writes ( the periodic rollback source).
   // ── Durability: hydrate SQLite from Postgres FIRST ────────────────────
-  // Earlier code expected db.initPersistence(). The current db.js exposes
-  // initPg/ensurePgTables/startRecoveryLoop/startMirrorLoop instead. Use
-  // those functions where available and preserve the same degraded-mode
-  // behavior instead of calling a nonexistent initPersistence().
+  // Restored boot flow (was broken by 08b1aeb, which skipped hydration):
+  //   initPg() → ensurePgTables() → hydrateFromPg() → [advisory lock]
+  //   → setSyncEnabled(true) → startMirrorLoop().
+  // Hydration MUST complete before the mirror loop starts: without it, a
+  // fresh SQLite cache is empty and the first mirror would push an empty DB
+  // over the real Postgres rows (the rollback bug). The advisory lock below
+  // then decides which instance may run the write pipeline.
 
   // Helper to safely call optional setSyncEnabled
   const safeSetSyncEnabled = (v) => { if (db.setSyncEnabled) try { db.setSyncEnabled(v); } catch (e) { /* ignore */ } };
 
   let persisted = { enabled: false, hydrated: 0 };
   if (db.initPersistence) {
-    // If the module provides the old compatibility function, use it.
+    // Restored: initPersistence() = initPg + ensurePgTables + hydrateFromPg.
+    // Hydration runs BEFORE any mirror write (startMirrorLoop is only started
+    // after the advisory lock is acquired below, so writes are gated).
     try {
       persisted = await db.initPersistence();
+      // startRecoveryLoop() keeps the bot alive if PG drops mid-run.
+      if (db.startRecoveryLoop) db.startRecoveryLoop();
     } catch (e) {
-      console.warn('[db] initPersistence() compatibility wrapper failed:', e.message);
+      console.warn('[db] initPersistence() failed:', e.message);
       persisted = { enabled: false, hydrated: 0 };
     }
   } else if (db.initPg) {
-    // Use the newer API: attempt to initialize Postgres, create tables,
-    // and start recovery/mirror loops. We cannot meaningfully report a
-    // hydrated row count here (older initPersistence returned that), so
-    // hydrate count remains 0.
+    // Fallback: newer API without the hydration entry point.
     const ok = await db.initPg();
     if (ok) {
       if (db.ensurePgTables) await db.ensurePgTables();
-      if (db.startRecoveryLoop) db.startRecoveryLoop();
-      if (db.startMirrorLoop) db.startMirrorLoop();
+      if (db.hydrateFromPg) {
+        try { persisted = await db.hydrateFromPg(); } catch (e) { persisted = { enabled: false, hydrated: 0 }; }
+      }
       const info = db.syncInfo ? db.syncInfo() : {};
-      persisted.enabled = !!info.configured;
-      persisted.hydrated = 0;
+      persisted.enabled = persisted.enabled || !!info.configured;
     } else {
       const info = db.syncInfo ? db.syncInfo() : { configured: false };
       if (info.configured && !info.ready) {
@@ -161,12 +160,11 @@ async function main() {
         // but do not start the bot or accept economy writes until PG is ready.
         standby = true;
         safeSetSyncEnabled(false);
-        // DATABASE_URL is set but Postgres is not connected yet — say it LOUDLY.
         console.error(
           '❌❌❌ POSTGRES PERSISTENCE IS DOWN ❌❌❌\n' +
           'DATABASE_URL is set but the bot could NOT connect to Postgres.\n' +
           'Balances will NOT survive redeploys until this is fixed.\n' +
-          `  host=${info.host} port=${info.port} failures=${info.failures} lastError=${info.lastPgError}\n` +
+          `  host=${info.host} port=${info.port} lastError=${info.lastPgError}\n` +
           'Retrying in the background every 15s — check the Render env var value.'
         );
       }
@@ -189,6 +187,12 @@ async function main() {
     if (!standby && db.acquireInstanceLock) {
       standby = !(await db.acquireInstanceLock(PG_LOCK_KEY));
       safeSetSyncEnabled(!standby);
+      // The mirror loop (SQLite→PG) may only run on the primary (lock holder).
+      // Starting it here — AFTER hydration AND lock acquisition — guarantees
+      // a standby's stale local cache can never overwrite the primary's rows.
+      if (!standby) {
+        if (db.startMirrorLoop) db.startMirrorLoop();
+      }
       if (standby) {
         console.warn(
           `[instance] ${INSTANCE_ID || process.pid} is STANDBY — another instance holds the bot lock. ` +
@@ -274,6 +278,7 @@ async function main() {
       if (acquired) {
         standby = false;
         safeSetSyncEnabled(true);
+        if (db.startMirrorLoop) db.startMirrorLoop();
         if (primaryRetryTimer) {
           clearInterval(primaryRetryTimer);
           primaryRetryTimer = null;

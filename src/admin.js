@@ -6,9 +6,16 @@
  *  /sus [reason] — can chat in group but can't gamble / talk to Rimuru
  *  /mute [reason] — can't talk at all (group messages are answered with silence)
  * All show reason + duration when they end.
+ *
+ * Staff handlers (health, debug, setBalance, addCoins, stop, run, restart,
+ * ban, suspend, mute, unban, unsus, unmute, hide, xleaderboard) live here —
+ * bot.js delegates to these.
  */
 const db = require('./db');
 const config = require('./config');
+const backup = require('./backup');
+const leaderboard = require('./leaderboard');
+const { fmt, humanDuration } = require('./utils');
 
 const STATUS = {
   BANNED: 'banned',
@@ -54,7 +61,7 @@ function liftPenalty(userId) {
 function checkInteract(userId, { gambling = true } = {}) {
   const u = db.getUser(userId);
   if (!u) return { allowed: true };
-  if (String(userId) === config.ownerId) return { allowed: true };
+  if (String(userId) === String(config.ownerId)) return { allowed: true };
 
   const now = Date.now();
   const expired = u.status_until > 0 && u.status_until <= now;
@@ -92,10 +99,339 @@ function parseDuration(str) {
   return n * mult;
 }
 
+/* ===================== staff helpers ===================== */
+
+function isOwner(userId) {
+  return String(userId) === String(config.ownerId);
+}
+
+function isStaff(userId) {
+  if (isOwner(userId)) return true;
+  try {
+    return !!db.getAdminUser(Number(userId));
+  } catch (e) {
+    return false;
+  }
+}
+
+function metaOf(msg) {
+  const from = (msg && msg.from) || {};
+  return { username: from.username || '', first_name: from.first_name || '' };
+}
+
+function repliedUser(msg) {
+  const r = (msg && msg.reply_to_message) || null;
+  if (!r || !r.from) return null;
+  return r.from;
+}
+
+function splitDurReason(args) {
+  if (!args || !args.length) return { dur: null, reason: '' };
+  if (parseDuration(args[0])) {
+    return { dur: args[0], reason: args.slice(1).join(' ') };
+  }
+  return { dur: null, reason: args.join(' ') };
+}
+
+function gateAllowed() {
+  // Membership gate is enforced in bot.js; admin handlers are staff-gated here.
+  return { ok: true };
+}
+
+/* ===================== staff handlers ===================== */
+
+async function health(ctx, opts = {}) {
+  try {
+    const pkg = require('../package.json');
+    const stats = db.dashboardStats();
+    const mem = process.memoryUsage();
+    const pInfo = db.syncInfo();
+    const pgStatus = pInfo.configured
+      ? (pInfo.ready && pInfo.connected ? `✅ connected (${pInfo.host}:${pInfo.port})` : `❌ ${pInfo.host}:${pInfo.port} — ${pInfo.lastPgError || 'connecting…'}`)
+      : 'off (SQLite-only, ephemeral)';
+    const verified = pInfo.configured
+      ? `✅ writes: ${pInfo.writesOk} · failures: ${pInfo.writesFailed} · last write ${pInfo.lastWriteAt ? `${Math.floor((Date.now() - pInfo.lastWriteAt) / 1000)}s ago` : 'never'} · verified ${pInfo.lastVerifyAt ? `${Math.floor((Date.now() - pInfo.lastVerifyAt) / 1000)}s ago` : 'never'}`
+      : 'n/a';
+    const lines = [
+      `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${opts.commitHash || 'n/a'})`,
+      `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
+      `🏓 <b>Ping</b>: ${db.ping()}ms`,
+      `👥 <b>Users</b>: ${fmt(stats.users || 0)}`,
+      `💰 <b>Coins in circulation</b>: ${fmt(stats.totalCoins || 0)}`,
+      `🖥 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'} · hydrated: ${pInfo.hydrated ? 'yes' : 'no'})` : ''}`,
+      `✔️ <b>Verified writes</b>: ${verified}`,
+      `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
+      `⚠️ <b>Last error</b>: ${opts.lastError ? String(opts.lastError.message || opts.lastError).slice(0, 200) : 'none'}`,
+    ];
+    await ctx.reply(lines.join('\n'), { title: '👍 HEALTH', color: '#00BCD4', html: true });
+  } catch (e) {
+    await ctx.reply(`⚠️ Health check failed: ${e.message}`, { title: '👍 HEALTH', color: '#F44336' });
+  }
+}
+
+async function debug(ctx, opts = {}) {
+  if (!isStaff(ctx.userId)) {
+    return ctx.reply('Only staff can do that. 👑', { title: '🔒 STAFF ONLY', color: '#F44336' });
+  }
+  try {
+    const pkg = require('../package.json');
+    const stats = db.dashboardStats();
+    const cdCount = db.getCooldownCount();
+    const mem = process.memoryUsage();
+    const pInfo = db.syncInfo();
+    const pgStatus = pInfo.configured
+      ? (pInfo.ready && pInfo.connected ? `✅ connected (${pInfo.host}:${pInfo.port})` : `❌ ${pInfo.host}:${pInfo.port} — ${pInfo.lastPgError || 'connecting…'}`)
+      : 'off (SQLite-only, ephemeral)';
+    const verified = pInfo.configured
+      ? `✅ writes: ${pInfo.writesOk} · failures: ${pInfo.writesFailed} · last write ${pInfo.lastWriteAt ? `${Math.floor((Date.now() - pInfo.lastWriteAt) / 1000)}s ago` : 'never'} · verified ${pInfo.lastVerifyAt ? `${Math.floor((Date.now() - pInfo.lastVerifyAt) / 1000)}s ago` : 'never'}`
+      : 'n/a';
+    const lines = [
+      `🤖 <b>Version</b>: ${pkg.version || 'n/a'} (${opts.commitHash || 'n/a'})`,
+      `⏱ <b>Uptime</b>: ${humanDuration(Math.floor(process.uptime() * 1000))}`,
+      `🏓 <b>Ping</b>: ${db.ping()}ms`,
+      `👥 <b>Users</b>: ${fmt(stats.users || 0)}`,
+      `💰 <b>Coins in circulation</b>: ${fmt(stats.totalCoins || 0)}`,
+      `⏳ <b>Active cooldowns</b>: ${fmt(cdCount)}`,
+      `🖥 <b>Persistence</b>: ${pgStatus}${pInfo.configured ? ` (mirrors: ${pInfo.lastMirrorAt ? 'running' : 'pending'} · hydrated: ${pInfo.hydrated ? 'yes' : 'no'})` : ''}`,
+      `✔️ <b>Verified writes</b>: ${verified}`,
+      `Auto-backup: ${(() => { try { const bs = backup.getBackupState(); return `on · keep ${bs.keep} · ran ${bs.runCount} · suspect ${bs.suspectCount}`; } catch (e) { return 'n/a'; } })()}`,
+      `💾 <b>Memory</b>: rss ${fmt(Math.round(mem.rss / 1048576))} MB · heap ${fmt(Math.round(mem.heapUsed / 1048576))} MB`,
+      `⚠️ <b>Last error</b>: ${opts.lastError ? String(opts.lastError.message || opts.lastError).slice(0, 200) : 'none'}`,
+    ];
+    const actor = metaOf(ctx.msg);
+    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'debug', 0, 'staff debug dump');
+    db.logActivity('mod', `/debug by ${actor.username || ctx.userId}`, { target: ctx.userId });
+    await ctx.reply(lines.join('\n'), { title: '🛠 DEBUG', color: '#00BCD4', html: true });
+  } catch (e) {
+    await ctx.reply(`⚠️ Debug failed: ${e.message}`, { title: '🛠 DEBUG', color: '#F44336' });
+  }
+}
+
+async function setBalance(ctx) {
+  const r = staffCoin(ctx, 'set');
+  await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
+}
+
+async function addCoins(ctx) {
+  const r = staffCoin(ctx, 'add');
+  await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
+}
+
+function staffCoin(ctx, mode) {
+  if (!isStaff(ctx.userId)) {
+    return { title: '🔒 STAFF ONLY', color: '#F44336', message: 'Only the King and his moderators can do that. 👑' };
+  }
+  const raw = String((ctx.args || [])[0] || '').trim();
+  const amt = Math.floor(Number(raw.replace(/,/g, '')));
+  const minAmount = mode === 'add' ? 1 : 0;
+  if (!Number.isFinite(amt) || amt < minAmount) {
+    return {
+      title: mode === 'add' ? '➕ ADDCOIN' : '🎯 SET BALANCE',
+      color: '#F44336',
+      message: mode === 'add'
+        ? `Usage: <code>/addcoin [amount] [@username or reply]</code> — amount must be a positive number.`
+        : `Usage: <code>/sb [amount] [@username or reply]</code> — amount must be zero or greater (0 clears wallet AND bank).`,
+    };
+  }
+  let targetId = ctx.userId;
+  const replied = repliedUser(ctx.msg);
+  const mention = (ctx.args || []).find((a) => String(a).startsWith('@'));
+  if (replied) {
+    targetId = replied.id;
+  } else if (mention) {
+    const uname = String(mention).slice(1).toLowerCase();
+    const row = db.findUserByUsername(uname);
+    if (!row) {
+      return { title: '❓ UNKNOWN USER', color: '#F44336', message: `No user found for <code>@${uname}</code> — they must /start the bot first.` };
+    }
+    targetId = row.user_id;
+  }
+  const actor = metaOf(ctx.msg);
+  const target = db.getOrCreateUser(targetId);
+  if (mode === 'add') db.addWallet(targetId, amt);
+  else db.setNetworth(targetId, amt);
+  const after = db.getUser(targetId);
+  db.logActivity('admin', `/${mode} ${fmt(amt)} -> ${target.first_name || targetId} by ${actor.username || ctx.userId}`, { target: targetId, actor: ctx.userId });
+  return {
+    title: mode === 'add' ? '➕ COINS ADDED' : '🎯 BALANCE SET',
+    color: '#FFD700',
+    message: (mode === 'add'
+      ? `➕ <b>Added</b> ${fmt(amt)} coins to `
+      : `🎯 <b>Set</b> networth to <b>${fmt(amt)}</b> (wallet ${fmt(amt)} · bank 0) for `) +
+      `<a href="tg://user?id=${targetId}">${target.first_name || targetId}</a>.\n` +
+      `💳 Wallet: <b>${fmt(after.wallet)}</b> · 🏦 Bank: <b>${fmt(after.bank)}</b> · 💎 Net: <b>${fmt(after.wallet + after.bank)}</b>`,
+  };
+}
+
+async function stop(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 PAUSE', color: '#F44336' });
+  db.setBotPaused(true);
+  db.logActivity('mod', `/stop by ${metaOf(ctx.msg).username || ctx.userId} — bot PAUSED`, { target: ctx.userId });
+  await ctx.reply(
+    `🔒 <b>RIMURU PAUSED</b>\n\n` +
+    `All non-owner users are now ignored — no commands, no games, no button taps.\n` +
+    `The pause is <b>persisted</b> and survives redeploys.\n\n` +
+    `Resume with <code>/run</code>. The house is closed. 🚪`,
+    { title: '🔒 PAUSE', color: '#F44336', html: true }
+  );
+}
+
+async function run(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '▶️ RESUME', color: '#F44336' });
+  db.setBotPaused(false);
+  db.logActivity('mod', `/run by ${metaOf(ctx.msg).username || ctx.userId} — bot RESUMED`, { target: ctx.userId });
+  await ctx.reply(
+    `▶️ <b>RIMURU RESUMED</b>\n\n` +
+    `The house is open again. Welcome back, mortals. 🎰`,
+    { title: '▶️ RESUME', color: '#FFD700', html: true }
+  );
+}
+
+async function restart(ctx) {
+  if (!isStaff(ctx.userId)) return ctx.reply('Only the King and his moderators can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const actor = metaOf(ctx.msg);
+  db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'restart', 0, 'full state reset');
+  db.logActivity('mod', `/restart by ${actor.username || ctx.userId}`, { target: ctx.userId });
+  const cleared = [];
+  try {
+    const mines = require('./games/mines');
+    const blackjack = require('./games/blackjack');
+    const higherlower = require('./games/higherlower');
+    const race = require('./games/race');
+    for (const [userId, s] of mines.sessions || []) { s.alive = false; cleared.push(`mines:${userId}`); }
+    if (mines.sessions) mines.sessions.clear();
+    for (const [userId, s] of blackjack.sessions || []) { s.done = true; cleared.push(`blackjack:${userId}`); }
+    if (blackjack.sessions) blackjack.sessions.clear();
+    for (const [userId, s] of higherlower.sessions || []) { s.alive = false; cleared.push(`higherlower:${userId}`); }
+    if (higherlower.sessions) higherlower.sessions.clear();
+    for (const userId of race.sessions ? race.sessions.keys() : []) cleared.push(`race:${userId}`);
+    if (race.sessions) race.sessions.clear();
+  } catch (e) { /* game modules optional */ }
+
+  try {
+    const openHeists = db.getOpenHeists();
+    for (const row of openHeists) {
+      db.deleteHeist(row.leader_id);
+      cleared.push(`heist:${row.leader_id}`);
+    }
+    const cdRows = db.db.prepare('SELECT user_id, action FROM cooldowns').all();
+    for (const row of cdRows) cleared.push(`cd:${row.user_id}:${row.action}`);
+    db.clearAllCooldowns();
+    db.saveLottery((config.lottery && config.lottery.baseJackpot) || 5000000, 0, []);
+    cleared.push('lottery');
+  } catch (e) { /* non-fatal */ }
+
+  await ctx.reply(
+    `🔄 <b>RESTART COMPLETE</b>\n\n` +
+    `Cleared <b>${cleared.length}</b> active state entries:\n` +
+    `• Active games: mines, blackjack, higher/lower, race\n` +
+    `• Open heists & timers\n` +
+    `• All cooldowns\n` +
+    `• Lottery pot reset\n\n` +
+    `The house is clean. Everything starts fresh. ✨`,
+    { title: '🔒 ADMIN — RESTART', color: '#FFD700', html: true }
+  );
+}
+
+async function ban(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to someone with <code>/ban [reason]</code>. 🎯', { title: '🔒 ADMIN', color: '#F44336', html: true });
+  const { dur, reason } = splitDurReason(ctx.args);
+  const r = applyPenalty(target.id, STATUS.BANNED, reason, dur);
+  await ctx.reply(r.message, { title: '🔒 ADMIN — BAN', color: '#F44336' });
+}
+
+async function suspend(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to someone with <code>/sus [reason]</code>. 🎯', { title: '🔒 ADMIN', color: '#F44336', html: true });
+  const { dur, reason } = splitDurReason(ctx.args);
+  const r = applyPenalty(target.id, STATUS.SUSPECTED, reason, dur);
+  await ctx.reply(r.message, { title: '🔒 ADMIN — SUSPEND', color: '#F44336' });
+}
+
+async function mute(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to someone with <code>/mute [reason]</code>. 🎯', { title: '🔒 ADMIN', color: '#F44336', html: true });
+  const { dur, reason } = splitDurReason(ctx.args);
+  const r = applyPenalty(target.id, STATUS.MUTED, reason, dur);
+  await ctx.reply(r.message, { title: '🔒 ADMIN — MUTE', color: '#F44336' });
+}
+
+async function unban(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to someone with <code>/unban</code>. 🎯', { title: '🔒 ADMIN', color: '#F44336', html: true });
+  const r = liftPenalty(target.id);
+  await ctx.reply(r.message, { title: '🔒 ADMIN — UNBAN', color: '#00BCD4' });
+}
+
+async function unsus(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to someone with <code>/unsus</code>. 🎯', { title: '🔒 ADMIN', color: '#F44336', html: true });
+  const r = liftPenalty(target.id);
+  await ctx.reply(r.message, { title: '🔒 ADMIN — UNSUSPEND', color: '#00BCD4' });
+}
+
+async function unmute(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can do that. 👑', { title: '🔒 ADMIN', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to someone with <code>/unmute</code>. 🎯', { title: '🔒 ADMIN', color: '#F44336', html: true });
+  const r = liftPenalty(target.id);
+  await ctx.reply(r.message, { title: '🔒 ADMIN — UNMUTE', color: '#00BCD4' });
+}
+
+async function hide(ctx) {
+  const cd = require('./cooldowns');
+  const eco = require('./economy');
+  const g = cd.guard(ctx.userId, 'hide', 'Hiding');
+  if (g.blocked) return ctx.reply(g.message, { title: '💀 HIDE', color: '#F44336' });
+  const price = (config.hide && config.hide.price) || 5000;
+  const charge = eco.chargeWallet(ctx.userId, price, 'hide');
+  if (!charge.ok) return ctx.reply(charge.message, { title: '💀 HIDE', color: '#F44336' });
+  db.setHidden(ctx.userId, Date.now() + ((config.hide && config.hide.durationMs) || 60000));
+  cd.start(ctx.userId, 'hide', (config.cooldowns && config.cooldowns.hide) || 60000);
+  db.logActivity('user', `💀 /hide by ${metaOf(ctx.msg).username || ctx.userId}`, { target: ctx.userId, cost: price });
+  await ctx.reply(
+    `💀 <b>YOU VANISHED</b>\n\n` +
+    `You paid <b>${fmt(price)}</b> to slip into the shadows.\n` +
+    `For <b>60 seconds</b> nobody can <code>/rob</code> or <code>/heist</code> you.`,
+    { title: '💀 HIDE', color: '#00BCD4', html: true }
+  );
+}
+
+async function xleaderboard(ctx) {
+  if (!isStaff(ctx.userId)) {
+    return ctx.reply('Only staff can view the extended leaderboard. 👑', { title: '🔒 STAFF ONLY', color: '#F44336' });
+  }
+  const n = Number(String((ctx.args || [])[0] || '100').replace(/,/g, ''));
+  const limit = Number.isFinite(n) && n > 0 ? Math.min(100, Math.floor(n)) : 100;
+  await ctx.reply(leaderboard.renderCount(limit), { title: '🏆 EXTENDED LEADERBOARD', color: '#FFD700', html: true });
+}
+
 module.exports = {
   STATUS,
   applyPenalty,
   liftPenalty,
   checkInteract,
   parseDuration,
+  // Staff handlers (bot.js delegates)
+  health,
+  debug,
+  setBalance,
+  addCoins,
+  stop,
+  run,
+  restart,
+  ban,
+  suspend,
+  mute,
+  unban,
+  unsus,
+  unmute,
+  hide,
+  xleaderboard,
 };

@@ -1,56 +1,32 @@
 'use strict';
 /**
- * Rimuru Tempest Casino — Database layer.
- * SQLite (hot synchronous cache) + Postgres mirror (durable persistence).
+ * Rimuru Tempest Casino — database layer.
+ * SQLite (better-sqlite3) is the fast read/write store; Postgres mirrors it
+ * for durable persistence across Render redeploys.
  *
- * ARCHITECTURE
- * ============
- * Every write goes to SQLite FIRST (synchronous, always available), then
- * is QUEUED for Postgres mirroring. The mirror loop drains the queue in
- * FIFO order with a 10-second query timeout. On boot, if Postgres is
- * configured and reachable, the SQLite cache is REHYDRATED from Postgres
- * so balances/leaderboard/mods survive redeploys.
+ * STARTUP ORDER (index.js drives it):
+ *   1. initPg()                  — connect to Postgres
+ *   2. ensurePgTables()          — create mirror tables if missing
+ *   3. hydrateFromPg()           — HYDRATE SQLite FROM Postgres (durability!).
+ *                                  Never let a fresh SQLite cache overwrite
+ *                                  durable PG rows.
+ *   4. acquireInstanceLock()     — advisory lock; only the lock holder may
+ *                                  run the SQLite→PG mirror.
+ *   5. setSyncEnabled(true)      — enable the write pipeline on the primary.
  *
- * PERSISTENCE DEGRADED MODE
- * =========================
- * When Postgres is configured but unreachable (timeout, connection refused,
- * etc.) the bot enters persistence-degraded/read-only mode. State-changing
- * Telegram commands are blocked at the router level before touching SQLite.
- * The bot stays alive and /health remains reachable. Background recovery
- * retries the connection every 15 seconds. Once Postgres is reachable again,
- * the cache is rehydrated and the write pipeline is re-enabled.
- *
- * ADVISORY LOCK (single-instance guard)
- * ======================================
- * A dedicated PoolClient is checked out for the lifetime of the primary
- * process. That client owns a PostgreSQL advisory lock (pg_try_advisory_lock).
- * A 10-second heartbeat verifies the session is alive. Losing the heartbeat
- * disables the write pipeline. This prevents two Render instances from
- * writing to Postgres simultaneously.
- *
- * TABLE REGISTRATION
- * ==================
- * Every table that should be mirrored to Postgres must be registered in
- * TABLE_COLS (column names) and TABLE_PKS (primary key column names).
- * The mirror loop uses these to build INSERT ... ON CONFLICT upserts.
+ * The mirror (SQLite→PG) is gated on pgWritable && pgLockHeld && syncEnabled.
  */
-
-const Database = require('better-sqlite3');
 const path = require('path');
 const fs = require('fs');
+const Database = require('better-sqlite3');
 const config = require('./config');
 
-/* ===================== SQLite setup ===================== */
+const DATA_DIR = path.join(__dirname, '..', 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'rimuru.db');
 
-const dbDir = path.dirname(path.resolve(config.dbPath));
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
-}
-
-const db = new Database(config.dbPath);
+const db = new Database(DB_PATH);
 db.pragma('journal_mode = WAL');
-db.pragma('synchronous = NORMAL');
-db.pragma('busy_timeout = 5000');
 db.pragma('foreign_keys = ON');
 
 /* ===================== Postgres setup ===================== */
@@ -74,6 +50,8 @@ let pgRecoveryTimer = null;
 let pgHeartbeatTimer = null;
 let pgLockHeld = false;
 let pgDegraded = false;
+let syncEnabled = true; // SQLite writes allowed (mirror pipeline on)
+let pgHydrated = false; // Postgres → SQLite hydration completed
 
 const PG_CONFIGURED = !!config.databaseUrl;
 
@@ -95,6 +73,10 @@ if (PG_CONFIGURED) {
     pgPool.on('error', (err) => {
       console.error('[db] PG pool error:', err.message);
       pgLastError = err;
+      pgConnected = false;
+      pgReady = false;
+      pgWritable = false;
+      pgDegraded = true;
     });
   } catch (e) {
     console.error('[db] PG init error:', e.message);
@@ -118,6 +100,7 @@ const TABLE_COLS = {
   game_sessions: 'user_id, game, state, expires_at',
   backup_meta: 'id, filename, ts, user_count, total_coins, suspect, source',
   backup_data: 'id, backup_id, table_name, row_count, data',
+  backups: 'id, filename, data, user_count, created_by, created_at',
   broadcast_queue: 'id, message, target, status, created_by, created_at',
   events: 'id, title, description, type, reward, ends_at, created_by, created_at',
   mission_progress: 'user_id, mission_id, attempts, completed, last_attempt',
@@ -147,6 +130,7 @@ const TABLE_PKS = {
   game_sessions: 'user_id, game',
   backup_meta: 'id',
   backup_data: 'id',
+  backups: 'id',
   broadcast_queue: 'id',
   events: 'id',
   mission_progress: 'user_id, mission_id',
@@ -178,6 +162,7 @@ function createTables() {
       created_at TEXT DEFAULT (datetime('now')),
       updated_at TEXT DEFAULT (datetime('now')),
       status TEXT DEFAULT '',
+      status_reason TEXT DEFAULT '',
       status_until INTEGER DEFAULT 0,
       hidden_until INTEGER DEFAULT 0,
       last_seen INTEGER DEFAULT 0
@@ -260,17 +245,25 @@ function createTables() {
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       filename TEXT,
       ts INTEGER,
-      user_count INTEGER DEFAULT 0,
-      total_coins INTEGER DEFAULT 0,
+      user_count INTEGER,
+      total_coins INTEGER,
       suspect INTEGER DEFAULT 0,
-      source TEXT DEFAULT 'sqlite'
+      source TEXT DEFAULT 'local'
     );
     CREATE TABLE IF NOT EXISTS backup_data (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       backup_id INTEGER,
       table_name TEXT,
-      row_count INTEGER DEFAULT 0,
+      row_count INTEGER,
       data TEXT
+    );
+    CREATE TABLE IF NOT EXISTS backups (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      filename TEXT NOT NULL,
+      data TEXT NOT NULL,
+      user_count INTEGER NOT NULL DEFAULT 0,
+      created_by INTEGER DEFAULT 0,
+      created_at INTEGER NOT NULL
     );
     CREATE TABLE IF NOT EXISTS broadcast_queue (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -283,7 +276,7 @@ function createTables() {
     CREATE TABLE IF NOT EXISTS events (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       title TEXT,
-      description TEXT,
+      description TEXT DEFAULT '',
       type TEXT DEFAULT 'mission',
       reward INTEGER DEFAULT 0,
       ends_at INTEGER DEFAULT 0,
@@ -295,7 +288,7 @@ function createTables() {
       mission_id INTEGER,
       attempts INTEGER DEFAULT 0,
       completed INTEGER DEFAULT 0,
-      last_attempt TEXT,
+      last_attempt INTEGER DEFAULT 0,
       PRIMARY KEY (user_id, mission_id)
     );
     CREATE TABLE IF NOT EXISTS redeem_codes (
@@ -316,7 +309,7 @@ function createTables() {
       character_id TEXT PRIMARY KEY,
       name TEXT,
       series TEXT DEFAULT '',
-      image_url TEXT,
+      image_url TEXT DEFAULT '',
       bio TEXT DEFAULT '',
       favorites INTEGER DEFAULT 0,
       rarity TEXT DEFAULT 'common',
@@ -325,10 +318,10 @@ function createTables() {
     CREATE TABLE IF NOT EXISTS waifu_claims (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER,
-      character_id TEXT,
+      character_id TEXT UNIQUE,
       name TEXT,
       series TEXT DEFAULT '',
-      image_url TEXT,
+      image_url TEXT DEFAULT '',
       rarity TEXT DEFAULT 'common',
       claimed_at TEXT DEFAULT (datetime('now'))
     );
@@ -336,11 +329,11 @@ function createTables() {
       character_id TEXT PRIMARY KEY,
       name TEXT,
       series TEXT DEFAULT '',
-      image_url TEXT,
+      image_url TEXT DEFAULT '',
       bio TEXT DEFAULT '',
       favorites INTEGER DEFAULT 0,
       rarity TEXT DEFAULT 'common',
-      expires_at INTEGER,
+      expires_at INTEGER DEFAULT 0,
       chat_id INTEGER DEFAULT 0,
       claimed INTEGER DEFAULT 0
     );
@@ -348,7 +341,7 @@ function createTables() {
       character_id TEXT PRIMARY KEY,
       name TEXT,
       series TEXT DEFAULT '',
-      image_url TEXT,
+      image_url TEXT DEFAULT '',
       bio TEXT DEFAULT '',
       favorites INTEGER DEFAULT 0,
       rarity TEXT DEFAULT 'common',
@@ -357,10 +350,10 @@ function createTables() {
     CREATE TABLE IF NOT EXISTS hunt_claims (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       user_id INTEGER,
-      character_id TEXT,
+      character_id TEXT UNIQUE,
       name TEXT,
       series TEXT DEFAULT '',
-      image_url TEXT,
+      image_url TEXT DEFAULT '',
       rarity TEXT DEFAULT 'common',
       claimed_at TEXT DEFAULT (datetime('now'))
     );
@@ -368,11 +361,11 @@ function createTables() {
       character_id TEXT PRIMARY KEY,
       name TEXT,
       series TEXT DEFAULT '',
-      image_url TEXT,
+      image_url TEXT DEFAULT '',
       bio TEXT DEFAULT '',
       favorites INTEGER DEFAULT 0,
       rarity TEXT DEFAULT 'common',
-      expires_at INTEGER,
+      expires_at INTEGER DEFAULT 0,
       chat_id INTEGER DEFAULT 0,
       claimed INTEGER DEFAULT 0
     );
@@ -387,34 +380,54 @@ function createTables() {
       value TEXT,
       updated_at TEXT DEFAULT (datetime('now'))
     );
+    CREATE TABLE IF NOT EXISTS time_wallet (
+      user_id INTEGER,
+      expires_at INTEGER DEFAULT 0,
+      amount INTEGER DEFAULT 0,
+      PRIMARY KEY (user_id, expires_at)
+    );
   `);
+
+  // Add status_reason column to existing installs (idempotent migration).
+  try {
+    db.exec(`ALTER TABLE users ADD COLUMN status_reason TEXT DEFAULT ''`);
+  } catch (e) { /* already exists */ }
 }
 
 createTables();
 
 /* ===================== HELPER: prepared statements ===================== */
 
-const stmts = {};
 function prep(sql) {
-  if (!stmts[sql]) stmts[sql] = db.prepare(sql);
-  return stmts[sql];
+  return db.prepare(sql);
 }
 
 /* ===================== USER / ECONOMY ===================== */
 
 function getOrCreateUser(userId, meta = {}) {
-  let row = prep('SELECT * FROM users WHERE user_id = ?').get(userId);
-  if (!row) {
-    prep('INSERT INTO users (user_id, username, first_name, wallet, bank, networth) VALUES (?, ?, ?, ?, ?, ?)').run(
-      userId, meta.username || '', meta.first_name || '', config.startBalance, 0, config.startBalance
-    );
-    row = prep('SELECT * FROM users WHERE user_id = ?').get(userId);
-  } else if (meta.username || meta.first_name) {
-    prep('UPDATE users SET username = ?, first_name = ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(
-      meta.username || row.username, meta.first_name || row.first_name, userId
-    );
+  const row = prep('SELECT * FROM users WHERE user_id = ?').get(userId);
+  if (row) {
+    // Update mutable display fields only when provided; keep economy intact.
+    const updates = [];
+    const params = [];
+    if (meta.username && meta.username !== row.username) {
+      updates.push('username = ?');
+      params.push(meta.username);
+    }
+    if (meta.first_name && meta.first_name !== row.first_name) {
+      updates.push('first_name = ?');
+      params.push(meta.first_name);
+    }
+    if (updates.length) {
+      params.push(userId);
+      prep(`UPDATE users SET ${updates.join(', ')}, updated_at = datetime('now') WHERE user_id = ?`).run(...params);
+    }
+    return prep('SELECT * FROM users WHERE user_id = ?').get(userId);
   }
-  return row;
+  prep(
+    'INSERT INTO users (user_id, username, first_name, wallet, bank, networth) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(userId, meta.username || '', meta.first_name || '', config.startBalance, 0, config.startBalance);
+  return prep('SELECT * FROM users WHERE user_id = ?').get(userId);
 }
 
 function getUser(userId) {
@@ -423,6 +436,10 @@ function getUser(userId) {
 
 function addWallet(userId, amount) {
   prep('UPDATE users SET wallet = wallet + ?, networth = networth + ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(amount, amount, userId);
+}
+
+function addBank(userId, amount) {
+  prep('UPDATE users SET bank = bank + ?, networth = networth + ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(amount, amount, userId);
 }
 
 function setNetworth(userId, amount) {
@@ -437,8 +454,13 @@ function setBank(userId, amount) {
   prep('UPDATE users SET bank = ?, networth = wallet + ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(amount, amount, userId);
 }
 
+function getNetWorth(userId) {
+  const u = prep('SELECT networth, wallet, bank FROM users WHERE user_id = ?').get(userId);
+  return u ? (u.networth || u.wallet + u.bank) : 0;
+}
+
 function findUserByUsername(username) {
-  return prep('SELECT * FROM users WHERE LOWER(username) = ?').get(String(username || '').toLowerCase());
+  return prep('SELECT * FROM users WHERE lower(username) = lower(?) LIMIT 1').get(username);
 }
 
 function leaderboard(limit = 10) {
@@ -450,15 +472,38 @@ function leaderboardCount(limit = 100) {
 }
 
 function dashboardStats() {
-  const totalUsers = prep('SELECT COUNT(*) as c FROM users').get().c;
-  const activeUsers = prep('SELECT COUNT(*) as c FROM users WHERE last_seen > ?').get(Date.now() - 7 * 24 * 3600 * 1000).c;
-  const totalGroups = prep('SELECT COUNT(DISTINCT chat_id) as c FROM chat_logs WHERE chat_id < 0').get().c;
-  const coinsInCirculation = prep('SELECT COALESCE(SUM(networth), 0) as c FROM users').get().c;
-  return { totalUsers, activeUsers, totalGroups, coinsInCirculation };
+  const users = prep('SELECT COUNT(*) AS n FROM users').get().n;
+  const totalCoins = prep('SELECT COALESCE(SUM(networth), 0) AS s FROM users').get().s;
+  const totalBets = prep('SELECT COALESCE(SUM(bet), 0) AS s FROM game_history').get().s;
+  const totalWins = prep('SELECT COALESCE(SUM(amount), 0) AS s FROM game_history WHERE result = \'win\'').get().s;
+  return { users, totalCoins, totalBets, totalWins };
 }
 
 function getCooldownCount() {
-  return prep('SELECT COUNT(*) as c FROM cooldowns WHERE expires_at > ?').get(Date.now()).c;
+  return prep('SELECT COUNT(*) AS c FROM cooldowns').get().c;
+}
+
+function getAllUsers() {
+  return prep('SELECT * FROM users ORDER BY networth DESC').all();
+}
+
+function listUsersByNetWorth(limit = 100) {
+  return prep('SELECT * FROM users ORDER BY networth DESC LIMIT ?').all(limit);
+}
+
+function searchUsers(q, limit = 20) {
+  const like = `%${String(q || '').toLowerCase()}%`;
+  return prep('SELECT * FROM users WHERE lower(username) LIKE ? OR lower(first_name) LIKE ? OR CAST(user_id AS TEXT) LIKE ? ORDER BY networth DESC LIMIT ?')
+    .all(like, like, like, limit);
+}
+
+function getUserCooldowns(userId) {
+  return prep('SELECT * FROM cooldowns WHERE user_id = ? ORDER BY expires_at DESC').all(userId);
+}
+
+function setRankStats(userId, rank, validMatches) {
+  prep('UPDATE users SET rank = ?, rank_valid_matches = ?, updated_at = datetime(\'now\') WHERE user_id = ?')
+    .run(rank, validMatches || 0, userId);
 }
 
 /* ===================== ADMIN / PENALTIES ===================== */
@@ -468,31 +513,64 @@ function isAdminUser(userId) {
   return !!row;
 }
 
+function addAdminUser(userId, role = 'mod', addedBy = 0) {
+  prep('INSERT INTO admin_users (user_id, role, added_by) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET role = excluded.role').run(userId, role, addedBy);
+}
+
+function getAdminUser(userId) {
+  return prep('SELECT * FROM admin_users WHERE user_id = ?').get(userId);
+}
+
+function listAdminUsers() {
+  return prep('SELECT * FROM admin_users ORDER BY added_at DESC').all();
+}
+
+function setAdminLastLogin(userId) {
+  prep('UPDATE admin_users SET added_at = datetime(\'now\') WHERE user_id = ?').run(userId);
+}
+
 function removeAdminUser(userId) {
   prep('DELETE FROM admin_users WHERE user_id = ?').run(userId);
 }
 
 function getUserStatus(userId) {
-  const row = prep('SELECT status, status_until FROM users WHERE user_id = ?').get(userId);
-  if (!row || !row.status) return null;
-  if (row.status_until > 0 && row.status_until <= Date.now()) return null;
-  return row;
+  return prep('SELECT status, status_until, status_reason FROM users WHERE user_id = ?').get(userId);
+}
+
+function setStatus(userId, status, reason, until = 0) {
+  prep('UPDATE users SET status = ?, status_until = ?, status_reason = ?, updated_at = datetime(\'now\') WHERE user_id = ?')
+    .run(status, until, reason || '', userId);
+}
+
+function clearStatus(userId) {
+  prep('UPDATE users SET status = \'\', status_until = 0, status_reason = \'\', updated_at = datetime(\'now\') WHERE user_id = ?').run(userId);
 }
 
 function expirePenalties() {
-  const expired = prep('SELECT user_id, status FROM users WHERE status != \'\' AND status_until > 0 AND status_until <= ?').all(Date.now());
-  prep('UPDATE users SET status = \'\', status_until = 0, updated_at = datetime(\'now\') WHERE status != \'\' AND status_until > 0 AND status_until <= ?').run(Date.now());
+  const rows = prep('SELECT user_id, status, status_until FROM users WHERE status != \'\' AND status_until > 0 AND status_until <= ?').all(Date.now());
+  const expired = [];
+  for (const r of rows) {
+    prep('UPDATE users SET status = \'\', status_until = 0, status_reason = \'\' WHERE user_id = ?').run(r.user_id);
+    expired.push({ user_id: r.user_id, status: r.status });
+  }
   return expired;
 }
 
 /* ===================== COOLDOWNS ===================== */
 
 function getCooldown(userId, action) {
-  return prep('SELECT * FROM cooldowns WHERE user_id = ? AND action = ?').get(userId, action);
+  const row = prep('SELECT expires_at FROM cooldowns WHERE user_id = ? AND action = ?').get(userId, action);
+  if (!row) return 0;
+  const until = Number(row.expires_at) || 0;
+  if (until > 0 && until <= Date.now()) {
+    prep('DELETE FROM cooldowns WHERE user_id = ? AND action = ?').run(userId, action);
+    return 0;
+  }
+  return until;
 }
 
 function setCooldown(userId, action, expiresAt) {
-  prep('INSERT OR REPLACE INTO cooldowns (user_id, action, expires_at) VALUES (?, ?, ?)').run(userId, action, expiresAt);
+  prep('INSERT INTO cooldowns (user_id, action, expires_at) VALUES (?, ?, ?) ON CONFLICT(user_id, action) DO UPDATE SET expires_at = excluded.expires_at').run(userId, action, expiresAt);
 }
 
 function clearAllCooldowns() {
@@ -502,35 +580,46 @@ function clearAllCooldowns() {
 /* ===================== LOTTERY ===================== */
 
 function getLottery() {
-  return prep('SELECT * FROM lottery ORDER BY id DESC LIMIT 1').get();
+  const row = prep('SELECT * FROM lottery ORDER BY id DESC LIMIT 1').get();
+  if (!row) {
+    prep('INSERT INTO lottery (jackpot, buyers, entries) VALUES (?, 0, \'[]\')').run(config.lottery.baseJackpot || 5000000);
+    return prep('SELECT * FROM lottery ORDER BY id DESC LIMIT 1').get();
+  }
+  return row;
 }
 
 function saveLottery(jackpot, buyers, entries) {
-  const existing = getLottery();
-  if (existing) {
-    prep('UPDATE lottery SET jackpot = ?, buyers = ?, entries = ? WHERE id = ?').run(jackpot, buyers, JSON.stringify(entries), existing.id);
-  } else {
-    prep('INSERT INTO lottery (jackpot, buyers, entries) VALUES (?, ?, ?)').run(jackpot, buyers, JSON.stringify(entries));
-  }
+  prep('UPDATE lottery SET jackpot = ?, buyers = ?, entries = ? WHERE id = (SELECT id FROM lottery ORDER BY id DESC LIMIT 1)').run(jackpot, buyers, JSON.stringify(entries || []));
 }
 
 /* ===================== HEISTS ===================== */
 
 function getOpenHeists() {
-  const rows = prep('SELECT * FROM heists WHERE status = \'open\'').all();
-  return rows.map((r) => ({ ...r, members: JSON.parse(r.members || '[]') }));
+  return prep('SELECT * FROM heists WHERE status = \'open\'').all();
 }
 
 function getHeist(leaderId) {
   const row = prep('SELECT * FROM heists WHERE leader_id = ?').get(leaderId);
   if (!row) return null;
-  return { ...row, members: JSON.parse(row.members || '[]') };
+  try { row.members = JSON.parse(row.members || '[]'); } catch (e) { row.members = []; }
+  return row;
 }
 
 function saveHeist(leaderId, targetId, members, status, expiresAt) {
-  prep('INSERT OR REPLACE INTO heists (leader_id, target_id, members, status, expires_at) VALUES (?, ?, ?, ?, ?)').run(
-    leaderId, targetId, JSON.stringify(members), status, expiresAt
-  );
+  prep('INSERT INTO heists (leader_id, target_id, members, status, expires_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(leader_id) DO UPDATE SET target_id = excluded.target_id, members = excluded.members, status = excluded.status, expires_at = excluded.expires_at')
+    .run(leaderId, targetId, JSON.stringify(members || []), status || 'open', expiresAt || 0);
+}
+
+function createHeist(leaderId, targetId, members, status, expiresAt) {
+  saveHeist(leaderId, targetId, members, status, expiresAt);
+}
+
+function updateHeistMembers(leaderId, members) {
+  prep('UPDATE heists SET members = ? WHERE leader_id = ?').run(JSON.stringify(members || []), leaderId);
+}
+
+function updateHeistStatus(leaderId, status) {
+  prep('UPDATE heists SET status = ? WHERE leader_id = ?').run(status, leaderId);
 }
 
 function deleteHeist(leaderId) {
@@ -563,6 +652,15 @@ function hasItem(userId, itemId) {
   return !!row;
 }
 
+function getItemQty(userId, itemId) {
+  const row = prep('SELECT * FROM inventory WHERE user_id = ? AND item_id = ?').get(userId, itemId);
+  return row ? row.quantity : 0;
+}
+
+function addItem(userId, itemId, qty = 1) {
+  addInventory(userId, itemId, qty);
+}
+
 /* ===================== GAME SESSIONS ===================== */
 
 function getGameSession(userId, game) {
@@ -577,9 +675,8 @@ function getGameSession(userId, game) {
 }
 
 function setGameSession(userId, game, state, expiresAt = 0) {
-  prep('INSERT OR REPLACE INTO game_sessions (user_id, game, state, expires_at) VALUES (?, ?, ?, ?)').run(
-    userId, game, typeof state === 'string' ? state : JSON.stringify(state), expiresAt
-  );
+  prep('INSERT INTO game_sessions (user_id, game, state, expires_at) VALUES (?, ?, ?, ?) ON CONFLICT(user_id, game) DO UPDATE SET state = excluded.state, expires_at = excluded.expires_at')
+    .run(userId, game, JSON.stringify(state || {}), expiresAt);
 }
 
 function deleteGameSession(userId, game) {
@@ -589,37 +686,52 @@ function deleteGameSession(userId, game) {
 /* ===================== LOGGING ===================== */
 
 function logGameHistory(data) {
-  prep('INSERT INTO game_history (user_id, username, game, bet, result, amount) VALUES (?, ?, ?, ?, ?, ?)').run(
-    data.user_id, data.username || '', data.game, data.bet || 0, data.result || '', data.amount || 0
-  );
+  prep('INSERT INTO game_history (user_id, username, game, bet, result, amount) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(data.user_id, data.username || '', data.game || '', data.bet || 0, data.result || '', data.amount || 0);
 }
 
 function logActivity(type, message, data = {}) {
-  prep('INSERT INTO activity_feed (type, message, data) VALUES (?, ?, ?)').run(type, message, JSON.stringify(data));
+  prep('INSERT INTO activity_feed (type, message, data) VALUES (?, ?, ?)').run(type, message, JSON.stringify(data || {}));
 }
 
 function logAudit(userId, username, action, amount, details) {
-  prep('INSERT INTO audit_log (user_id, username, action, amount, details) VALUES (?, ?, ?, ?, ?)').run(userId, username, action, amount || 0, details || '');
+  prep('INSERT INTO audit_log (user_id, username, action, amount, details) VALUES (?, ?, ?, ?, ?)')
+    .run(userId, username || '', action || '', amount || 0, details || '');
 }
 
 function logChat(msg) {
   const from = msg.from || {};
-  prep('INSERT INTO chat_logs (user_id, username, chat_id, message) VALUES (?, ?, ?, ?)').run(
-    from.id, from.username || '', msg.chat.id, String(msg.text || msg.caption || '').slice(0, 500)
-  );
+  prep('INSERT INTO chat_logs (user_id, username, chat_id, message) VALUES (?, ?, ?, ?)')
+    .run(from.id || 0, from.username || '', msg.chat ? msg.chat.id : 0, String(msg.text || msg.caption || '').slice(0, 500));
+}
+
+function getChatLogs(limit = 100) {
+  return prep('SELECT * FROM chat_logs ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+function getGameHistory(limit = 100) {
+  return prep('SELECT * FROM game_history ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+function getAuditLog(limit = 100) {
+  return prep('SELECT * FROM audit_log ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+function getActivity(limit = 100) {
+  return prep('SELECT * FROM activity_feed ORDER BY id DESC LIMIT ?').all(limit);
 }
 
 /* ===================== SEEN CHAT IDS ===================== */
 
 function getSeenChatIds() {
-  return prep('SELECT DISTINCT chat_id FROM chat_logs').all().map((r) => r.chat_id);
+  return prep('SELECT DISTINCT chat_id FROM chat_logs WHERE chat_id IS NOT NULL').all().map((r) => r.chat_id);
 }
 
 /* ===================== BROADCAST ===================== */
 
 function createBroadcast(message, target, createdBy) {
-  const info = prep('INSERT INTO broadcast_queue (message, target, created_by) VALUES (?, ?, ?)').run(message, target, createdBy);
-  return { id: info.lastInsertRowid, message, target };
+  const info = prep('INSERT INTO broadcast_queue (message, target, status, created_by) VALUES (?, ?, \'pending\', ?)').run(message, target || 'all', createdBy || 0);
+  return { id: Number(info.lastInsertRowid), message, target: target || 'all', status: 'pending', created_by: createdBy || 0 };
 }
 
 function getPendingBroadcasts() {
@@ -630,17 +742,61 @@ function markBroadcastDone(id) {
   prep('UPDATE broadcast_queue SET status = \'done\' WHERE id = ?').run(id);
 }
 
+function listBroadcasts(limit = 50) {
+  return prep('SELECT * FROM broadcast_queue ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+function updateBroadcastCount(id) {
+  prep('UPDATE broadcast_queue SET status = status WHERE id = ?').run(id);
+}
+
 /* ===================== EVENTS ===================== */
 
 function createEvent(data) {
-  const info = prep('INSERT INTO events (title, description, type, reward, ends_at, created_by) VALUES (?, ?, ?, ?, ?, ?)').run(
-    data.title, data.description || '', data.type || 'mission', data.reward || 0, data.ends_at || 0, data.created_by || 0
-  );
-  return { id: info.lastInsertRowid, ...data };
+  const info = prep('INSERT INTO events (title, description, type, reward, ends_at, created_by) VALUES (?, ?, ?, ?, ?, ?)')
+    .run(data.title || '', data.description || '', data.type || 'mission', data.reward || 0, data.ends_at || 0, data.created_by || 0);
+  return prep('SELECT * FROM events WHERE id = ?').get(Number(info.lastInsertRowid));
 }
 
 function getActiveEvents() {
-  return prep('SELECT * FROM events WHERE ends_at = 0 OR ends_at > ? ORDER BY id DESC').all(Date.now());
+  const now = Date.now();
+  return prep('SELECT * FROM events WHERE ends_at = 0 OR ends_at > ? ORDER BY id DESC').all(now);
+}
+
+function listEvents(limit = 50) {
+  return prep('SELECT * FROM events ORDER BY id DESC LIMIT ?').all(limit);
+}
+
+function updateEvent(id, data) {
+  const sets = [];
+  const params = [];
+  for (const k of ['title', 'description', 'type', 'reward', 'ends_at']) {
+    if (data[k] !== undefined) {
+      sets.push(`${k} = ?`);
+      params.push(data[k]);
+    }
+  }
+  if (!sets.length) return null;
+  params.push(id);
+  prep(`UPDATE events SET ${sets.join(', ')} WHERE id = ?`).run(...params);
+  return prep('SELECT * FROM events WHERE id = ?').get(id);
+}
+
+function deleteEvent(id) {
+  prep('DELETE FROM events WHERE id = ?').run(id);
+}
+
+function activeEvents() {
+  return getActiveEvents();
+}
+
+function incrementEventCompletions(userId, missionId) {
+  const row = prep('SELECT * FROM mission_progress WHERE user_id = ? AND mission_id = ?').get(userId, missionId);
+  if (row) {
+    prep('UPDATE mission_progress SET attempts = attempts + 1, last_attempt = ? WHERE user_id = ? AND mission_id = ?').run(Date.now(), userId, missionId);
+  } else {
+    prep('INSERT INTO mission_progress (user_id, mission_id, attempts, completed, last_attempt) VALUES (?, ?, 1, 0, ?)').run(userId, missionId, Date.now());
+  }
 }
 
 /* ===================== MISSION PROGRESS ===================== */
@@ -650,23 +806,37 @@ function getMissionProgress(userId, missionId) {
 }
 
 function upsertMissionProgress(userId, missionId, data) {
-  prep('INSERT OR REPLACE INTO mission_progress (user_id, mission_id, attempts, completed, last_attempt) VALUES (?, ?, ?, ?, ?)').run(
-    userId, missionId, data.attempts || 0, data.completed || 0, data.last_attempt || new Date().toISOString()
-  );
+  const row = prep('SELECT * FROM mission_progress WHERE user_id = ? AND mission_id = ?').get(userId, missionId);
+  if (row) {
+    prep('UPDATE mission_progress SET attempts = ?, completed = ?, last_attempt = ? WHERE user_id = ? AND mission_id = ?')
+      .run(data.attempts !== undefined ? data.attempts : row.attempts, data.completed !== undefined ? data.completed : row.completed, Date.now(), userId, missionId);
+  } else {
+    prep('INSERT INTO mission_progress (user_id, mission_id, attempts, completed, last_attempt) VALUES (?, ?, ?, ?, ?)')
+      .run(userId, missionId, data.attempts || 0, data.completed || 0, Date.now());
+  }
 }
 
 /* ===================== REDEEM CODES ===================== */
 
 function getRedeemCode(code) {
-  return prep('SELECT * FROM redeem_codes WHERE code = ?').get(String(code || '').toUpperCase());
+  return prep('SELECT * FROM redeem_codes WHERE code = ?').get(code);
 }
 
 function createRedeemCode(code, amount, maxUses, createdBy) {
-  prep('INSERT INTO redeem_codes (code, amount, max_uses, created_by) VALUES (?, ?, ?, ?)').run(code, amount, maxUses, createdBy);
+  try {
+    prep('INSERT INTO redeem_codes (code, amount, uses, max_uses, created_by) VALUES (?, ?, 0, ?, ?)').run(code, amount, maxUses || 1, createdBy || 0);
+    return prep('SELECT * FROM redeem_codes WHERE code = ?').get(code);
+  } catch (e) {
+    return null;
+  }
 }
 
 function useRedeemCode(code) {
+  const row = prep('SELECT * FROM redeem_codes WHERE code = ?').get(code);
+  if (!row) return null;
+  if (row.uses >= row.max_uses) return null;
   prep('UPDATE redeem_codes SET uses = uses + 1 WHERE code = ?').run(code);
+  return prep('SELECT * FROM redeem_codes WHERE code = ?').get(code);
 }
 
 function deleteRedeemCode(code) {
@@ -678,23 +848,109 @@ function listRedeemCodes() {
 }
 
 function addRedeemClaim(code, userId) {
-  prep('INSERT INTO redeem_claims (code, user_id) VALUES (?, ?)').run(code, userId);
+  try {
+    prep('INSERT INTO redeem_claims (code, user_id) VALUES (?, ?)').run(code, userId);
+    return true;
+  } catch (e) {
+    return false;
+  }
 }
 
 function hasRedeemClaim(code, userId) {
   return !!prep('SELECT * FROM redeem_claims WHERE code = ? AND user_id = ?').get(code, userId);
 }
 
+/* ===================== REDEEM: legacy aliases ===================== */
+
+function hasRedeemed(userId, code) {
+  return hasRedeemClaim(code, userId);
+}
+
+function recordRedemption(userId, code) {
+  return addRedeemClaim(code, userId);
+}
+
+/* ===================== TIME WALLET (timed rank rewards) ===================== */
+
+function addTimeWallet(userId, amount, expiresAt) {
+  prep('INSERT INTO time_wallet (user_id, amount, expires_at) VALUES (?, ?, ?) ON CONFLICT(user_id, expires_at) DO UPDATE SET amount = amount + ?')
+    .run(userId, amount, expiresAt || 0, amount);
+}
+
+function getTimeWalletRow(userId) {
+  const rows = prep('SELECT * FROM time_wallet WHERE user_id = ?').all(userId);
+  let amount = 0;
+  for (const r of rows) {
+    if (r.expires_at > 0 && r.expires_at <= Date.now()) {
+      prep('DELETE FROM time_wallet WHERE user_id = ? AND expires_at = ?').run(userId, r.expires_at);
+    } else {
+      amount += r.amount;
+    }
+  }
+  return { user_id: userId, amount };
+}
+
+function getTimeWalletBalance(userId) {
+  const row = getTimeWalletRow(userId);
+  return row ? row.amount : 0;
+}
+
+function spendTimeWallet(userId, amount) {
+  const rows = prep('SELECT * FROM time_wallet WHERE user_id = ? ORDER BY expires_at ASC').all(userId);
+  let remaining = amount;
+  for (const r of rows) {
+    if (remaining <= 0) break;
+    if (r.expires_at > 0 && r.expires_at <= Date.now()) {
+      prep('DELETE FROM time_wallet WHERE user_id = ? AND expires_at = ?').run(userId, r.expires_at);
+      continue;
+    }
+    const use = Math.min(r.amount, remaining);
+    remaining -= use;
+    if (r.amount - use <= 0) {
+      prep('DELETE FROM time_wallet WHERE user_id = ? AND expires_at = ?').run(userId, r.expires_at);
+    } else {
+      prep('UPDATE time_wallet SET amount = amount - ? WHERE user_id = ? AND expires_at = ?').run(use, userId, r.expires_at);
+    }
+  }
+  return remaining <= 0;
+}
+
+function sweepExpiredTimeWallet() {
+  prep('DELETE FROM time_wallet WHERE expires_at > 0 AND expires_at <= ?').run(Date.now());
+}
+
+/* ===================== WAIFU / HUNT SPAWN (alias to active-card API) ===================== */
+
+function getActiveSpawn() {
+  return getActiveWaifu();
+}
+
+function setActiveSpawn(card, expiresAt, chatId) {
+  setActiveWaifu(card, expiresAt, chatId);
+}
+
+function clearActiveSpawn() {
+  clearActiveWaifu();
+}
+
+function claimCharacter(userId, char) {
+  return claimWaifuCharacter(userId, char);
+}
+
+function isCharacterClaimed(characterId) {
+  return isWaifuCharacterClaimed(characterId);
+}
+
 /* ===================== WAIFU COLLECTION ===================== */
 
 function getActiveWaifu() {
-  return prep('SELECT * FROM waifu_spawn ORDER BY expires_at DESC LIMIT 1').get();
+  const row = prep('SELECT * FROM waifu_spawn WHERE claimed = 0 AND expires_at > ? ORDER BY expires_at ASC LIMIT 1').get(Date.now());
+  return row || null;
 }
 
 function setActiveWaifu(card, expiresAt, chatId) {
-  prep('INSERT OR REPLACE INTO waifu_spawn (character_id, name, series, image_url, bio, favorites, rarity, expires_at, chat_id, claimed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)').run(
-    card.character_id, card.name, card.series || '', card.image_url, card.bio || '', card.favorites || 0, card.rarity || 'common', expiresAt, chatId
-  );
+  prep('INSERT INTO waifu_spawn (character_id, name, series, image_url, bio, favorites, rarity, expires_at, chat_id, claimed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0) ON CONFLICT(character_id) DO UPDATE SET name = excluded.name, series = excluded.series, image_url = excluded.image_url, bio = excluded.bio, favorites = excluded.favorites, rarity = excluded.rarity, expires_at = excluded.expires_at, chat_id = excluded.chat_id, claimed = excluded.claimed')
+    .run(card.character_id || card.id, card.name || '', card.series || '', card.image_url || '', card.bio || '', card.favorites || 0, card.rarity || 'common', expiresAt || 0, chatId || 0);
 }
 
 function clearActiveWaifu() {
@@ -702,30 +958,41 @@ function clearActiveWaifu() {
 }
 
 function claimWaifuCharacter(userId, char) {
-  const existing = prep('SELECT * FROM waifu_claims WHERE user_id = ? AND character_id = ?').get(userId, char.character_id);
-  if (existing) return false;
-  prep('INSERT INTO waifu_claims (user_id, character_id, name, series, image_url, rarity) VALUES (?, ?, ?, ?, ?, ?)').run(
-    userId, char.character_id, char.name, char.series || '', char.image_url, char.rarity || 'common'
-  );
-  return true;
+  const characterId = char.character_id || char.id;
+  if (!characterId) return null;
+  const now = Date.now();
+  let row;
+  try {
+    prep('INSERT INTO waifu_claims (user_id, character_id, name, series, image_url, rarity, claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(userId, characterId, char.name || '', char.series || '', char.image_url || '', char.rarity || 'common', now);
+    row = prep('SELECT * FROM waifu_claims WHERE character_id = ?').get(characterId);
+  } catch (e) {
+    return null; // duplicate claim (UNIQUE on character_id)
+  }
+  try { prep('UPDATE waifu_spawn SET claimed = 1 WHERE character_id = ?').run(characterId); } catch (e) { /* non-fatal */ }
+  return row;
 }
 
 function getUserCollection(userId) {
   return prep('SELECT * FROM waifu_claims WHERE user_id = ? ORDER BY claimed_at ASC').all(userId);
 }
 
+function getUserCharacters(userId) {
+  return getUserCollection(userId);
+}
+
 function getUserCharacterByIndex(userId, index) {
   const rows = prep('SELECT * FROM waifu_claims WHERE user_id = ? ORDER BY claimed_at ASC').all(userId);
-  if (index < 1 || index > rows.length) return null;
-  return rows[index - 1];
+  const i = (index || 1) - 1;
+  return rows[i] || null;
 }
 
 function getCharacterByName(userId, name) {
-  return prep('SELECT * FROM waifu_claims WHERE user_id = ? AND LOWER(name) = ?').get(userId, String(name).toLowerCase());
+  return prep('SELECT * FROM waifu_claims WHERE user_id = ? AND lower(name) LIKE lower(?) LIMIT 1').get(userId, `%${name}%`);
 }
 
 function getWaifuLeaderboard(limit = 10) {
-  return prep('SELECT user_id, COUNT(*) as count FROM waifu_claims GROUP BY user_id ORDER BY count DESC LIMIT ?').all(limit);
+  return prep('SELECT w.user_id, u.username, u.first_name, COUNT(*) AS count FROM waifu_claims w LEFT JOIN users u ON u.user_id = w.user_id GROUP BY w.user_id ORDER BY count DESC LIMIT ?').all(limit);
 }
 
 function isWaifuCharacterClaimed(characterId) {
@@ -735,13 +1002,13 @@ function isWaifuCharacterClaimed(characterId) {
 /* ===================== HUNT COLLECTION ===================== */
 
 function getActiveHunt() {
-  return prep('SELECT * FROM hunt_spawn ORDER BY expires_at DESC LIMIT 1').get();
+  const row = prep('SELECT * FROM hunt_spawn WHERE claimed = 0 AND expires_at > ? ORDER BY expires_at ASC LIMIT 1').get(Date.now());
+  return row || null;
 }
 
 function setActiveHunt(card, expiresAt, chatId) {
-  prep('INSERT OR REPLACE INTO hunt_spawn (character_id, name, series, image_url, bio, favorites, rarity, expires_at, chat_id, claimed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)').run(
-    card.character_id, card.name, card.series || '', card.image_url, card.bio || '', card.favorites || 0, card.rarity || 'common', expiresAt, chatId
-  );
+  prep('INSERT INTO hunt_spawn (character_id, name, series, image_url, bio, favorites, rarity, expires_at, chat_id, claimed) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0) ON CONFLICT(character_id) DO UPDATE SET name = excluded.name, series = excluded.series, image_url = excluded.image_url, bio = excluded.bio, favorites = excluded.favorites, rarity = excluded.rarity, expires_at = excluded.expires_at, chat_id = excluded.chat_id, claimed = excluded.claimed')
+    .run(card.character_id || card.id, card.name || '', card.series || '', card.image_url || '', card.bio || '', card.favorites || 0, card.rarity || 'common', expiresAt || 0, chatId || 0);
 }
 
 function clearActiveHunt() {
@@ -749,26 +1016,37 @@ function clearActiveHunt() {
 }
 
 function claimHuntCharacter(userId, char) {
-  const existing = prep('SELECT * FROM hunt_claims WHERE user_id = ? AND character_id = ?').get(userId, char.character_id);
-  if (existing) return false;
-  prep('INSERT INTO hunt_claims (user_id, character_id, name, series, image_url, rarity) VALUES (?, ?, ?, ?, ?, ?)').run(
-    userId, char.character_id, char.name, char.series || '', char.image_url, char.rarity || 'common'
-  );
-  return true;
+  const characterId = char.character_id || char.id;
+  if (!characterId) return null;
+  const now = Date.now();
+  let row;
+  try {
+    prep('INSERT INTO hunt_claims (user_id, character_id, name, series, image_url, rarity, claimed_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(userId, characterId, char.name || '', char.series || '', char.image_url || '', char.rarity || 'common', now);
+    row = prep('SELECT * FROM hunt_claims WHERE character_id = ?').get(characterId);
+  } catch (e) {
+    return null; // duplicate claim (UNIQUE on character_id)
+  }
+  try { prep('UPDATE hunt_spawn SET claimed = 1 WHERE character_id = ?').run(characterId); } catch (e) { /* non-fatal */ }
+  return row;
 }
 
 function getHuntCollection(userId) {
   return prep('SELECT * FROM hunt_claims WHERE user_id = ? ORDER BY claimed_at ASC').all(userId);
 }
 
+function getUserHuntCharacters(userId) {
+  return getHuntCollection(userId);
+}
+
 function getHuntCharacterByIndex(userId, index) {
   const rows = prep('SELECT * FROM hunt_claims WHERE user_id = ? ORDER BY claimed_at ASC').all(userId);
-  if (index < 1 || index > rows.length) return null;
-  return rows[index - 1];
+  const i = (index || 1) - 1;
+  return rows[i] || null;
 }
 
 function getHuntLeaderboard(limit = 10) {
-  return prep('SELECT user_id, COUNT(*) as count FROM hunt_claims GROUP BY user_id ORDER BY count DESC LIMIT ?').all(limit);
+  return prep('SELECT h.user_id, u.username, u.first_name, COUNT(*) AS count FROM hunt_claims h LEFT JOIN users u ON u.user_id = h.user_id GROUP BY h.user_id ORDER BY count DESC LIMIT ?').all(limit);
 }
 
 function isHuntCharacterClaimed(characterId) {
@@ -776,9 +1054,8 @@ function isHuntCharacterClaimed(characterId) {
 }
 
 function cacheHuntCharacter(card) {
-  prep('INSERT OR REPLACE INTO hunt_cache (character_id, name, series, image_url, bio, favorites, rarity) VALUES (?, ?, ?, ?, ?, ?, ?)').run(
-    card.character_id, card.name, card.series || '', card.image_url, card.bio || '', card.favorites || 0, card.rarity || 'common'
-  );
+  prep('INSERT INTO hunt_cache (character_id, name, series, image_url, bio, favorites, rarity) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(character_id) DO UPDATE SET name = excluded.name, series = excluded.series, image_url = excluded.image_url, bio = excluded.bio, favorites = excluded.favorites, rarity = excluded.rarity')
+    .run(card.character_id || card.id, card.name || '', card.series || '', card.image_url || '', card.bio || '', card.favorites || 0, card.rarity || 'common');
 }
 
 function getCachedHuntCharacter(characterId) {
@@ -786,17 +1063,22 @@ function getCachedHuntCharacter(characterId) {
 }
 
 function getHuntPool(limit = 10) {
-  return prep(`
-    SELECT c.* FROM hunt_cache c
-    WHERE NOT EXISTS (SELECT 1 FROM hunt_claims cl WHERE cl.character_id = c.character_id)
-    ORDER BY RANDOM() LIMIT ?
-  `).all(limit);
+  return prep('SELECT * FROM hunt_cache ORDER BY favorites DESC LIMIT ?').all(limit);
+}
+
+/* ===================== ATTACK ===================== */
+
+function getAttackEligibleUsers() {
+  const now = Date.now();
+  return prep('SELECT * FROM users WHERE status = \'\' AND (hidden_until = 0 OR hidden_until <= ?) AND last_seen > ? ORDER BY networth DESC')
+    .all(now, now - 7 * 24 * 3600 * 1000);
 }
 
 /* ===================== BOT MEMORY ===================== */
 
 function setMemory(key, value, category = 'general') {
-  prep('INSERT OR REPLACE INTO bot_memory (key, value, category, updated_at) VALUES (?, ?, ?, datetime(\'now\'))').run(key, value, category);
+  prep('INSERT INTO bot_memory (key, value, category, updated_at) VALUES (?, ?, ?, datetime(\'now\')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, category = excluded.category, updated_at = datetime(\'now\')')
+    .run(key, value, category);
 }
 
 function getMemory(key) {
@@ -814,23 +1096,21 @@ function deleteMemory(key) {
 /* ===================== BOT STATE ===================== */
 
 function setBotPaused(paused) {
-  prep('INSERT OR REPLACE INTO bot_state (key, value, updated_at) VALUES (\'paused\', ?, datetime(\'now\'))').run(paused ? 'true' : 'false');
+  prep('INSERT INTO bot_state (key, value, updated_at) VALUES (\'paused\', ?, datetime(\'now\')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')').run(paused ? 'true' : 'false');
 }
 
 function getBotPaused() {
-  const row = prep("SELECT * FROM bot_state WHERE key = 'paused'").get();
+  const row = prep('SELECT value FROM bot_state WHERE key = \'paused\'').get();
   return row ? row.value === 'true' : false;
 }
 
-// Generic key/value settings on the bot_state table (mirrored to Postgres).
 function getSetting(key) {
   const row = prep('SELECT value FROM bot_state WHERE key = ?').get(key);
   return row ? row.value : null;
 }
 
 function setSetting(key, value) {
-  prep('INSERT INTO bot_state (key, value, updated_at) VALUES (?, ?, datetime(\'now\')) ' +
-       'ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime(\'now\')').run(key, value);
+  prep('INSERT INTO bot_state (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, String(value));
 }
 
 /* ===================== HIDE ===================== */
@@ -870,14 +1150,19 @@ function syncInfo() {
     lastMirrorAt: pgLastMirrorAt,
     degraded: pgDegraded,
     lockHeld: pgLockHeld,
+    instanceLockHeld: pgLockHeld,
+    hydrated: pgHydrated,
+    syncEnabled,
   };
 }
 
-async function acquireInstanceLock() {
+const PG_LOCK_KEY = 0x52494d55; // "RIMU" — must match index.js
+
+async function acquireInstanceLock(lockKey = PG_LOCK_KEY) {
   if (!PG_CONFIGURED || !pgPool) return false;
   try {
     pgClient = await pgPool.connect();
-    const res = await pgClient.query('SELECT pg_try_advisory_lock(123456789) as locked');
+    const res = await pgClient.query('SELECT pg_try_advisory_lock($1) as locked', [Number(lockKey)]);
     pgLockHeld = res.rows[0]?.locked === true;
     if (pgLockHeld) {
       console.log('[db] PG advisory lock acquired');
@@ -907,11 +1192,11 @@ async function acquireInstanceLock() {
   }
 }
 
-async function releaseInstanceLock() {
+async function releaseInstanceLock(lockKey = PG_LOCK_KEY) {
   if (pgHeartbeatTimer) { clearInterval(pgHeartbeatTimer); pgHeartbeatTimer = null; }
   if (pgClient) {
     try {
-      await pgClient.query('SELECT pg_advisory_unlock(123456789)');
+      await pgClient.query('SELECT pg_advisory_unlock($1)', [Number(lockKey)]);
       pgClient.release();
     } catch (e) { /* non-fatal */ }
     pgClient = null;
@@ -970,7 +1255,7 @@ async function ensurePgTables() {
 }
 
 async function mirrorTable(table) {
-  if (!pgReady || !pgWritable || !pgLockHeld || !pgPool) return;
+  if (!pgReady || !pgWritable || !pgLockHeld || !syncEnabled || !pgPool) return;
   const cols = TABLE_COLS[table];
   const pk = TABLE_PKS[table];
   if (!cols || !pk) return;
@@ -1004,7 +1289,7 @@ async function mirrorTable(table) {
 }
 
 async function fullMirror() {
-  if (!pgReady || !pgWritable || !pgLockHeld) return;
+  if (!pgReady || !pgWritable || !pgLockHeld || !syncEnabled) return;
   if (pgMirrorRunning) return;
   pgMirrorRunning = true;
   try {
@@ -1023,7 +1308,7 @@ function queuePgWrite(table, data) {
 }
 
 async function drainMirrorQueue() {
-  if (!pgReady || !pgWritable || !pgLockHeld || !pgPool) return;
+  if (!pgReady || !pgWritable || !pgLockHeld || !syncEnabled || !pgPool) return;
   if (pgMirrorRunning) return;
   pgMirrorRunning = true;
   try {
@@ -1088,8 +1373,6 @@ async function startRecoveryLoop() {
       pgDegraded = false;
       pgLastError = null;
       console.log('[db] Postgres recovered');
-      await ensurePgTables();
-      await fullMirror();
     } catch (e) {
       pgLastError = e;
       pgConnected = false;
@@ -1098,7 +1381,131 @@ async function startRecoveryLoop() {
       pgDegraded = true;
     }
   }, 15000);
-  pgRecoveryTimer.unref && pgRecoveryTimer.unref();
+}
+
+/* ===================== HYDRATION (Postgres → SQLite) ===================== */
+
+/**
+ * Pull every mirror table from Postgres into SQLite. This is the durability
+ * step: without it, a fresh SQLite cache would be empty and the first mirror
+ * would push an empty DB over real Postgres rows (the rollback bug).
+ *
+ * Table-by-table: wipe the SQLite table, then insert PG rows.
+ * Returns { enabled, hydrated } — hydrated = total rows copied.
+ */
+async function hydrateFromPg() {
+  if (!PG_CONFIGURED || !pgPool || !pgReady) {
+    return { enabled: false, hydrated: 0 };
+  }
+  let hydrated = 0;
+  try {
+    for (const table of Object.keys(TABLE_COLS)) {
+      const cols = TABLE_COLS[table];
+      const pk = TABLE_PKS[table];
+      if (!cols || !pk) continue;
+      const colNames = cols.split(', ').map((c) => c.split(' ')[0]);
+      const res = await pgPool.query(`SELECT ${colNames.join(', ')} FROM ${table}`);
+      if (!res.rows.length) continue;
+      prep(`DELETE FROM ${table}`).run();
+      const placeholders = colNames.map(() => '?').join(', ');
+      const insert = prep(`INSERT INTO ${table} (${colNames.join(', ')}) VALUES (${placeholders})`);
+      for (const row of res.rows) {
+        try {
+          insert.run(...colNames.map((c) => (row[c] === null || row[c] === undefined ? null : row[c])));
+          hydrated++;
+        } catch (e) {
+          // Row-level conflict (e.g. legacy PK) — skip, non-fatal.
+        }
+      }
+    }
+    pgHydrated = true;
+    console.log(`[db] Hydrated SQLite from Postgres (${hydrated} rows).`);
+    return { enabled: true, hydrated };
+  } catch (e) {
+    console.error('[db] hydrateFromPg failed:', e.message);
+    pgLastError = e;
+    pgHydrated = false;
+    return { enabled: false, hydrated: 0 };
+  }
+}
+
+/**
+ * Compatibility entry point expected by index.js. Restores the original
+ * boot flow: connect → ensure tables → HYDRATE → ready.
+ * Returns { enabled, hydrated }.
+ */
+async function initPersistence() {
+  const ok = await initPg();
+  if (!ok) {
+    // SQLite-only mode — no PG, nothing to hydrate from.
+    pgHydrated = true;
+    return { enabled: false, hydrated: 0 };
+  }
+  await ensurePgTables();
+  const h = await hydrateFromPg();
+  return { enabled: h.enabled, hydrated: h.hydrated };
+}
+
+function setSyncEnabled(v) {
+  syncEnabled = !!v;
+  if (!syncEnabled) {
+    pgWritable = false;
+  } else if (pgReady) {
+    pgWritable = true;
+  }
+}
+
+function isSyncEnabled() {
+  return syncEnabled && pgWritable;
+}
+
+/* ===================== BACKUPS (PG snapshots) ===================== */
+
+function saveBackupPg(filename, data, userCount, createdBy) {
+  prep('INSERT INTO backups (filename, data, user_count, created_by, created_at) VALUES (?, ?, ?, ?, ?)')
+    .run(filename, data, userCount || 0, createdBy || 0, Date.now());
+  const row = prep('SELECT * FROM backups ORDER BY id DESC LIMIT 1').get();
+  // Mirror to Postgres (fire-and-forget; the mirror loop drains it).
+  if (pgPool && pgReady) {
+    const colNames = ['id', 'filename', 'data', 'user_count', 'created_by', 'created_at'];
+    queuePgWrite('backups', [row.id, row.filename, row.data, row.user_count, row.created_by, row.created_at]);
+  }
+  return row;
+}
+
+function listBackupsPg(limit = 10) {
+  return prep('SELECT * FROM backups ORDER BY id DESC LIMIT ?').all(limit)
+    .map((row) => ({
+      id: Number(row.id),
+      filename: row.filename,
+      user_count: Number(row.user_count) || 0,
+      created_by: Number(row.created_by) || 0,
+      created_at: Number(row.created_at) || 0,
+    }));
+}
+
+function newestBackupPg() {
+  const row = prep('SELECT * FROM backups ORDER BY id DESC LIMIT 1').get();
+  if (!row) return null;
+  return {
+    id: Number(row.id),
+    filename: row.filename,
+    data: row.data,
+    user_count: Number(row.user_count) || 0,
+    created_by: Number(row.created_by) || 0,
+    created_at: Number(row.created_at) || 0,
+  };
+}
+
+async function pgRun(table, sql, params = []) {
+  if (!pgPool || !pgReady) return Promise.resolve(false);
+  try {
+    await pgPool.query(sql, params);
+    return true;
+  } catch (e) {
+    pgLastError = e;
+    return false;
+  }
 }
 
 /* ===================== CLOSE ===================== */
@@ -1119,42 +1526,59 @@ function close() {
 
 module.exports = {
   // User / economy
-  getOrCreateUser, getUser, addWallet, setNetworth, setWallet, setBank,
-  findUserByUsername, leaderboard, leaderboardCount, dashboardStats,
-  getCooldownCount,
+  getOrCreateUser, getUser, addWallet, addBank, setNetworth, setWallet, setBank,
+  getNetWorth, findUserByUsername, leaderboard, leaderboardCount, dashboardStats,
+  getCooldownCount, getAllUsers, listUsersByNetWorth, searchUsers,
+  getUserCooldowns, setRankStats,
   // Admin / penalties
-  isAdminUser, removeAdminUser, getUserStatus, expirePenalties,
+  isAdminUser, addAdminUser, getAdminUser, listAdminUsers, setAdminLastLogin,
+  removeAdminUser, getUserStatus, setStatus, clearStatus, expirePenalties,
   // Cooldowns
   getCooldown, setCooldown, clearAllCooldowns,
   // Lottery
   getLottery, saveLottery,
   // Heists
-  getOpenHeists, getHeist, saveHeist, deleteHeist,
+  getOpenHeists, getHeist, saveHeist, deleteHeist, createHeist,
+  updateHeistMembers, updateHeistStatus,
   // Inventory
-  getInventory, addInventory, removeInventory, hasItem,
+  getInventory, addInventory, removeInventory, hasItem, getItemQty, addItem,
   // Game sessions
   getGameSession, setGameSession, deleteGameSession,
   // Logging
-  logGameHistory, logActivity, logAudit, logChat,
+  logGameHistory, logActivity, logAudit, logChat, getChatLogs,
+  getGameHistory, getAuditLog, getActivity,
   // Seen chat IDs
   getSeenChatIds,
   // Broadcast
-  createBroadcast, getPendingBroadcasts, markBroadcastDone,
+  createBroadcast, getPendingBroadcasts, markBroadcastDone, listBroadcasts,
+  updateBroadcastCount,
   // Events
-  createEvent, getActiveEvents,
+  createEvent, getActiveEvents, listEvents, updateEvent, deleteEvent,
+  activeEvents, incrementEventCompletions,
   // Missions
   getMissionProgress, upsertMissionProgress,
+  // Backups (PG snapshots)
+  saveBackupPg, newestBackupPg, listBackupsPg, pgRun,
   // Redeem codes
   getRedeemCode, createRedeemCode, useRedeemCode, deleteRedeemCode,
-  listRedeemCodes, addRedeemClaim, hasRedeemClaim,
+  listRedeemCodes, addRedeemClaim, hasRedeemClaim, hasRedeemed, recordRedemption,
+  // Time wallet
+  addTimeWallet, getTimeWalletRow, getTimeWalletBalance, spendTimeWallet,
+  sweepExpiredTimeWallet,
   // Waifu
   getActiveWaifu, setActiveWaifu, clearActiveWaifu, claimWaifuCharacter,
-  getUserCollection, getUserCharacterByIndex, getCharacterByName,
+  getUserCollection, getUserCharacters, getUserCharacterByIndex, getCharacterByName,
   getWaifuLeaderboard, isWaifuCharacterClaimed,
+  // Waifu/Hunt spawn aliases
+  getActiveSpawn, setActiveSpawn, clearActiveSpawn, claimCharacter,
+  isCharacterClaimed,
   // Hunt
   getActiveHunt, setActiveHunt, clearActiveHunt, claimHuntCharacter,
-  getHuntCollection, getHuntCharacterByIndex, getHuntLeaderboard,
-  isHuntCharacterClaimed, cacheHuntCharacter, getCachedHuntCharacter, getHuntPool,
+  getHuntCollection, getUserHuntCharacters, getHuntCharacterByIndex,
+  getHuntLeaderboard, isHuntCharacterClaimed, cacheHuntCharacter,
+  getCachedHuntCharacter, getHuntPool,
+  // Attack
+  getAttackEligibleUsers,
   // Memory
   setMemory, getMemory, getMemoriesByCategory, deleteMemory,
   // Bot state
@@ -1164,10 +1588,11 @@ module.exports = {
   setHidden, isHidden,
   // Ping
   ping,
-  // Postgres
+  // Postgres + hydration
   syncInfo, initPg, ensurePgTables, acquireInstanceLock, releaseInstanceLock,
   startMirrorLoop, startRecoveryLoop, queuePgWrite, drainMirrorQueue,
-  fullMirror, mirrorTable,
+  fullMirror, mirrorTable, hydrateFromPg, initPersistence,
+  setSyncEnabled, isSyncEnabled,
   // Close
   close,
   // Raw db for advanced use
