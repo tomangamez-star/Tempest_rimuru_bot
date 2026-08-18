@@ -1,1867 +1,218 @@
-'use strict';
-/**
- * Rimuru Tempest Casino — main bot router.
- * Wires node-telegram-bot-api to every module. Handles commands, inline
- * callbacks, penalties (ban/sus/mute), the "Rimuru" AI trigger, reply-to-bot
- * conversations, owner emoji reactions, sticker sending, the persistent
- * command menu (setMyCommands) and the multi-level inline menu system.
- *
- * UI: EVERY message is a "notebook note" — vibrant Rimuru blue/cyan + gold
- * with a vertical margin bar on the LEFT edge (HTML <blockquote>). All
- * sending goes through src/send.js so the bar renders on casino, games,
- * economy, leaderboard, balance, help — every single message.
- *
- * Navigation: the persistent ☰ command menu under the text input
- * (setMyCommands + setChatMenuButton) is the PRIMARY navigation. Inline
- * keyboards on messages are HIDDEN by default (SHOW_INLINE_BUTTONS=false)
- * but the inline menu code stays intact and toggleable.
- */
-const TelegramBot = require('node-telegram-bot-api');
-const path = require('path');
-const fs = require('fs');
-
-const config = require('./config');
-const db = require('./db');
-const eco = require('./economy');
-const cd = require('./cooldowns');
-const admin = require('./admin');
-const leaderboard = require('./leaderboard');
-const rimuru = require('./rimuru');
-const memory = require('./memory');
-const income = require('./income');
-const { fmt, humanDuration, note, pick, THEME } = require('./utils');
-const send = require('./send');
-
-const slots = require('./games/slots');
-const dice = require('./games/dice');
-const coinflip = require('./games/coinflip');
-const mines = require('./games/mines');
-const blackjack = require('./games/blackjack');
-const roulette = require('./games/roulette');
-const higherlower = require('./games/higherlower');
-const lottery = require('./games/lottery');
-const race = require('./games/race');
-const guess = require('./games/guess');
-const crash = require('./games/crash');
-const wheel = require('./games/wheel');
-const rps = require('./games/rps');
-const tictactoe = require('./games/tictactoe');
-const dicevs = require('./games/dicevs');
-const cfstreak = require('./games/cfstreak');
-const numroulette = require('./games/numroulette');
-const shop = require('./shop');
-const crime = require('./crimes/crime');
-const fishing = require('./fish');
-const robbery = require('./crimes/robbery');
-const heist = require('./crimes/heist');
-const keyboards = require('./keyboards');
-const missions = require('./missions');
-const backup = require('./backup');
-const redeem = require('./redeem');
-const profile = require('./profile');
-const broadcastMod = require('./broadcast');
-const attack = require('./attack');
-const fbi = require('./fbi');
-const rank = require('./rank');
-const timewallet = require('./timewallet');
-const waifu = require('./waifu');
-const hunt = require('./hunt');
-const dashboard = require('./dashboard/server');
-
-// In-memory heist timers (leaderId -> timeout)
-const heistTimers = new Map();
-
-// Health/debug state for /debug (staff-only)
-let lastError = null;
-let commitHash = null;
-try {
-  commitHash =
-    process.env.RENDER_GIT_COMMIT ||
-    require('child_process').execSync('git rev-parse --short HEAD', { timeout: 2000 }).toString().trim();
-} catch (e) {
-  commitHash = null;
-}
-
-// Owner emoji reaction keywords (config.reactions)
-const REACT_KEYS = Object.keys(config.reactions).filter((k) => k !== 'fallback');
-
-// Persistent command menu — the "☰" button next to the text input.
-// This is the PRIMARY navigation (Telegram renders it as a dropdown under
-// the input bar, the same area as the sticker/attachment menu).
-const MENU_COMMANDS = [
-  { command: 'leaderboard', description: '🏆 Leaderboard' },
-  { command: 'balance', description: '💰 Balance' },
-  { command: 'casino', description: '🎰 Casino' },
-  { command: 'games', description: '🎮 Games' },
-  { command: 'economy', description: '💼 Economy' },
-  { command: 'shop', description: '🛒 Shop' },
-  { command: 'crime', description: '🕵️ Crime' },
-  { command: 'profile', description: '🪪 Profile / Badges' },
-  { command: 'help', description: '❓ Help' },
-  { command: 'health', description: '👌 Health' },
-  { command: 'attack', description: '🐉 Deploy attackers (owner)' },
-  { command: 'fbi', description: '🚔 FBI raid (owner)' },
-  { command: 'swat', description: '🚔 SWAT raid (owner)' },
-  { command: 'rank', description: '🏆 Your rank' },
-  { command: 'ranks', description: '📊 Rank ladder' },
-  { command: 'waifu', description: '💝 Spawn a waifu (owner)' },
-  { command: 'collection', description: '💝 Your waifu collection' },
-  { command: 'wlb', description: '💝 Waifu leaderboard' },
-  { command: 'viewwaifu', description: '💝 View a waifu by number' },
-  { command: 'hunt', description: '⚔️ Start an anime hunt (owner)' },
-  { command: 'char', description: '⚔️ Search an anime character' },
-  { command: 'characters', description: '⚔️ Your character collection' },
-  { command: 'viewchar', description: '⚔️ View a character by number' },
-  { command: 'clb', description: '⚔️ Character leaderboard' },
-  { command: 'remember', description: '🧠 Store a memory (owner)' },
-  { command: 'recall', description: '🧠 Recall a memory (owner)' },
-];
-
-function createBot() {
-  const bot = new TelegramBot(config.telegramToken, {
-    polling: true,
-    onlyFirstMatch: false,
-    filepath: false,
-  });
-
-  // sendPhoto helper used by /viewwaifu and /viewchar (photo-first, text fallback).
-  const depsPhoto = (chatId, imageUrl, opts) => bot.sendPhoto(chatId, imageUrl, opts);
-
-  /* ---------- helpers ---------- */
-
-  function metaOf(msg) {
-    const from = msg.from || {};
-    return { username: from.username || '', first_name: from.first_name || '' };
-  }
-
-  function isOwner(userId) {
-    return String(userId) === String(config.ownerId);
-  }
-
-  /** Authorized staff = the owner OR a moderator registered in the dashboard. */
-  function isAuthorized(userId) {
-    if (isOwner(userId)) return true;
-    try {
-      return !!db.getAdminUser(Number(userId));
-    } catch (e) {
-      return false;
-    }
-  }
-
-  /** Staff check (owner + dashboard moderators). Used by the group gate,
-   *  Rimuru personality split, /debug and /restart. */
-  function isStaff(userId) {
-    return isAuthorized(userId);
-  }
-
-  /**
-   * Reply wrapper — EVERY message is a blockquote notebook note (HTML).
-   * opts: { title, color, icon, raw, html, parse_mode, reply_markup,
-   *         reply_to_message_id, ... }
-   *  - opts.html === true OR opts.parse_mode === 'HTML' → body is TRUSTED
-   *    HTML (never re-escaped — this kills the double-escape bug).
-   *  - opts.raw === true → send the body verbatim (no note wrapper);
-   *    still forced through parse_mode HTML + sanitizer as a safety net.
-   *  - Inline keyboards are gated behind config.showInlineButtons.
-   */
-  async function reply(chatId, text, opts = {}) {
-    const trustedHtml = opts.html === true || opts.parse_mode === 'HTML';
-    // Reply-to-message: quote the triggering message ("replying to @user"
-    // bubble) when the sender is replying to the bot, or for bot commands /
-    // Rimuru triggers (the router tags ctx.msg._replyTarget).
-    if (!opts.reply_to_message_id && opts._replyTarget) {
-      opts = { ...opts, reply_to_message_id: opts._replyTarget };
-      delete opts._replyTarget;
-    }
-    if (opts.raw) {
-      // Raw HTML — sanitize, no note wrapper. parse_mode stays HTML.
-      const safe = send.sanitizeHtml(text);
-      return send.sendText(bot, chatId, safe, { ...opts, html: true, raw: true });
-    }
-    return send.sendText(bot, chatId, text, { ...opts, html: trustedHtml });
-  }
-
-  /** Edit wrapper — same note-style rules as reply(). */
-  async function editMsg(chatId, messageId, text, opts = {}) {
-    const trustedHtml = opts.html === true || opts.parse_mode === 'HTML';
-    if (opts.raw) {
-      const safe = send.sanitizeHtml(text);
-      return send.editText(bot, chatId, messageId, safe, { ...opts, html: true, raw: true });
-    }
-    return send.editText(bot, chatId, messageId, text, { ...opts, html: trustedHtml });
-  }
-
-  /** Threaded reply (replies to a specific message — "replying to @user"). */
-  async function replyThreaded(chatId, messageId, text, opts = {}) {
-    return reply(chatId, text, { ...opts, reply_to_message_id: messageId });
-  }
-
-  function buildCtx(msg, args = []) {
-    const from = msg.from || {};
-    return {
-      bot,
-      msg,
-      args,
-      chatId: msg.chat.id,
-      userId: from.id,
-      isOwner: isOwner(from.id),
-      eco,
-      cd,
-      config,
-      db,
-      keyboards,
-      // Native reply-keyboard builder for the current page
-      // ('main' | 'casino' | 'games' | 'economy') — attach to a response
-      // via reply_markup so the grid persists above the phone keyboard.
-      keyboardFor: (page) => keyboards.keyboardFor(page),
-      reply: (t, o) => reply(msg.chat.id, t, { ...(msg._replyTarget ? { _replyTarget: msg._replyTarget } : {}), ...o }),
-      editMsg: (chatId, messageId, t, o) => editMsg(chatId, messageId, t, o),
-      answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
-    };
-  }
-
-  /** Parse "/cmd arg1 arg2" from message text. */
-  function parseCommand(text) {
-    const t = String(text || '').trim();
-    if (!t.startsWith('/')) return null;
-    const parts = t.slice(1).split(/\s+/);
-    const cmd = parts[0].split('@')[0].toLowerCase();
-    return { cmd, args: parts.slice(1) };
-  }
-
-  /** Resolve a replied-to user (for /rob, /heist, /donate, /transfer). */
-  function repliedUser(msg) {
-    const r = msg.reply_to_message;
-    if (!r || !r.from) return null;
-    return r.from;
-  }
-
-  /* ---------- penalty gating ---------- */
-
-  function canInteract(userId, gambling = true) {
-    return admin.checkInteract(userId, { gambling });
-  }
-
-  /* ---------- stickers (Rimuru vibe) — ALWAYS AFTER the text ---------- */
-
-  let stickerCache = null;
-  let stickerDisabled = false;
-
-  /** Get a random sticker file_id from the configured pack (graceful). */
-  async function nextSticker() {
-    if (!config.stickerPack || stickerDisabled) return null;
-    try {
-      if (!stickerCache) {
-        const set = await bot.getStickerSet(config.stickerPack);
-        stickerCache = (set.stickers || []).map((s) => s.file_id);
-      }
-      if (!stickerCache.length) {
-        stickerDisabled = true;
-        return null;
-      }
-      return stickerCache[Math.floor(Math.random() * stickerCache.length)];
-    } catch (e) {
-      console.warn(`[sticker] pack "${config.stickerPack}" unavailable — stickers disabled:`, e.message);
-      stickerDisabled = true;
-      return null;
-    }
-  }
-
-  /** Send the sticker AFTER the text message resolves (never before). */
-  async function stickerAfterText(chatId, textPromise) {
-    const fileId = await nextSticker();
-    if (!fileId) return null;
-    try {
-      await textPromise; // text FIRST
-    } catch (e) {
-      /* text failed — still try the sticker */
-    }
-    try {
-      return await bot.sendSticker(chatId, fileId);
-    } catch (e) {
-      console.warn('[sticker] send failed:', e.message);
-      return null;
-    }
-  }
-
-  /* ---------- GROUP MEMBERSHIP GATE (@the_jtf) ---------- */
-  // Before any non-staff user can use the bot (games/economy/commands),
-  // they must be a member of config.requiredGroup. Staff bypass entirely.
-  // Membership results are cached for config.groupGateCacheMs (60s) to avoid
-  // hammering the Telegram API; the /verify button always re-checks fresh.
-
-  const membershipCache = new Map(); // userId -> { ok: boolean, at: number }
-  const MEMBERSHIP_CACHE_MAX = 5000; // OOM fix: bound the cache so it can't grow forever
-  /** Cache a membership result, evicting the oldest entry when over cap. */
-  function cacheMembership(userId, val) {
-    membershipCache.set(userId, val);
-    if (membershipCache.size > MEMBERSHIP_CACHE_MAX) {
-      const oldest = membershipCache.keys().next().value;
-      if (oldest !== undefined) membershipCache.delete(oldest);
-    }
-  }
-
-  let resolvedGroupId = config.requiredGroupId || 0;
-  let groupResolvePromise = null;
-
-  /** Resolve the required group's numeric chat id via getChat('@the_jtf').
-   *  Uses the REQUIRED_GROUP_ID override when set. Cached after first OK. */
-  async function resolveRequiredGroup() {
-    if (resolvedGroupId) return resolvedGroupId;
-    if (groupResolvePromise) return groupResolvePromise;
-    if (!config.requiredGroup) return 0; // gate disabled
-    groupResolvePromise = (async () => {
-      try {
-        const chat = await bot.getChat(config.requiredGroup);
-        if (chat && chat.id) {
-          resolvedGroupId = chat.id;
-          console.log(`[gate] required group ${config.requiredGroup} resolved to chat ${resolvedGroupId}`);
-        } else {
-          console.warn(`[gate] getChat(${config.requiredGroup}) returned no id — gate OFF`);
-        }
-      } catch (e) {
-        console.warn(`[gate] could not resolve ${config.requiredGroup}: ${e.message} — gate OFF until resolved`);
-      } finally {
-        groupResolvePromise = null;
-      }
-      return resolvedGroupId;
-    })();
-    return groupResolvePromise;
-  }
-
-  /** Fresh membership check (never cached) — used by /verify. */
-  async function checkMembershipFresh(userId) {
-    if (isStaff(userId)) return { ok: true, staff: true };
-    const gid = await resolveRequiredGroup();
-    if (!gid) return { ok: true, gateOff: true }; // gate disabled/unresolved → allow
-    try {
-      const m = await bot.getChatMember(gid, userId);
-      const status = m && m.status;
-      const member = ['creator', 'administrator', 'member'].includes(status);
-      membershipCache.set(userId, { ok: member, at: Date.now() });
-      cacheMembership(userId, { ok: member, at: Date.now() });
-      return { ok: member, status };
-    } catch (e) {
-      console.warn(`[gate] getChatMember(${gid}, ${userId}) error: ${e.message}`);
-      return { ok: false, status: 'error' };
-    }
-  }
-
-  /** Cached gate check (60s TTL). Fresh when expired. */
-  async function gateAllowed(userId) {
-    if (isStaff(userId)) return { ok: true, staff: true };
-    const cached = membershipCache.get(userId);
-    if (cached && Date.now() - cached.at < config.groupGateCacheMs) {
-      return { ok: cached.ok, cached: true };
-    }
-    return checkMembershipFresh(userId);
-  }
-
-  /** Is the gate actually active right now? (group configured + resolved) */
-  async function gateActive() {
-    if (!config.requiredGroup) return false;
-    if (config.requiredGroupId) return true;
-    const gid = await resolveRequiredGroup();
-    return !!gid;
-  }
-
-  /** The join-prompt message + inline "✅ Verify" button (always shown). */
-  function gatePrompt(chatId) {
-    const link = config.requiredGroup ? `https://t.me/${config.requiredGroup.replace(/^@/, '')}` : '';
-    return {
-      text:
-        `🔒 <b>JOIN THE GROUP FIRST</b>\n\n` +
-        `Mortal, you must be a member of <a href="${link}">${config.requiredGroup}</a> to use the casino.\n\n` +
-        `1️⃣ Tap the group link above and press <b>Join</b>\n` +
-        `2️⃣ Come back and tap <b>✅ Verify</b>\n\n` +
-        `Only members of the house get to play. 🐉`,
-      opts: {
-        title: '🔒 MEMBERS ONLY',
-        color: THEME.gold,
-        html: true,
-        reply_markup: {
-          inline_keyboard: [[{ text: '✅ Verify', callback_data: 'gate:verify' }]],
-        },
-        // The Verify button is essential to the gate flow — it must render
-        // even when SHOW_INLINE_BUTTONS=false.
-        alwaysShowMarkup: true,
-      },
-    };
-  }
-
-  /** /verify — force a FRESH membership check and report the result. */
-  async function verifyCommand(ctx) {
-    const res = await checkMembershipFresh(ctx.userId);
-    if (res.ok) {
-      await ctx.reply(
-        `✅ <b>VERIFIED!</b>\n\nWelcome to the house, ${ctx.msg.from.first_name || 'mortal'}. Everything is unlocked. 🎰`,
-        { title: '✅ VERIFIED', color: THEME.gold, html: true }
-      );
-    } else {
-      const p = gatePrompt(ctx.chatId);
-      await ctx.reply(p.text, p.opts);
-    }
-    return res;
-  }
-
-  /* ---------- owner smart reactions (dynamic, owner-only) ---------- */
-
-  // Dynamic fallback pool — picked at random so reactions feel alive.
-  const REACT_POOL = ['👍', '❤️', '😄', '😂', '👏', '🔥', '💯', '😎'];
-
-  /** Does this message target Rimuru (mention, reply-to-bot, or command)? */
-  function targetsRimuru(msg) {
-    const text = String(msg.text || msg.caption || '');
-    if (text.startsWith('/')) return true;            // bot command
-    if (rimuru.shouldTrigger(text)) return true;      // "rimuru" / mention
-    const r = msg.reply_to_message;
-    return !!(r && r.from && r.from.is_bot === true); // reply to the bot
-  }
-
-  /**
-   * Pick a dynamic emoji for the owner's message: keyword reactions win
-   * (e.g. "nice" → 👏), then sentiment hints, then a random pool pick so
-   * it feels alive and varied.
-   */
-  function reactionFor(text) {
-    const t = String(text || '').toLowerCase();
-    for (const key of REACT_KEYS) {
-      if (t.includes(key)) return config.reactions[key];
-    }
-    if (/\b(win|won|rich|profit|gain|lucky|jackpot|nice|great|love|good|yay)\b/.test(t)) {
-      return pick(['🎉', '🔥', '💯', '😄', '💰']);
-    }
-    if (/\b(lose|lost|broke|bad|sad|cry|rip|ouch|damn|fail|unlucky)\b/.test(t)) {
-      return pick(['💸', '😢', '😅', '🫠', '🙃']);
-    }
-    if (/\b(angry|mad|hate|rage|wtf|fuck|annoying)\b/.test(t)) {
-      return pick(['😡', '🤬', '😤']);
-    }
-    if (t.includes('?')) {
-      return pick(['🤔', '🧐']);
-    }
-    return pick(REACT_POOL);
-  }
-
-  /** Owner-only dynamic emoji reaction, fired before the text reply. */
-  async function maybeReact(msg) {
-    if (!msg.from || msg.from.is_bot) return;
-    if (!isOwner(msg.from.id)) return;                 // owner only
-    if (!targetsRimuru(msg)) return;                   // tag / reply / command only
-    const text = String(msg.text || msg.caption || '');
-    if (!text) return;
-    try {
-      await bot.setMessageReaction(msg.chat.id, msg.message_id, {
-        reaction: [{ type: 'emoji', emoji: reactionFor(text) }],
-      });
-    } catch (e) {
-      /* reactions are best-effort */
-    }
-  }
-
-  /* ---------- inline menu system (kept intact, gated by SHOW_INLINE_BUTTONS) ---------- */
-
-  const MENU = {
-    main: () => ({
-      text:
-        `🐉 <b>RIMURU'S CASINO</b>\n\n` +
-        `✨ Welcome to the Tempest house, mortal.\n` +
-        `👑 The house always wins — but I'll let you play.\n\n` +
-        `👇 <i>Pick your poison:</i>`,
-      markup: {
-        inline_keyboard: [
-          [
-            { text: '🏆 Leaderboard', callback_data: 'menu:lb' },
-            { text: '💰 Balance', callback_data: 'menu:bal' },
-          ],
-          [
-            { text: '🎰 Casino', callback_data: 'menu:casino' },
-            { text: '🎮 Games', callback_data: 'menu:games' },
-          ],
-          [
-            { text: '💼 Economy', callback_data: 'menu:economy' },
-            { text: '❓ Help', callback_data: 'menu:help' },
-          ],
-        ],
-      },
-    }),
-
-    casino: () => ({
-      text:
-        `🎰 <b>CASINO — the big tables</b>\n\n` +
-        `♠️ <b>Blackjack</b> — /bj [amount] · 3:2 on blackjack\n` +
-        `🎡 <b>Roulette</b> — /roulette [type] [amount] · up to 36×\n` +
-        `🍒 <b>Slots</b> — /slots [amount] · 2× / 4×\n` +
-        `🎟️ <b>Lottery</b> — /lottery buy · pot of 5,000,000+ 🤑\n\n` +
-        `👇 <i>Tap a game for details, or just type the command.</i>`,
-      markup: {
-        inline_keyboard: [
-          [
-            { text: '♠️ Blackjack', callback_data: 'menu:g:bj' },
-            { text: '🎡 Roulette', callback_data: 'menu:g:roulette' },
-          ],
-          [
-            { text: '🍒 Slots', callback_data: 'menu:g:slots' },
-            { text: '🎟️ Lottery', callback_data: 'menu:g:lottery' },
-          ],
-          [{ text: '⬅️ Back', callback_data: 'menu:main' }],
-        ],
-      },
-    }),
-
-    games: () => ({
-      text:
-        `🎮 <b>GAMES — quick & light</b>\n\n` +
-        `🪙 <b>Coin Flip</b> — /cf [heads|tails] [amount] · 2×\n` +
-        `💎 <b>Mines</b> — /mines [amount] · 5×5, 4 mines (1 hidden) that MOVE after each pick\n` +
-        `🎲 <b>Dice</b> — /dice [1-6] [amount] · 6× if you hit\n` +
-        `📏 <b>Higher or Lower</b> — /hl [amount] · streak multiplier\n\n` +
-        `👇 <i>Tap a game for details, or just type the command.</i>`,
-      markup: {
-        inline_keyboard: [
-          [
-            { text: '🪙 Coin Flip', callback_data: 'menu:g:cf' },
-            { text: '💎 Mines', callback_data: 'menu:g:mines' },
-          ],
-          [
-            { text: '🎲 Dice', callback_data: 'menu:g:dice' },
-            { text: '📏 Higher/Lower', callback_data: 'menu:g:hl' },
-          ],
-          [
-            { text: '🎯 Guess Number', callback_data: 'menu:g:guess' },
-            { text: '🎰 Lottery', callback_data: 'menu:g:lottery' },
-          ],
-          [{ text: '⬅️ Back', callback_data: 'menu:main' }],
-        ],
-      },
-    }),
-
-    economy: () => ({
-      text:
-        `💼 <b>ECONOMY</b>\n\n` +
-        `👛 Wallet (rob-able) vs 🏦 Bank (safe).\n` +
-        `💰 Keep your loot in the bank, mortal.\n\n` +
-        `✨ <i>More tools coming soon…</i>`,
-      markup: {
-        inline_keyboard: [
-          [
-            { text: '🏦 Deposit All', callback_data: 'menu:eco:depAll' },
-            { text: '🏦 Deposit 100k', callback_data: 'menu:eco:dep100k' },
-          ],
-          [
-            { text: '👛 Withdraw All', callback_data: 'menu:eco:wdAll' },
-            { text: '👛 Withdraw 100k', callback_data: 'menu:eco:wd100k' },
-          ],
-          [{ text: '⬅️ Back', callback_data: 'menu:main' }],
-        ],
-      },
-    }),
-  };
-
-  const GAME_USAGE = {
-    bj: '♠️ <b>Blackjack</b>\n<code>/bj [amount]</code>\nHit / Stand / Double. Dealer stands on 17+. Blackjack pays 3:2. 💪',
-    roulette: '🎡 <b>Roulette</b>\n<code>/roulette color red 5000</code>\nred|black 2× · even|odd 2× · low|high 2× · dozen 3× · column 3× · straight 36× · split 18×',
-    slots: '🍒 <b>Slots</b>\n<code>/slots [amount]</code>\n3 reels — 2 match = 2×, 3 match = 4×. 🎰',
-    lottery: '🎟️ <b>Lottery</b>\n<code>/lottery buy [tickets]</code>\nTicket = 10,000 coins. 5 buyers = draw. Pot grows with every ticket! 🤑',
-    cf: '🪙 <b>Coin Flip</b>\n<code>/cf [heads|tails] [amount]</code>\nWin = double. 🍀',
-    mines: '💎 <b>Mines</b>\n<code>/mines [amount]</code>\n5×5 grid, 4 mines (1 hidden) — the mines MOVE after every pick. +25% of your bet per safe pick. Cash out anytime. 💣',
-    dice: '🎲 <b>Dice</b>\n<code>/dice [1-6] [amount]</code>\nAnimated dice — hit your number = 6×. Rare, but sweet. 😎',
-    hl: '📏 <b>Higher or Lower</b>\n<code>/hl [amount]</code>\nGuess the next card. Streak multiplier climbs, cash out anytime. 🔥',
-    guess: '🎯 <b>Guess the Number</b>\n<code>/guess [amount]</code>\nPick 1-10. 3 chances with higher/lower hints. 1st try = 5x, 2nd = 3x, 3rd = 2x. 🎲',
-    crash: '💥 <b>Crash</b>\n<code>/crash [amount]</code>\nA LIVE multiplier rocket — press 💰 CASHOUT before it explodes. Long rides pay big. 💥',
-    wheel: '🎡 <b>Wheel of Fortune</b>\n<code>/wheel [amount]</code>\nSpin a 12-segment wheel — 0.5x to 10x. Lady luck decides. 🎰',
-    rps: '✊ <b>Rock Paper Scissors</b>\n<code>/rps [rock|paper|scissors] [amount]</code>\nBeat the house. Tie = half back. ✋✌️',
-    ttt: '⭕ <b>Tic-Tac-Toe</b>\n<code>/ttt [amount]</code>\nButton game vs the house — pick difficulty (Easy/Normal/Hard), then X or O. No bet = play for fun. ❌',
-    duel: '🎲 <b>Dice Duel</b>\n<code>/duel [amount]</code>\nYou vs the house — higher roll wins. Ties go to the house. ⚔️',
-    cfs: '🪙 <b>Coin Flip Streak</b>\n<code>/cfs [heads|tails] [amount]</code>\nEach correct flip doubles your payout. One miss = everything gone. 🔥',
-    num: '🎯 <b>Number Roulette</b>\n<code>/num [1-10] [amount]</code>\nPick 1-10. Rarer picks pay more — up to 9x. 🎡',
-  };
-
-  /** Build a menu message (text + markup) and send it. */
-  async function sendMenu(chatId, page = 'main', opts = {}) {
-    const m = MENU[page]();
-    // Route through reply() so the menu message is a blockquote note too
-    // (bar renders) and reply_to_message_id is honoured.
-    return reply(chatId, m.text, {
-      title: '\ud83d\udcdc RIMURU MENU', color: THEME.gold, icon: '\ud83d\udcdc',
-      html: true, reply_markup: send.inlineMarkup(m.markup), ...opts,
-    });
-  }
-
-  /** Edit an existing menu message to a different page. */
-  async function editMenu(chatId, messageId, page = 'main') {
-    const m = MENU[page]();
-    // Route through editMsg() — same blockquote-note style, parse-error safe.
-    return editMsg(chatId, messageId, m.text, {
-      title: '\ud83d\udcdc RIMURU MENU', color: THEME.gold, icon: '\ud83d\udcdc',
-      html: true, reply_markup: send.inlineMarkup(m.markup),
-    }).catch((e) => {
-      console.warn('[menu] edit failed:', e.message);
-      return null;
-    });
-  }
-
-  /* ---------- command handlers ---------- */
-
-  const handlers = {
-    start: async (ctx) => {
-      const u = eco.ensure(ctx.userId, metaOf(ctx.msg));
-      // Blockquote (notebook note) intro — Rimuru welcomes the user to the group.
-      await ctx.reply(
-        `Welcome to the Tempest house, <b>${u.first_name || 'mortal'}</b>. 🐉\n\n` +
-        `I'm <b>Rimuru Tempest</b> — the lord of this casino. The house always wins… but I'll let you play. ✨\n\n` +
-        `You start with <b>${fmt(config.startBalance)}</b> coins. 💰\n\n` +
-        `Tap a button below to explore — or just type a command. 👇`,
-        {
-          title: '🐉 RIMURU TEMPEST CASINO',
-          color: THEME.blue,
-          html: true,
-          // Centered inline buttons (main menu) — always shown on /start.
-          reply_markup: MENU.main().markup,
-          alwaysShowMarkup: true,
-        }
-      );
-      // Native reply keyboard appears automatically after /start —
-      // the grid above the phone keyboard (toggleable, not persistent).
-      // ALWAYS re-send a FRESH main keyboard: Telegram caches the keyboard
-      // per chat, so a group that saw an OLD deploy's labels (e.g. colored
-      // emojis from a previous build) keeps tapping stale text. Re-sending
-      // here replaces the stale cached keyboard with the current labels.
-      if (config.showReplyKeyboard) {
-        try {
-          await bot.sendMessage(ctx.chatId, '⌨️ Your quick-menu keyboard is ready below.', {
-            reply_markup: keyboards.keyboardFor('main'),
-          });
-        } catch (e) {
-          console.warn('[start] keyboard:', e.message);
-        }
-      }
-      // GROUP GATE: even /start checks membership for non-staff — if they
-      // haven't joined the required group yet, show the join prompt.
-      if (!isStaff(ctx.userId)) {
-        const gate = await gateAllowed(ctx.userId);
-        if (!gate.ok) {
-          const p = gatePrompt(ctx.chatId);
-          await ctx.reply(p.text, p.opts);
-        }
-      }
-    },
-
-    menu: async (ctx) => sendMenu(ctx.chatId),
-
-    casino: async (ctx) => {
-      await ctx.reply(MENU.casino().text, {
-        title: '🎰 CASINO', color: THEME.cyan, html: true,
-        reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('casino') : send.inlineMarkup(MENU.casino().markup),
-      });
-    },
-    games: async (ctx) => {
-      await ctx.reply(MENU.games().text, {
-        title: '🎮 GAMES', color: THEME.cyan, html: true,
-        reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('games') : send.inlineMarkup(MENU.games().markup),
-      });
-    },
-    economy: async (ctx) => {
-      await ctx.reply(MENU.economy().text, {
-        title: '💼 ECONOMY', color: THEME.cyan, html: true,
-        reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('economy') : send.inlineMarkup(MENU.economy().markup),
-      });
-    },
-
-    help: async (ctx) => {
-      await ctx.reply(
-        `<b>🎮 Games</b> (per-game cooldown)\n` +
-        `• /slots [amt] — 3 reels, 2×/4×\n` +
-        `• /dice [1-6] [amt] — animated dice, 6×\n` +
-        `• /cf [heads|tails] [amt] — 2×\n` +
-        `• /mines [amt] — 5×5, 4 mines (1 hidden) that MOVE after each pick, +25% per safe pick\n` +
-        `• /bj [amt] — blackjack, 3:2 on blackjack\n` +
-        `• /roulette [color|even|odd|low|high|dozen|column|straight|split] [amt]\n` +
-        `• /hl [amt] — higher or lower, streak multiplier\n` +
-        `• /guess [amt] — pick 1-10, 3 chances, up to 5x\n` +
-        `• /lottery [buy|draw|status] [n] — tickets 10k, 5 buyers = draw\n\n` +
-        `<b>🔥 New games</b>\n` +
-        `• /crash [amt] — multiplier rocket, cash out before it crashes 💥\n` +
-        `• /wheel [amt] — wheel of fortune, 0.5x–10x 🎡\n` +
-        `• /rps [rock|paper|scissors] [amt] — vs the house ✊✋✌️\n` +
-        `• /ttt [amt] — button tic-tac-toe vs the house (difficulty + X/O, no bet = fun) ⭕❌\n` +
-        `• /duel [amt] — dice duel, higher roll wins 🎲\n` +
-        `• /cfs [heads|tails] [amt] — coin flip streak, doubles each win 🪙\n` +
-        `• /num [1-10] [amt] — number roulette, rare picks pay up to 9x 🎯\n\n` +
-        `<b>💼 Economy</b>\n` +
-        `• /balance — wallet + bank\n` +
-        `• /dep [amt|all] — wallet → bank\n` +
-        `• /wd [amt|all] — bank → wallet\n` +
-        `• /donate [amt] (reply) — from wallet\n` +
-        `• /transfer [amt] (reply) — from bank\n\n` +
-        `<b>🕵️ Crime</b>\n` +
-        `• /rob (reply) — 10 min cooldown, fail = fine\n` +
-        `• /crime [amt] — bet on a crime, up to 7x (needs shop items)\n` +
-        `• /heist (reply) — 20 min, open 60s for /join, max 5 crew\n` +
-        `• /join — join an open heist\n\n` +
-        `<b>🛒 Shop</b>\n` +
-        `• /shop — item list · /buy [id] [qty] — buy items\n` +
-        `• /inv — your inventory (crowbar/gun/mask → crime, hook → /fish)\n\n` +
-        `<b>💵 Income</b>\n` +
-        `• /beg · /work · /fish · /dig — quick coins\n` +
-        `• /daily — 24h · /bonus — weekly\n\n` +
-        `<b>🎣 Activities</b>\n` +
-        `• /fish — needs a Fishing Hook from /shop\n` +
-        `• /dig — treasure hunt\n\n` +
-        `<b>🪪 Profile</b>\n` +
-        `• /p — your profile card (rank, win rate, badges)\n` +
-        `• /badges — your earned badges\n` +
-        `• /id — your ID card\n` +
-        `• /rank — your rank, logo, progress + time-wallet\n` +
-        `• /ranks — full rank ladder (Bronze → Mythic)\n\n` +
-        `<b>🕹️ Other</b>\n` +
-        `• /race [amt] — race against the house\n` +
-        `• /hide — 50M coins, vanish from robs &amp; heists for 60s\n` +
-        `• /redeem [CODE] — claim a code (coins go to BANK)\n` +
-        `• /verify — re-check your group membership\n` +
-        `• /health — bot health &amp; persistence status (anyone)\n\n` +
-        `<b>👑 Staff</b>\n` +
-        `• /redeem create [CODE] [AMT] [USES] — mint a code (mods capped at 50M)\n` +
-        `• /redeem list · /redeem delete [CODE] · /backup · /backups · /restore [id]\n` +
-        `• /sb [amount] — set a user's whole networth (wallet = amount, bank = 0)\n` +
-        `• /broadcast [message] (alias /bd) — announce to all users & groups\n` +
-        `  · owner: any message · mods: must be relevant to the bot\n` +
-        `• /set [type] [title] | [desc] | [reward] (alias /s) — create an event / mission / giveaway\n` +
-        `• /attack — Rimuru deploys attackers against a wealthy player (owner/Rimuru only)\n` +
-        `• /attack [number] (reply) — deploy exactly N attackers against the replied user (owner only)\n` +
-        `• /FBI (alias /SWAT) — reply to raid a user's home (owner only, case-sensitive escape)\n` +
-        `• /xleaderboard [n] (alias /xlb) — full networth list of ALL players, 1–100 (staff only)\n` +
-        `• /stop — pause the bot for maintenance (owner) · /run — resume\n\n` +
-        `<b>💝 Waifu collection</b>\n` +
-        `• /waifu (alias /wspawn) — spawn a random character card with a Claim button (owner only)\n` +
-        `• /collection (alias /waifus) — your claimed characters (numbered)\n` +
-        `• /viewwaifu [number] (alias /vw) — view one claimed character by number\n` +
-        `• /character [name] — details of one claimed character\n` +
-        `• /wlb — top waifu collectors\n\n` +
-        `<b>⚔️ Anime Hunt</b>\n` +
-        `• /hunt (alias /shunt) — start an anime hunt, spawn a random character (owner only)\n` +
-        `• /char [name] (alias /whois) — search a character and see their info (anyone)\n` +
-        `• /characters — your claimed characters (numbered)\n` +
-        `• /viewchar [number] (alias /vc) — view one claimed character by number\n` +
-        `• /clb [n] — top character hunters (default 10, max 100)\n` +
-        `• /remember [key] [value] — store a memory (owner only)\n` +
-        `• /recall [key] — retrieve a memory (owner only)\n\n` +
-        `<b>🏆 /lb</b> — top 10 richest\n` +
-        `<b>📜 /menu</b> — interactive menu\n` +
-        `☰ <i>The menu button next to the text box has all commands.</i>\n` +
-        `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
-        { title: '❓ RIMURU HELP', color: THEME.gold, html: true }
-      );
-    },
-
-    balance: async (ctx) => {
-      const u = eco.ensure(ctx.userId, metaOf(ctx.msg));
-      await ctx.reply(
-        `👛 Wallet (rob-able): <b>${fmt(u.wallet)}</b>\n` +
-        `🏦 Bank (safe): <b>${fmt(u.bank)}</b>\n` +
-        `💎 Net worth: <b>${fmt(u.wallet + u.bank)}</b>`,
-        { title: `💰 ${u.first_name || 'YOUR'} BALANCE`, color: THEME.gold, html: true }
-      );
-    },
-
-    // 💼 Economy sub-keyboard actions (reply-keyboard button taps)
-    bank: async (ctx) => {
-      const u = eco.ensure(ctx.userId, metaOf(ctx.msg));
-      await ctx.reply(
-        `🏦 <b>BANK</b>\n\n` +
-        `💼 Saved: <b>${fmt(u.bank)}</b>\n` +
-        `👛 Wallet: <b>${fmt(u.wallet)}</b>\n\n` +
-        `Use <code>/dep [amount|all]</code> to deposit or <code>/wd [amount|all]</code> to withdraw.`,
-        { title: '🏦 BANK', color: THEME.cyan, html: true }
-      );
-    },
-    income: async (ctx) => {
-      await ctx.reply(
-        `<b>💵 INCOME</b>\n\n` +
-        `• /beg — quick coins\n` +
-        `• /work — steady pay\n` +
-        `• /fish — lucky catch\n` +
-        `• /dig — treasure hunt\n` +
-        `• /daily — 24h reward\n` +
-        `• /bonus — weekly reward`,
-        { title: '💵 INCOME', color: THEME.gold, html: true }
-      );
-    },
-
-    dep: async (ctx) => {
-      // No amount → "all" (withdraw/deposit the full balance by default).
-      const r = eco.deposit(ctx.userId, ctx.args[0] || 'all');
-      await ctx.reply(r.message, { title: '🏦 DEPOSIT', color: THEME.cyan });
-    },
-    deposit: async (ctx) => {
-      const r = eco.deposit(ctx.userId, ctx.args[0] || 'all');
-      await ctx.reply(r.message, { title: '🏦 DEPOSIT', color: THEME.cyan });
-    },
-    wd: async (ctx) => {
-      const r = eco.withdraw(ctx.userId, ctx.args[0] || 'all');
-      await ctx.reply(r.message, { title: '💵 WITHDRAW', color: THEME.cyan });
-    },
-    withdraw: async (ctx) => {
-      const r = eco.withdraw(ctx.userId, ctx.args[0] || 'all');
-      await ctx.reply(r.message, { title: '💵 WITHDRAW', color: THEME.cyan });
-    },
-
-    donate: async (ctx) => {
-      const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/donate [amount]</code>. 🎯', { title: '💝 DONATE', color: THEME.cyan, html: true });
-      const r = eco.donate(ctx.userId, target.id, ctx.args[0]);
-      await ctx.reply(r.message, { title: '💝 DONATE', color: THEME.cyan, html: true });
-    },
-    transfer: async (ctx) => {
-      const target = repliedUser(ctx.msg);
-      if (!target) return ctx.reply('Reply to someone with <code>/transfer [amount]</code>. 🎯', { title: '🏦 TRANSFER', color: THEME.cyan, html: true });
-      const r = eco.transfer(ctx.userId, target.id, ctx.args[0]);
-      await ctx.reply(r.message, { title: '🏦 TRANSFER', color: THEME.cyan, html: true });
-    },
-
-    // ----- games -----
-    slots: async (ctx) => {
-      const r = await slots.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'slots', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    dice: async (ctx) => {
-      const r = await dice.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'dice', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    cf: async (ctx) => {
-      const r = await coinflip.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'coinflip', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
-      return r;
-    },
-    coinflip: async (ctx) => {
-      const r = await coinflip.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'coinflip', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
-      return r;
-    },
-    mines: async (ctx) => {
-      const r = await mines.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'mines', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    bj: async (ctx) => {
-      const r = await blackjack.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'blackjack', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    roulette: async (ctx) => {
-      const r = await roulette.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'roulette', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    hl: async (ctx) => {
-      const r = await higherlower.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'higherlower', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    guess: async (ctx) => {
-      const r = await guess.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'guess', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    crash: async (ctx) => {
-      const r = await crash.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'crash', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    wheel: async (ctx) => {
-      const r = await wheel.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'wheel', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    rps: async (ctx) => {
-      const r = await rps.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'rps', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    ttt: async (ctx) => {
-      const r = await tictactoe.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'tictactoe', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    duel: async (ctx) => {
-      const r = await dicevs.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'dicevs', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    cfs: async (ctx) => {
-      const r = await cfstreak.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'cfstreak', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
-      return r;
-    },
-    coinflipstreak: async (ctx) => {
-      const r = await cfstreak.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'cfstreak', r.bet || ctx.args[1] || 0, r.won ? 'win' : 'lose', r.net);
-      return r;
-    },
-    num: async (ctx) => {
-      const r = await numroulette.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'numroulette', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    race: async (ctx) => {
-      const r = await race.play(ctx);
-      if (r && typeof r.won === 'boolean') logGame(ctx.userId, metaOf(ctx.msg), 'race', ctx.args[0], r.won ? 'win' : 'lose', r.net);
-    },
-    lottery: async (ctx) => {
-      await lottery.play(ctx);
-    },
-
-    // ----- crime -----
-    rob: async (ctx) => {
-      await robbery.play(ctx);
-    },
-    heist: async (ctx) => {
-      await heist.play(ctx);
-    },
-    crime: async (ctx) => {
-      await crime.play(ctx);
-    },
-    join: async (ctx) => {
-      await heist.join(ctx);
-    },
-
-    // ----- economy -----
-    daily: async (ctx) => {
-      await income.daily(ctx);
-    },
-    bonus: async (ctx) => {
-      await income.bonus(ctx);
-    },
-    beg: async (ctx) => {
-      await income.beg(ctx);
-    },
-    work: async (ctx) => {
-      await income.work(ctx);
-    },
-    fish: async (ctx) => {
-      await fishing.play(ctx);
-    },
-    dig: async (ctx) => {
-      await fishing.dig(ctx);
-    },
-
-    // ----- shop -----
-    shop: async (ctx) => {
-      await shop.shop(ctx);
-    },
-    buy: async (ctx) => {
-      await shop.buy(ctx);
-    },
-    inv: async (ctx) => {
-      await shop.inventory(ctx);
-    },
-
-    // ----- profile -----
-    p: async (ctx) => {
-      await profile.profile(ctx);
-    },
-    profile: async (ctx) => {
-      await profile.profile(ctx);
-    },
-    badges: async (ctx) => {
-      await profile.badges(ctx);
-    },
-    id: async (ctx) => {
-      await profile.id(ctx);
-    },
-
-    // ----- leaderboard -----
-    lb: async (ctx) => {
-      await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true });
-    },
-    leaderboard: async (ctx) => {
-      await ctx.reply(leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true });
-    },
-
-    // ----- staff -----
-    sb: async (ctx) => {
-      await admin.setBalance(ctx);
-    },
-    addcoin: async (ctx) => {
-      await admin.addCoins(ctx);
-    },
-    stop: async (ctx) => {
-      await admin.stop(ctx);
-    },
-    run: async (ctx) => {
-      await admin.run(ctx);
-    },
-    restart: async (ctx) => {
-      await admin.restart(ctx);
-    },
-    ban: async (ctx) => {
-      await admin.ban(ctx);
-    },
-    sus: async (ctx) => {
-      await admin.suspend(ctx);
-    },
-    mute: async (ctx) => {
-      await admin.mute(ctx);
-    },
-    unban: async (ctx) => {
-      await admin.unban(ctx);
-    },
-    unsus: async (ctx) => {
-      await admin.unsus(ctx);
-    },
-    unmute: async (ctx) => {
-      await admin.unmute(ctx);
-    },
-    debug: async (ctx) => {
-      await admin.debug(ctx, { lastError, commitHash });
-    },
-    backup: async (ctx) => {
-      await backup.now(ctx);
-    },
-    backups: async (ctx) => {
-      await backup.list(ctx);
-    },
-    restore: async (ctx) => {
-      await backup.restore(ctx);
-    },
-    redeem: async (ctx) => {
-      await redeem.handle(ctx);
-    },
-    xlb: async (ctx) => {
-      await admin.xleaderboard(ctx);
-    },
-    xleaderboard: async (ctx) => {
-      await admin.xleaderboard(ctx);
-    },
-
-    // ----- health -----
-    health: async (ctx) => {
-      await admin.health(ctx, { lastError, commitHash });
-    },
-
-    // ----- verify -----
-    verify: async (ctx) => {
-      await verifyCommand(ctx);
-    },
-
-    // ----- attack -----
-    attack: async (ctx) => {
-      await handleAttack(ctx);
-    },
-
-    // ----- FBI -----
-    fbi: async (ctx) => {
-      await handleFbi(ctx);
-    },
-    swat: async (ctx) => {
-      await handleFbi(ctx);
-    },
-
-    // ----- hide -----
-    hide: async (ctx) => {
-      await admin.hide(ctx);
-    },
-
-    // ----- rank -----
-    rank: async (ctx) => {
-      await rank.show(ctx);
-    },
-    ranks: async (ctx) => {
-      await rank.ladder(ctx);
-    },
-
-    // ----- broadcast -----
-    broadcast: async (ctx) => {
-      await handleBroadcast(ctx);
-    },
-    bd: async (ctx) => {
-      await handleBroadcast(ctx);
-    },
-
-    // ----- set -----
-    set: async (ctx) => {
-      await handleSet(ctx);
-    },
-    s: async (ctx) => {
-      await handleSet(ctx);
-    },
-
-    // ----- waifu -----
-    waifu: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can spawn a waifu. 👑', { title: '💝 WAIFU', color: THEME.red });
-      await waifu.spawn({ chatId: ctx.chatId });
-    },
-    wspawn: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can spawn a waifu. 👑', { title: '💝 WAIFU', color: THEME.red });
-      await waifu.spawn({ chatId: ctx.chatId });
-    },
-    collection: async (ctx) => {
-      const rows = db.getUserCharacters(ctx.userId);
-      await ctx.reply(waifu.collectionCaption(rows), { title: '💝 WAIFU', color: '#FF80AB', html: true });
-    },
-    waifus: async (ctx) => {
-      const rows = db.getUserCharacters(ctx.userId);
-      await ctx.reply(waifu.collectionCaption(rows), { title: '💝 WAIFU', color: '#FF80AB', html: true });
-    },
-    viewwaifu: async (ctx) => {
-      await viewWaifu(ctx);
-    },
-    vw: async (ctx) => {
-      await viewWaifu(ctx);
-    },
-    wlb: async (ctx) => {
-      const rows = db.getWaifuLeaderboard(100);
-      await ctx.reply(waifu.leaderboardCaption(rows, 100), { title: '💝 WAIFU LEADERBOARD', color: '#FF80AB', html: true });
-    },
-    character: async (ctx) => {
-      const rows = db.getUserCharacters(ctx.userId);
-      await ctx.reply(waifu.characterCaption(rows), { title: '💝 WAIFU', color: '#FF80AB', html: true });
-    },
-
-    // ----- anime hunt -----
-    hunt: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can start a hunt. 👑', { title: '⚔️ ANIME HUNT', color: THEME.red });
-      const r = await hunt.spawn({ chatId: ctx.chatId });
-      if (!r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-    },
-    shunt: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can start a hunt. 👑', { title: '⚔️ ANIME HUNT', color: THEME.red });
-      const r = await hunt.spawn({ chatId: ctx.chatId });
-      if (!r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-    },
-    char: async (ctx) => {
-      const q = (ctx.args || []).join(' ').trim();
-      if (!q) return ctx.reply('Usage: <code>/char <name></code> or <code>/whois <name></code>', { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-      const r = await hunt.searchAndShow(q, { chatId: ctx.chatId });
-      if (!r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-    },
-    whois: async (ctx) => {
-      const q = (ctx.args || []).join(' ').trim();
-      if (!q) return ctx.reply('Usage: <code>/whois <name></code> or <code>/char <name></code>', { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-      const r = await hunt.searchAndShow(q, { chatId: ctx.chatId });
-      if (!r.ok) await ctx.reply(r.message, { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-    },
-    characters: async (ctx) => {
-      const rows = db.getUserHuntCharacters(ctx.userId);
-      await ctx.reply(hunt.collectionCaption(rows), { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-    },
-    viewchar: async (ctx) => {
-      await viewChar(ctx);
-    },
-    vc: async (ctx) => {
-      await viewChar(ctx);
-    },
-    clb: async (ctx) => {
-      const n = Math.min(100, Math.max(1, parseInt((ctx.args || [])[0], 10) || 10));
-      const rows = db.getHuntLeaderboard(n);
-      await ctx.reply(hunt.leaderboardCaption(rows, n), { title: '⚔️ CHARACTER LEADERBOARD', color: THEME.gold, html: true });
-    },
-
-    // ----- memory -----
-    remember: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can store memories. 👑', { title: '🧠 MEMORY', color: THEME.red });
-      const args = ctx.args || [];
-      if (args.length < 2) return ctx.reply('Usage: <code>/remember key value</code>', { title: '🧠 MEMORY', color: THEME.cyan, html: true });
-      const key = args[0].toLowerCase().replace(/[^a-z0-9_]/g, '_');
-      const value = args.slice(1).join(' ').trim();
-      memory.remember(key, value, 'bot_fact');
-      await ctx.reply(`⟧ <b>Memory Stored</b>\\n\\n${key}: ${value}`, { title: '🧠 MEMORY', color: THEME.gold, html: true });
-    },
-    recall: async (ctx) => {
-      if (!ctx.isOwner) return ctx.reply('Only the King can recall memories. 👑', { title: '🧠 MEMORY', color: THEME.red });
-      const key = (ctx.args || [])[0];
-      if (!key) return ctx.reply('Usage: <code>/recall key</code>', { title: '🧠 MEMORY', color: THEME.cyan, html: true });
-      const mem = memory.recall(key.toLowerCase().replace(/[^a-z0-9_-]/g, '_'));
-      if (mem) {
-        await ctx.reply(`🧠 <b>Memory</b>\\n\\n${mem.key}: ${mem.value}`, { title: '🧠 MEMORY', color: THEME.gold, html: true });
-      } else {
-        await ctx.reply(`🧠 No memory found for "${key}."`, { title: '🧠 MEMORY', color: THEME.cyan, html: true });
-      }
-    },
-  };
-
-  /**
-   * /broadcast (alias /bd) — queue a bot-wide announcement (staff).
-   */
-  async function handleBroadcast(ctx) {
-    const actor = metaOf(ctx.msg);
-    if (!isStaff(ctx.userId)) {
-      return ctx.reply('Only the King and his moderators can broadcast. 👑', { title: '📣 BROADCAST', color: THEME.red });
-    }
-    const text = (ctx.args || []).join(' ').trim();
-    if (!text) {
-      return ctx.reply(
-        `Usage: <code>/broadcast [message]</code>\n\nOwner may broadcast any message. Moderators must keep it relevant to the Rimuru bot (economy, games, events, commands, etc.).`,
-        { title: '📣 BROADCAST', color: THEME.cyan, html: true }
-      );
-    }
-
-    // Owner bypasses the content gate entirely; moderators are gated.
-    if (!ctx.isOwner) {
-      const verdict = await broadcastMod.isRelevant(text);
-      if (!verdict.ok) {
-        db.logActivity('mod', `Rejected broadcast from ${actor.username || ctx.userId}: ${text.slice(0, 80)} (${verdict.reason})`, { target: ctx.userId });
-        return ctx.reply(
-          `🚫 <b>BROADCAST REJECTED</b>\n\nThat message isn't relevant to the Rimuru bot (${verdict.reason}). Moderators can only broadcast about the bot, its economy, games, events, commands, or maintenance.`,
-          { title: '📣 BROADCAST', color: THEME.red, html: true }
-        );
-      }
-    }
-
-    const rec = db.createBroadcast(text, 'all', ctx.userId);
-    dashboard.queueBroadcast(rec.id, rec.message, 'all');
-    db.logActivity('broadcast', `Broadcast queued by ${actor.username || ctx.userId}: ${text.slice(0, 60)}`, { broadcast_id: rec.id });
-    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'broadcast', 0, `target=all`);
-    await ctx.reply(
-      `📣 <b>BROADCAST QUEUED</b> (#${rec.id})\n\nDelivering to all known users & groups…`,
-      { title: '📣 BROADCAST', color: THEME.gold, html: true }
-    );
-  }
-
-  /**
-   * /set (alias /s) — create an event / mission / giveaway that goes LIVE in
-   * the bot. Staff (owner + moderators) may use it. Usage:
-   *   /set [type] [title] | [description] | [reward]
-   */
-  async function handleSet(ctx) {
-    const actor = metaOf(ctx.msg);
-    if (!isStaff(ctx.userId)) {
-      return ctx.reply('Only the King and his moderators can set events. 👑', { title: '🎯 SET EVENT', color: THEME.red });
-    }
-
-    const args = (ctx.args || []).join(' ').trim();
-    if (!args) {
-      return ctx.reply(
-        `Usage: <code>/set [type] [title] | [description] | [reward]</code>\n\n` +
-        `Types: ${broadcastMod.EVENT_TYPES.join(', ')}\n` +
-        `Example: <code>/set mission Heist Rimuru and survive | Steal from the vault | 100000</code>\n\n` +
-        `The event goes live immediately (players use <code>/mission [id]</code>) and is announced to all chats.`,
-        { title: '🎯 SET EVENT', color: THEME.cyan, html: true }
-      );
-    }
-
-    // Parse: /set [type] [title | desc | reward] — type optional (defaults to mission).
-    let type = 'mission';
-    let rest = args;
-    const first = args.split(/\s+/)[0].toLowerCase();
-    if (broadcastMod.EVENT_TYPES.includes(first)) {
-      type = first;
-      rest = args.slice(first.length).trim();
-    }
-    if (!rest) {
-      return ctx.reply('Give the event a title: <code>/set mission Heist Rimuru | description | 100000</code>', { title: '🎯 SET EVENT', color: THEME.red, html: true });
-    }
-
-    const parts = rest.split('|').map((p) => p.trim());
-    const title = parts[0] || 'New event';
-    const description = parts[1] || '';
-    const reward = Math.max(0, Math.floor(Number(String(parts[2] || '').replace(/,/g, '')) || 0));
-
-    const ev = db.createEvent({
-      title,
-      description,
-      type,
-      reward,
-      ends_at: 0,
-      created_by: ctx.userId,
-    });
-    db.logActivity('event', `Event created via /set: ${title} (${type})`, { event_id: ev.id });
-    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'set_event', 0, `${type}: ${title} reward=${reward}`);
-
-    // Announce through the SAME queue so /set events are actually delivered.
-    try {
-      const rec = db.createBroadcast(broadcastMod.buildEventAnnouncement(ev), 'all', ctx.userId);
-      dashboard.queueBroadcast(rec.id, rec.message, 'all');
-      db.logActivity('broadcast', `Event announced via /set: ${ev.title}`, { broadcast_id: rec.id, event_id: ev.id });
-    } catch (e) {
-      console.error('[set] announce failed:', e.message);
-    }
-
-    await ctx.reply(
-      `✅ <b>EVENT LIVE</b> (#${ev.id})\n\n${broadcastMod.buildEventAnnouncement(ev)}\n\nPlayers use <code>/missions</code> and <code>/mission ${ev.id}</code>.`,
-      { title: '🎯 SET EVENT', color: THEME.gold, html: true }
-    );
-  }
-
-  /**
-   * /attack — manually trigger Rimuru's attack/security event (owner only).
-   */
-  async function handleAttack(ctx) {
-    if (!ctx.isOwner) {
-      return ctx.reply('Only Rimuru (the King) can trigger an attack. 🐉👑', { title: '🐉 ATTACK', color: THEME.red });
-    }
-    const replied = repliedUser(ctx.msg);
-    if (replied) {
-      const raw = String((ctx.args || [])[0] || '').trim();
-      const n = Math.floor(Number(raw.replace(/,/g, '')));
-      if (!Number.isFinite(n) || n < 1) {
-        return ctx.reply(
-          'Usage: reply to a user with <code>/attack [number]</code> — e.g. <code>/attack 100</code>.',
-          { title: '🐉 ATTACK', color: THEME.red, html: true }
-        );
-      }
-      const r = await attack.deployAgainst(replied.id, n, { chatId: ctx.chatId, actorId: ctx.userId });
-      if (r && !r.ok) await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
-      return;
-    }
-    const r = await attack.trigger({ manual: true, force: true, chatId: ctx.chatId, actorId: ctx.userId });
-    if (r && r.message && !r.targetId) {
-      return;
-    }
-    if (r && !r.ok) {
-      await ctx.reply(r.message, { title: '🐉 ATTACK', color: THEME.red, html: true });
-    }
-  }
-
-  /**
-   * /FBI (alias /SWAT) — owner replies to a user to raid their home (owner only).
-   */
-  async function handleFbi(ctx) {
-    if (!ctx.isOwner) {
-      return ctx.reply('Only the King can deploy the FBI. 🚔👑', { title: '🚔 FBI', color: THEME.red });
-    }
-    const replied = repliedUser(ctx.msg);
-    if (!replied) {
-      return ctx.reply(
-        'Reply to a user with <code>/FBI</code> (or <code>/SWAT</code>) to raid their home. 🚔',
-        { title: '🚔 FBI', color: THEME.red, html: true }
-      );
-    }
-    const r = await fbi.deployAgainst(replied.id, { chatId: ctx.chatId, actorId: ctx.userId });
-    if (r && !r.ok) await ctx.reply(r.message, { title: '🚔 FBI', color: THEME.red, html: true });
-  }
-
-  /** Schedule heist execution after the 60s open window. */
-  function scheduleHeist(ctx, heistRow) {
-    const timer = heistTimers.get(heistRow.leader_id);
-    if (timer) clearTimeout(timer);
-    const t = setTimeout(async () => {
-      const h = db.getHeist(heistRow.leader_id);
-      if (h && h.status === 'open') {
-        const res = heist.execute(heistRow.leader_id);
-        await reply(
-          ctx.msg.chat.id,
-          `⏰ <b>The heist window closed.</b>\n\n${res.message}`,
-          { title: '🏦 HEIST RESULT', color: THEME.red, html: true }
-        );
-      }
-      heistTimers.delete(heistRow.leader_id);
-    }, config.heist.openWindowMs);
-    heistTimers.set(heistRow.leader_id, t);
-  }
-
-  /** /viewwaifu <number> (alias /vw) — send that waifu's photo + details. */
-  async function viewWaifu(ctx) {
-    const n = parseInt((ctx.args || [])[0], 10);
-    const row = db.getUserCharacterByIndex(ctx.userId, n);
-    if (!row) return ctx.reply('No waifu at that number. Use <code>/collection</code> to see your list.', { title: '💝 WAIFU', color: '#FF80AB', html: true });
-    if (depsPhoto) {
-      try {
-        await depsPhoto(ctx.chatId, row.image_url, { caption: waifu.detailCaption(row), parse_mode: 'HTML' });
-        return;
-      } catch (e) {
-        console.warn('[waifu] view sendPhoto failed:', e.message);
-      }
-    }
-    await ctx.reply(waifu.detailCaption(row), { title: '💝 WAIFU', color: '#FF80AB', html: true });
-  }
-
-  /** /viewchar <number> (alias /vc) — send that character's photo + details. */
-  async function viewChar(ctx) {
-    const n = parseInt((ctx.args || [])[0], 10);
-    const row = db.getHuntCharacterByIndex(ctx.userId, n);
-    if (!row) return ctx.reply('No character at that number. Use <code>/characters</code> to see your list.', { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-    const cached = db.getCachedHuntCharacter(row.character_id);
-    const full = cached || row;
-    if (depsPhoto) {
-      try {
-        await depsPhoto(ctx.chatId, row.image_url, { caption: hunt.detailCaption(full, { claimedAt: row.claimed_at }), parse_mode: 'HTML' });
-        return;
-      } catch (e) {
-        console.warn('[hunt] view sendPhoto failed:', e.message);
-      }
-    }
-    await ctx.reply(hunt.detailCaption(full, { claimedAt: row.claimed_at }), { title: '⚔️ ANIME HUNT', color: THEME.gold, html: true });
-  }
-
-  /* ---------- callback routing ---------- */
-
-  async function onCallbackQuery(query) {
-    const data = String(query.data || '');
-    const chatId = query.message?.chat?.id;
-    const messageId = query.message?.message_id;
-    const from = query.from || {};
-    const userId = from.id;
-    const ctx = buildCtx(query.message || { chat: { id: chatId }, from }, []);
-    const pinfo = db.syncInfo();
-    if (pinfo.configured && !pinfo.writable) {
-      try { await bot.answerCallbackQuery(query.id, { text: 'Rimuru is in safe maintenance mode while the database recovers.', show_alert: true }); } catch (_) {}
-      return;
-    }
-
-    const answerCb = (text) => bot.answerCallbackQuery(query.id, { text }).catch(() => {});
-    const editMsgCb = (text, opts = {}) => editMsg(chatId, messageId, text, opts);
-
-    const check = canInteract(userId, true);
-    if (!check.allowed) {
-      if (check.reply) await answerCb(check.reply);
-      return;
-    }
-
-    try {
-      if (data === 'gate:verify') {
-        const res = await checkMembershipFresh(userId);
-        if (res.ok) {
-          await editMsg(chatId, messageId,
-            `✅ <b>VERIFIED!</b>\n\nWelcome to the house, ${from.first_name || 'mortal'}. Everything is unlocked. 🎰`,
-            { title: '✅ VERIFIED', color: THEME.gold, html: true });
-          await answerCb('✅ Verified! Enjoy the casino.');
-        } else {
-          await answerCb('Still not a member — join the group first!');
-        }
-        return;
-      }
-
-      if (data.startsWith('menu:')) {
-        const parts = data.split(':');
-        const page = parts[1];
-
-        if (page === 'main' || page === 'casino' || page === 'games' || page === 'economy') {
-          await editMenu(chatId, messageId, page);
-          await answerCb('');
-          return;
-        }
-
-        if (page === 'lb') {
-          await replyThreaded(chatId, messageId, leaderboard.render(), { title: '🏆 LEADERBOARD', color: THEME.gold, html: true });
-          await answerCb('');
-          return;
-        }
-        if (page === 'bal') {
-          const u = eco.ensure(userId, { first_name: from.first_name || '', username: from.username || '' });
-          await replyThreaded(chatId, messageId,
-            `👛 Wallet: <b>${fmt(u.wallet)}</b> · 🏦 Bank: <b>${fmt(u.bank)}</b> · 💎 Net: <b>${fmt(u.wallet + u.bank)}</b>`,
-            { title: '💰 BALANCE', color: THEME.gold, html: true });
-          await answerCb('');
-          return;
-        }
-        if (page === 'help') {
-          await replyThreaded(chatId, messageId,
-            `<b>🎮 Games</b>: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /guess · /race · /lottery\n` +
-            `<b>💼 Economy</b>: /balance · /dep · /wd · /donate · /transfer\n` +
-            `<b>🕵️ Crime</b>: /rob · /crime · /heist · /join\n` +
-            `<b>🛒 Shop</b>: /shop · /buy · /inv\n` +
-            `<b>🎣 Activities</b>: /fish · /dig\n` +
-            `<b>💵 Income</b>: /beg · /work · /daily · /bonus\n` +
-            `<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)\n` +
-            `<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank\n` +
-            `<b>💝</b> /waifu · /collection · /viewwaifu · /wlb\n` +
-            `<b>⚔️</b> /hunt · /char · /characters · /viewchar · /clb\n` +
-            `<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop\n` +
-            `💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
-            { title: '❓ HELP', color: THEME.gold, html: true });
-          await answerCb('');
-          return;
-        }
-
-        if (page === 'g' && parts[2] && GAME_USAGE[parts[2]]) {
-          await replyThreaded(chatId, messageId, GAME_USAGE[parts[2]], { title: '🎮 GAME', color: THEME.cyan, html: true });
-          await answerCb('');
-          return;
-        }
-
-        if (page === 'eco') {
-          const action = parts[2];
-          let r;
-          if (action === 'depAll') r = eco.deposit(userId, 'all');
-          else if (action === 'dep100k') r = eco.deposit(userId, '100000');
-          else if (action === 'wdAll') r = eco.withdraw(userId, 'all');
-          else if (action === 'wd100k') r = eco.withdraw(userId, '100000');
-          if (r) {
-            await replyThreaded(chatId, messageId, r.message, { title: '💼 ECONOMY', color: THEME.cyan });
-          }
-          await answerCb('');
-          return;
-        }
-
-        await answerCb('Unknown button.');
-        return;
-      }
-
-      if (data.startsWith('mines:')) {
-        const parts = data.split(':');
-        const action = parts[2];
-        if (action === 'pick') await mines.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        if (action === 'cash') await mines.onCash({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data.startsWith('bj:')) {
-        await blackjack.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data.startsWith('hl:')) {
-        await higherlower.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data.startsWith('guess:')) {
-        await guess.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data.startsWith('race:')) {
-        await race.onPick({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data.startsWith('crash:')) {
-        await crash.onCash({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data.startsWith('ttt:')) {
-        await tictactoe.onAction({ data }, { bot, chatId, userId, reply: (t, o) => reply(chatId, t, o), editMsg: editMsgCb, answerCb, eco });
-        return;
-      }
-      if (data === 'waifu:claim' || data.startsWith('waifu:claim')) {
-        await waifu.claim(userId, { chatId, messageId, from, answerCb });
-        return;
-      }
-      if (data === 'hunt:claim' || data.startsWith('hunt:claim')) {
-        await hunt.claim(userId, { chatId, messageId, from, answerCb });
-        return;
-      }
-      await answerCb('Unknown button.');
-    } catch (e) {
-      console.error('[callback] error:', e.message);
-      lastError = e;
-      await answerCb('Something went wrong.');
-    }
-  }
-
-  /* ---------- dashboard: chat + game logging (best-effort) ---------- */
-
-  function logGame(userId, meta, game, bet, result, amount) {
-    try {
-      db.logGameHistory({
-        user_id: userId,
-        username: meta.username || '',
-        game,
-        bet: bet || 0,
-        result: result || '',
-        amount: amount || 0,
-      });
-      rank.recordMatchResult(userId, bet || 0, result === 'win');
-    } catch (e) { /* non-fatal */ }
-  }
-
-  /* ---------- message routing ---------- */
-
-  const PAUSED_NOTICE = '🔒 Rimuru is paused for maintenance. Please try again later.';
-  const PAUSE_EXEMPT_CMDS = ['run', 'backup', 'backups', 'restore', 'health', 'debug', 'stop', 'start', 'help'];
-  const pausedNotified = new Set();
-
-  function isPausedFor(msg) {
-    if (!db.getBotPaused()) return false;
-    const from = msg.from || {};
-    if (String(from.id) === String(config.ownerId)) return false;
-    const parsed = parseCommand(String(msg.text || msg.caption || ''));
-    if (parsed && PAUSE_EXEMPT_CMDS.includes(parsed.cmd)) return false;
-    const key = `${msg.chat.id}:${from.id}`;
-    if (!pausedNotified.has(key)) {
-      pausedNotified.add(key);
-      try {
-        bot.sendMessage(msg.chat.id, PAUSED_NOTICE).catch(() => {});
-      } catch (e) { /* non-fatal */ }
-    }
-    return true;
-  }
-
-  const PERSISTENCE_EXEMPT_CMDS = new Set(['health', 'debug', 'help', 'start', 'verify', 'stop', 'run']);
-  const PERSISTENCE_NOTICE = '🛠️ Rimuru is temporarily in safe maintenance mode while the database connection recovers. Your balance and progress are protected. Please try again shortly.';
-
-  function isPersistenceBlockedFor(msg) {
-    // NON-BLOCKING: SQLite is the live read/write store and writes are queued
-    // to the mirror until Postgres recovers. Blocking every command while PG
-    // is degraded made the bot appear completely dead — the gate is removed
-    // so all commands (including /health, /stats, /waifu, /redeem, /attack)
-    // always respond. Postgres degradation is surfaced via /health instead.
-    return false;
-  }
-
-  async function onMessage(msg) {
-    if (!msg.from || msg.from.is_bot) return;
-    const text = String(msg.text || msg.caption || '');
-    const userId = msg.from.id;
-    const chatId = msg.chat.id;
-    try { attack.markSeen(userId); } catch (e) { /* non-fatal */ }
-    if (isPersistenceBlockedFor(msg)) return;
-    try {
-      db.getOrCreateUser(userId, { username: msg.from.username || '', first_name: msg.from.first_name || '' });
-    } catch (e) { /* non-fatal */ }
-    if (isPausedFor(msg)) return;
-    try { db.logChat(msg); } catch (e) { /* non-fatal */ }
-    msg._replyTarget = msg.message_id;
-    const ctx = buildCtx(msg, []);
-    db.expirePenalties();
-    const check = canInteract(userId, true);
-    if (!check.allowed) {
-      if (check.reply && text.startsWith('/')) await reply(chatId, check.reply, { title: '⛔ BLOCKED', color: THEME.red });
-      return;
-    }
-    await maybeReact(msg);
-    const parsed = parseCommand(text);
-    if (parsed) {
-      const { cmd, args } = parsed;
-      const handler = handlers[cmd];
-      if (handler) {
-        ctx.args = args;
-        try {
-          const staffCmds = ['ban', 'sus', 'mute', 'unban', 'unsus', 'unmute', 'restart', 'addcoin', 'sb', 'broadcast', 'bd', 'set', 's', 'xleaderboard', 'xlb', 'debug', 'backup', 'backups', 'restore', 'redeem', 'stop', 'run', 'attack', 'fbi', 'swat'];
-          if (!isStaff(ctx.userId) && !['start', 'help', 'verify'].includes(cmd) && !staffCmds.includes(cmd)) {
-            const gate = await gateAllowed(ctx.userId);
-            if (!gate.ok) {
-              const p = gatePrompt(chatId);
-              await reply(chatId, p.text, p.opts);
-              return;
-            }
-          }
-          await handler(ctx);
-        } catch (e) {
-          console.error(`[cmd /${cmd}] error:`, e.message, e.stack);
-          lastError = e;
-          await reply(chatId, `⚠️ Something went wrong with /${cmd}. Try again.`, { title: '💥 ERROR', color: THEME.red });
-        }
-        return;
-      }
-    }
-
-    const kbRoute = keyboards.routeButton(text);
-    if (kbRoute) {
-      if (kbRoute.back) {
-        await reply(chatId, `✨️ <b>Main menu</b> — pick a category.`, {
-          title: '🐉 RIMURU CASINO', color: THEME.cyan, html: true,
-          reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor('main') : undefined,
-        });
-        return;
-      }
-      if (kbRoute.page) {
-        const pageTexts = {
-          casino: MENU.casino().text,
-          games: MENU.games().text,
-          economy: MENU.economy().text,
-        };
-        await reply(chatId, pageTexts[kbRoute.page] || '', {
-          title: kbRoute.page === 'casino' ? '🎰 CASINO' : kbRoute.page === 'games' ? '🎮 GAMES' : '💼 ECONOMY',
-          color: THEME.cyan, html: true,
-          reply_markup: config.showReplyKeyboard ? keyboards.keyboardFor(kbRoute.page) : undefined,
-        });
-        return;
-      }
-      const handler = handlers[kbRoute.cmd];
-      if (handler) {
-        ctx.args = [];
-        try {
-          await handler(ctx);
-        } catch (e) {
-          console.error(`[kb /${kbRoute.cmd}] error:`, e.message, e.stack);
-          await reply(chatId, `⚠️ Something went wrong with that button. Try again.`, { title: '💥 ERROR', color: THEME.red });
-        }
-        return;
-      }
-    }
-
-    try {
-      if (await attack.handleInput(userId, chatId, text)) return;
-    } catch (e) { console.error('[attack] handleInput error:', e.message); }
-
-    try {
-      if (await fbi.handleInput(userId, chatId, text)) return;
-    } catch (e) { console.error('[fbi] handleInput error:', e.message); }
-
-    const isReplyToBot = msg.reply_to_message &&
-      msg.reply_to_message.from &&
-      msg.reply_to_message.from.is_bot === true;
-    if (rimuru.shouldTrigger(text) || isReplyToBot) {
-      if (!isStaff(userId)) {
-        const gate = await gateAllowed(userId);
-        if (!gate.ok) {
-          const p = gatePrompt(chatId);
-          await reply(chatId, p.text, p.opts);
-          return;
-        }
-      }
-      const from = msg.from;
-      const owner = isOwner(userId);
-      const name = from.first_name || from.username || 'mortal';
-      try {
-        const ans = await rimuru.reply(text, {
-          id: userId, first_name: name, username: from.username,
-          isOwner: owner, isStaff: isStaff(userId),
-        });
-        const textPromise = reply(chatId, ans, { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
-        await stickerAfterText(chatId, textPromise);
-      } catch (e) {
-        console.error('[rimuru] reply error:', e.message);
-        lastError = e;
-        await reply(chatId, 'Hmph. The void ate my words. Try again, mortal.', { title: '🐉 RIMURU', color: THEME.gold, reply_to_message_id: msg.message_id });
-      }
-      return;
-    }
-  }
-
-  let botMeId = null;
-  bot.getMe().then((me) => {
-    botMeId = me.id;
-    return bot.setMyCommands(MENU_COMMANDS)
-      .then(() => bot.setChatMenuButton({ menu_button: { type: 'commands' } }))
-      .then(() => bot.getMyCommands());
-  }).then((cmds) => {
-    console.log(`✰ Persistent command menu registered (setMyCommands): ${cmds.map((c) => `/${c.command}`).join(' ')}`);
-  }).catch((e) => {
-    console.warn('[boot] getMe/setMyCommands failed:', e.message);
-  });
-
-  try {
-    dashboard.setActiveBot(bot);
-  } catch (e) { /* non-fatal */ }
-  setInterval(() => {
-    try {
-      let drained = 0;
-      const sender = makeBroadcastSender();
-      for (let item = dashboard.drainBroadcastQueue(sender); item; item = dashboard.drainBroadcastQueue(sender)) {
-        drained++;
-        if (drained >= 50) break;
-      }
-      if (drained) console.log(`[dashboard] drained ${drained} broadcast(s)`);
-    } catch (e) {
-      console.error('[dashboard] drain error:', e.message);
-    }
-  }, 10000);
-
-  function makeBroadcastSender() {
-    return (item, done) => {
-      let count = 0;
-      const target = item.target || 'all';
-      const chats = new Set();
-      try {
-        for (const cid of db.getSeenChatIds()) chats.add(Number(cid));
-      } catch (e) { /* non-fatal */ }
-      let list = [...chats];
-      if (target === 'groups') list = list.filter((c) => c < 0);
-      else if (target === 'users') list = list.filter((c) => c > 0);
-      list = [...new Set(list)].slice(0, target === 'all' ? 1000 : 500);
-      (async () => {
-        for (const cid of list) {
-          try {
-            await bot.sendMessage(cid, item.message, { parse_mode: 'HTML' });
-            count++;
-          } catch (e) { /* skip unreachable chats */ }
-        }
-        done(count);
-        console.log(`[dashboard] broadcast #${item.id} (${target}) delivered to ${count}/${list.length} chats`);
-      })().catch(() => done(count));
-    };
-  }
-
-  try {
-    attack.attach({
-      reply: (chatId, text, opts) => reply(chatId, text, opts),
-      announce: (text) => {
-        const rec = db.createBroadcast(text, 'all', Number(config.ownerId));
-        dashboard.queueBroadcast(rec.id, rec.message, 'all');
-        return Promise.resolve();
-      },
-      group: async (text, opts) => {
-        const groups = db.getSeenChatIds().filter((cid) => Number(cid) < 0);
-        for (const gid of groups) {
-          try { await reply(gid, text, opts); } catch (e) { /* non-fatal */ }
-        }
-      },
-    });
-    attack.startRandomScheduler();
-  } catch (e) {
-    console.error('[attack] wiring failed:', e.message);
-  }
-
-  try {
-    fbi.attach({
-      reply: (chatId, text, opts) => reply(chatId, text, opts),
-      announce: (text) => {
-        const rec = db.createBroadcast(text, 'all', Number(config.ownerId));
-        dashboard.queueBroadcast(rec.id, rec.message, 'all');
-        return Promise.resolve();
-      },
-    });
-  } catch (e) {
-    console.error('[fbi] wiring failed:', e.message);
-  }
-
-  try {
-    waifu.attach({
-      reply: (chatId, text, opts) => reply(chatId, text, opts),
-      sendPhoto: (chatId, imageUrl, opts) => bot.sendPhoto(chatId, imageUrl, opts),
-      answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
-    });
-  } catch (e) {
-    console.error('[waifu] wiring failed:', e.message);
-  }
-
-  try {
-    hunt.attach({
-      reply: (chatId, text, opts) => reply(chatId, text, opts),
-      sendPhoto: (chatId, imageUrl, opts) => bot.sendPhoto(chatId, imageUrl, opts),
-      answerCb: (text) => bot.answerCallbackQuery(text && text.query_id ? text.query_id : undefined, text && text.text ? { text: text.text } : {}).catch(() => {}),
-    });
-  } catch (e) {
-    console.error('[hunt] wiring failed:', e.message);
-  }
-
-  bot.on('message', onMessage);
-  bot.on('callback_query', onCallbackQuery);
-
-  try {
-    waifu.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
-  } catch (e) { console.error('[waifu] auto-spawn wiring failed:', e.message); }
-
-  try {
-    hunt.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
-  } catch (e) { console.error('[hunt] auto-spawn wiring failed:', e.message); }
-
-  setInterval(() => {
-    const expired = db.expirePenalties();
-    for (const u of expired) {
-      console.log(`[admin] ${u.status} expired for user ${u.user_id}`);
-    }
-  }, 30000);
-
-  setInterval(() => {
-    try { attack.sweep(); } catch (e) { console.error('[attack] sweep error:', e.message); }
-  }, 5000);
-
-  setInterval(() => {
-    try { fbi.sweep(); } catch (e) { console.error('[fbi] sweep error:', e.message); }
-  }, 5000);
-
-  setInterval(() => {
-    try { waifu.expireIfNeeded(); } catch (e) { console.error('[waifu] sweep error:', e.message); }
-  }, 30000);
-
-  setInterval(() => {
-    try { hunt.expireIfNeeded(); } catch (e) { console.error('[hunt] sweep error:', e.message); }
-  }, 30000);
-
-  setInterval(() => {
-    try { timewallet.sweep(); } catch (e) { console.error('[rank] time-wallet sweep error:', e.message); }
-  }, 60000);
-
-  let lastPeak = rank.isPeakHour();
-  setInterval(() => {
-    try {
-      const nowPeak = rank.isPeakHour();
-      if (nowPeak && !lastPeak) {
-        const rec = db.createBroadcast('🌞 <b>PEAK HOURS STARTED</b>\n\nEvery game is now a flat 50/50 until 11:00 WAT. Good luck, mortals!', 'all', Number(config.ownerId));
-        dashboard.queueBroadcast(rec.id, rec.message, 'all');
-        console.log('[rank] peak hours STARTED (08:00 WAT) — flat 50/50 engaged');
-      } else if (!nowPeak && lastPeak) {
-        const rec = db.createBroadcast('🌙 <b>PEAK HOURS ENDED</b>\n\nRank-based win chances are back. Top ranks face worse odds — the house protects its whales.', 'all', Number(config.ownerId));
-        dashboard.queueBroadcast(rec.id, rec.message, 'all');
-        console.log('[rank] peak hours ENDED (11:00 WAT) — rank-tier odds restored');
-      }
-      lastPeak = nowPeak;
-    } catch (e) { console.error('[rank] peak-hour scheduler error:', e.message); }
-  }, 60000);
-
-  bot.on('polling_error', (err) => {
-    console.error('[polling] error:', err.message);
-  });
-
-  return bot;
-}
-
-module.exports = { createBot, MENU_COMMANDS };
+"use strict";const TelegramBot=require("node-telegram-bot-api"),path=require("path"),fs=require("fs"),config=require("./config"),db=require("./db"),eco=require("./economy"),cd=require("./cooldowns"),admin=require("./admin"),leaderboard=require("./leaderboard"),rimuru=require("./rimuru"),memory=require("./memory"),income=require("./income"),{fmt,humanDuration,note,pick,THEME}=require("./utils"),send=require("./send"),slots=require("./games/slots"),dice=require("./games/dice"),coinflip=require("./games/coinflip"),mines=require("./games/mines"),blackjack=require("./games/blackjack"),roulette=require("./games/roulette"),higherlower=require("./games/higherlower"),lottery=require("./games/lottery"),race=require("./games/race"),guess=require("./games/guess"),crash=require("./games/crash"),wheel=require("./games/wheel"),rps=require("./games/rps"),tictactoe=require("./games/tictactoe"),dicevs=require("./games/dicevs"),cfstreak=require("./games/cfstreak"),numroulette=require("./games/numroulette"),shop=require("./shop"),crime=require("./crimes/crime"),fishing=require("./fish"),robbery=require("./crimes/robbery"),heist=require("./crimes/heist"),keyboards=require("./keyboards"),missions=require("./missions"),backup=require("./backup"),redeem=require("./redeem"),profile=require("./profile"),broadcastMod=require("./broadcast"),attack=require("./attack"),fbi=require("./fbi"),rank=require("./rank"),timewallet=require("./timewallet"),waifu=require("./waifu"),hunt=require("./hunt"),dashboard=require("./dashboard/server"),heistTimers=new Map;let lastError=null,commitHash=null;try{commitHash=process.env.RENDER_GIT_COMMIT||require("child_process").execSync("git rev-parse --short HEAD",{timeout:2e3}).toString().trim()}catch(e){commitHash=null}const REACT_KEYS=Object.keys(config.reactions).filter(k=>k!=="fallback"),MENU_COMMANDS=[{command:"leaderboard",description:"🏆 Leaderboard"},{command:"balance",description:"💰 Balance"},{command:"casino",description:"🎰 Casino"},{command:"games",description:"🎮 Games"},{command:"economy",description:"💼 Economy"},{command:"shop",description:"🛒 Shop"},{command:"crime",description:"🕵️ Crime"},{command:"profile",description:"🪪 Profile / Badges"},{command:"help",description:"❓ Help"},{command:"health",description:"👌 Health"},{command:"attack",description:"🐉 Deploy attackers (owner)"},{command:"fbi",description:"🚔 FBI raid (owner)"},{command:"swat",description:"🚔 SWAT raid (owner)"},{command:"rank",description:"🏆 Your rank"},{command:"ranks",description:"📊 Rank ladder"},{command:"waifu",description:"💝 Spawn a waifu (owner)"},{command:"swaifu",description:"💍 Spawn a SUPER waifu (owner)"},{command:"collection",description:"💝 Your waifu collection"},{command:"wlb",description:"💝 Waifu leaderboard"},{command:"viewwaifu",description:"💝 View a waifu by number"},{command:"hunt",description:"⚔️ Start an anime hunt (owner)"},{command:"char",description:"⚔️ Search an anime character"},{command:"characters",description:"⚔️ Your character collection"},{command:"viewchar",description:"⚔️ View a character by number"},{command:"clb",description:"⚔️ Character leaderboard"},{command:"remember",description:"🧠 Store a memory (owner)"},{command:"recall",description:"🧠 Recall a memory (owner)"}];function createBot(){const bot=new TelegramBot(config.telegramToken,{polling:!0,onlyFirstMatch:!1,filepath:!1}),depsPhoto=(chatId,imageUrl,opts)=>bot.sendPhoto(chatId,imageUrl,opts);function metaOf(msg){const from=msg.from||{};return{username:from.username||"",first_name:from.first_name||""}}function isOwner(userId){return String(userId)===String(config.ownerId)}function isAuthorized(userId){if(isOwner(userId))return!0;try{return!!db.getAdminUser(Number(userId))}catch(e){return!1}}function isStaff(userId){return isAuthorized(userId)}async function reply(chatId,text,opts={}){const trustedHtml=opts.html===!0||opts.parse_mode==="HTML";if(!opts.reply_to_message_id&&opts._replyTarget&&(opts={...opts,reply_to_message_id:opts._replyTarget},delete opts._replyTarget),opts.raw){const safe=send.sanitizeHtml(text);return send.sendText(bot,chatId,safe,{...opts,html:!0,raw:!0})}return send.sendText(bot,chatId,text,{...opts,html:trustedHtml})}async function editMsg(chatId,messageId,text,opts={}){const trustedHtml=opts.html===!0||opts.parse_mode==="HTML";if(opts.raw){const safe=send.sanitizeHtml(text);return send.editText(bot,chatId,messageId,safe,{...opts,html:!0,raw:!0})}return send.editText(bot,chatId,messageId,text,{...opts,html:trustedHtml})}async function replyThreaded(chatId,messageId,text,opts={}){return reply(chatId,text,{...opts,reply_to_message_id:messageId})}function buildCtx(msg,args=[]){const from=msg.from||{};return{bot,msg,args,chatId:msg.chat.id,userId:from.id,isOwner:isOwner(from.id),eco,cd,config,db,keyboards,keyboardFor:page=>keyboards.keyboardFor(page),reply:(t,o)=>reply(msg.chat.id,t,{...msg._replyTarget?{_replyTarget:msg._replyTarget}:{},...o}),editMsg:(chatId,messageId,t,o)=>editMsg(chatId,messageId,t,o),answerCb:text=>bot.answerCallbackQuery(text&&text.query_id?text.query_id:void 0,text&&text.text?{text:text.text}:{}).catch(()=>{})}}function parseCommand(text){const t=String(text||"").trim();if(!t.startsWith("/"))return null;const parts=t.slice(1).split(/\s+/);return{cmd:parts[0].split("@")[0].toLowerCase(),args:parts.slice(1)}}function repliedUser(msg){const r=msg.reply_to_message;return!r||!r.from?null:r.from}function canInteract(userId,gambling=!0){return admin.checkInteract(userId,{gambling})}let stickerCache=null,stickerDisabled=!1;async function nextSticker(){if(!config.stickerPack||stickerDisabled)return null;try{return stickerCache||(stickerCache=((await bot.getStickerSet(config.stickerPack)).stickers||[]).map(s=>s.file_id)),stickerCache.length?stickerCache[Math.floor(Math.random()*stickerCache.length)]:(stickerDisabled=!0,null)}catch(e){return console.warn(`[sticker] pack "${config.stickerPack}" unavailable — stickers disabled:`,e.message),stickerDisabled=!0,null}}async function stickerAfterText(chatId,textPromise){const fileId=await nextSticker();if(!fileId)return null;try{await textPromise}catch(e){}try{return await bot.sendSticker(chatId,fileId)}catch(e){return console.warn("[sticker] send failed:",e.message),null}}const membershipCache=new Map,MEMBERSHIP_CACHE_MAX=5e3;function cacheMembership(userId,val){if(membershipCache.set(userId,val),membershipCache.size>MEMBERSHIP_CACHE_MAX){const oldest=membershipCache.keys().next().value;oldest!==void 0&&membershipCache.delete(oldest)}}let resolvedGroupId=config.requiredGroupId||0,groupResolvePromise=null;async function resolveRequiredGroup(){return resolvedGroupId||groupResolvePromise||(config.requiredGroup?(groupResolvePromise=(async()=>{try{const chat=await bot.getChat(config.requiredGroup);chat&&chat.id?(resolvedGroupId=chat.id,console.log(`[gate] required group ${config.requiredGroup} resolved to chat ${resolvedGroupId}`)):console.warn(`[gate] getChat(${config.requiredGroup}) returned no id — gate OFF`)}catch(e){console.warn(`[gate] could not resolve ${config.requiredGroup}: ${e.message} — gate OFF until resolved`)}finally{groupResolvePromise=null}return resolvedGroupId})(),groupResolvePromise):0)}async function checkMembershipFresh(userId){if(isStaff(userId))return{ok:!0,staff:!0};const gid=await resolveRequiredGroup();if(!gid)return{ok:!0,gateOff:!0};try{const m=await bot.getChatMember(gid,userId),status=m&&m.status,member=["creator","administrator","member"].includes(status);return membershipCache.set(userId,{ok:member,at:Date.now()}),cacheMembership(userId,{ok:member,at:Date.now()}),{ok:member,status}}catch(e){return console.warn(`[gate] getChatMember(${gid}, ${userId}) error: ${e.message}`),{ok:!1,status:"error"}}}async function gateAllowed(userId){if(isStaff(userId))return{ok:!0,staff:!0};const cached=membershipCache.get(userId);return cached&&Date.now()-cached.at<config.groupGateCacheMs?{ok:cached.ok,cached:!0}:checkMembershipFresh(userId)}async function gateActive(){return config.requiredGroup?config.requiredGroupId?!0:!!await resolveRequiredGroup():!1}function gatePrompt(chatId){return{text:`🔒 <b>JOIN THE GROUP FIRST</b>
+
+Mortal, you must be a member of <a href="${config.requiredGroup?`https://t.me/${config.requiredGroup.replace(/^@/,"")}`:""}">${config.requiredGroup}</a> to use the casino.
+
+1️⃣ Tap the group link above and press <b>Join</b>
+2️⃣ Come back and tap <b>✅ Verify</b>
+
+Only members of the house get to play. 🐉`,opts:{title:"🔒 MEMBERS ONLY",color:THEME.gold,html:!0,reply_markup:{inline_keyboard:[[{text:"✅ Verify",callback_data:"gate:verify"}]]},alwaysShowMarkup:!0}}}async function verifyCommand(ctx){const res=await checkMembershipFresh(ctx.userId);if(res.ok)await ctx.reply(`✅ <b>VERIFIED!</b>
+
+Welcome to the house, ${ctx.msg.from.first_name||"mortal"}. Everything is unlocked. 🎰`,{title:"✅ VERIFIED",color:THEME.gold,html:!0});else{const p=gatePrompt(ctx.chatId);await ctx.reply(p.text,p.opts)}return res}const REACT_POOL=["👍","❤️","😄","😂","👏","🔥","💯","😎"];function targetsRimuru(msg){const text=String(msg.text||msg.caption||"");if(text.startsWith("/")||rimuru.shouldTrigger(text))return!0;const r=msg.reply_to_message;return!!(r&&r.from&&r.from.is_bot===!0)}function reactionFor(text){const t=String(text||"").toLowerCase();for(const key of REACT_KEYS)if(t.includes(key))return config.reactions[key];return/\b(win|won|rich|profit|gain|lucky|jackpot|nice|great|love|good|yay)\b/.test(t)?pick(["🎉","🔥","💯","😄","💰"]):/\b(lose|lost|broke|bad|sad|cry|rip|ouch|damn|fail|unlucky)\b/.test(t)?pick(["💸","😢","😅","🫠","🙃"]):/\b(angry|mad|hate|rage|wtf|fuck|annoying)\b/.test(t)?pick(["😡","🤬","😤"]):t.includes("?")?pick(["🤔","🧐"]):pick(REACT_POOL)}async function maybeReact(msg){if(!msg.from||msg.from.is_bot||!isOwner(msg.from.id)||!targetsRimuru(msg))return;const text=String(msg.text||msg.caption||"");if(text)try{await bot.setMessageReaction(msg.chat.id,msg.message_id,{reaction:[{type:"emoji",emoji:reactionFor(text)}]})}catch(e){}}const MENU={main:()=>({text:`🐉 <b>RIMURU'S CASINO</b>
+
+✨ Welcome to the Tempest house, mortal.
+👑 The house always wins — but I'll let you play.
+
+👇 <i>Pick your poison:</i>`,markup:{inline_keyboard:[[{text:"🏆 Leaderboard",callback_data:"menu:lb"},{text:"💰 Balance",callback_data:"menu:bal"}],[{text:"🎰 Casino",callback_data:"menu:casino"},{text:"🎮 Games",callback_data:"menu:games"}],[{text:"💼 Economy",callback_data:"menu:economy"},{text:"❓ Help",callback_data:"menu:help"}]]}}),casino:()=>({text:`🎰 <b>CASINO — the big tables</b>
+
+♠️ <b>Blackjack</b> — /bj [amount] · 3:2 on blackjack
+🎡 <b>Roulette</b> — /roulette [type] [amount] · up to 36×
+🍒 <b>Slots</b> — /slots [amount] · 2× / 4×
+🎟️ <b>Lottery</b> — /lottery buy · pot of 5,000,000+ 🤑
+
+👇 <i>Tap a game for details, or just type the command.</i>`,markup:{inline_keyboard:[[{text:"♠️ Blackjack",callback_data:"menu:g:bj"},{text:"🎡 Roulette",callback_data:"menu:g:roulette"}],[{text:"🍒 Slots",callback_data:"menu:g:slots"},{text:"🎟️ Lottery",callback_data:"menu:g:lottery"}],[{text:"⬅️ Back",callback_data:"menu:main"}]]}}),games:()=>({text:`🎮 <b>GAMES — quick & light</b>
+
+🪙 <b>Coin Flip</b> — /cf [heads|tails] [amount] · 2×
+💎 <b>Mines</b> — /mines [amount] · 5×5, 4 mines (1 hidden) that MOVE after each pick
+🎲 <b>Dice</b> — /dice [1-6] [amount] · 6× if you hit
+📏 <b>Higher or Lower</b> — /hl [amount] · streak multiplier
+
+👇 <i>Tap a game for details, or just type the command.</i>`,markup:{inline_keyboard:[[{text:"🪙 Coin Flip",callback_data:"menu:g:cf"},{text:"💎 Mines",callback_data:"menu:g:mines"}],[{text:"🎲 Dice",callback_data:"menu:g:dice"},{text:"📏 Higher/Lower",callback_data:"menu:g:hl"}],[{text:"🎯 Guess Number",callback_data:"menu:g:guess"},{text:"🎰 Lottery",callback_data:"menu:g:lottery"}],[{text:"⬅️ Back",callback_data:"menu:main"}]]}}),economy:()=>({text:`💼 <b>ECONOMY</b>
+
+👛 Wallet (rob-able) vs 🏦 Bank (safe).
+💰 Keep your loot in the bank, mortal.
+
+✨ <i>More tools coming soon…</i>`,markup:{inline_keyboard:[[{text:"🏦 Deposit All",callback_data:"menu:eco:depAll"},{text:"🏦 Deposit 100k",callback_data:"menu:eco:dep100k"}],[{text:"👛 Withdraw All",callback_data:"menu:eco:wdAll"},{text:"👛 Withdraw 100k",callback_data:"menu:eco:wd100k"}],[{text:"⬅️ Back",callback_data:"menu:main"}]]}})},GAME_USAGE={bj:`♠️ <b>Blackjack</b>
+<code>/bj [amount]</code>
+Hit / Stand / Double. Dealer stands on 17+. Blackjack pays 3:2. 💪`,roulette:`🎡 <b>Roulette</b>
+<code>/roulette color red 5000</code>
+red|black 2× · even|odd 2× · low|high 2× · dozen 3× · column 3× · straight 36× · split 18×`,slots:`🍒 <b>Slots</b>
+<code>/slots [amount]</code>
+3 reels — 2 match = 2×, 3 match = 4×. 🎰`,lottery:`🎟️ <b>Lottery</b>
+<code>/lottery buy [tickets]</code>
+Ticket = 10,000 coins. 5 buyers = draw. Pot grows with every ticket! 🤑`,cf:`🪙 <b>Coin Flip</b>
+<code>/cf [heads|tails] [amount]</code>
+Win = double. 🍀`,mines:`💎 <b>Mines</b>
+<code>/mines [amount]</code>
+5×5 grid, 4 mines (1 hidden) — the mines MOVE after every pick. +25% of your bet per safe pick. Cash out anytime. 💣`,dice:`🎲 <b>Dice</b>
+<code>/dice [1-6] [amount]</code>
+Animated dice — hit your number = 6×. Rare, but sweet. 😎`,hl:`📏 <b>Higher or Lower</b>
+<code>/hl [amount]</code>
+Guess the next card. Streak multiplier climbs, cash out anytime. 🔥`,guess:`🎯 <b>Guess the Number</b>
+<code>/guess [amount]</code>
+Pick 1-10. 3 chances with higher/lower hints. 1st try = 5x, 2nd = 3x, 3rd = 2x. 🎲`,crash:`💥 <b>Crash</b>
+<code>/crash [amount]</code>
+A LIVE multiplier rocket — press 💰 CASHOUT before it explodes. Long rides pay big. 💥`,wheel:`🎡 <b>Wheel of Fortune</b>
+<code>/wheel [amount]</code>
+Spin a 12-segment wheel — 0.5x to 10x. Lady luck decides. 🎰`,rps:`✊ <b>Rock Paper Scissors</b>
+<code>/rps [rock|paper|scissors] [amount]</code>
+Beat the house. Tie = half back. ✋✌️`,ttt:`⭕ <b>Tic-Tac-Toe</b>
+<code>/ttt [amount]</code>
+Button game vs the house — pick difficulty (Easy/Normal/Hard), then X or O. No bet = play for fun. ❌`,duel:`🎲 <b>Dice Duel</b>
+<code>/duel [amount]</code>
+You vs the house — higher roll wins. Ties go to the house. ⚔️`,cfs:`🪙 <b>Coin Flip Streak</b>
+<code>/cfs [heads|tails] [amount]</code>
+Each correct flip doubles your payout. One miss = everything gone. 🔥`,num:`🎯 <b>Number Roulette</b>
+<code>/num [1-10] [amount]</code>
+Pick 1-10. Rarer picks pay more — up to 9x. 🎡`};async function sendMenu(chatId,page="main",opts={}){const m=MENU[page]();return reply(chatId,m.text,{title:"📜 RIMURU MENU",color:THEME.gold,icon:"📜",html:!0,reply_markup:send.inlineMarkup(m.markup),...opts})}async function editMenu(chatId,messageId,page="main"){const m=MENU[page]();return editMsg(chatId,messageId,m.text,{title:"📜 RIMURU MENU",color:THEME.gold,icon:"📜",html:!0,reply_markup:send.inlineMarkup(m.markup)}).catch(e=>(console.warn("[menu] edit failed:",e.message),null))}const handlers={start:async ctx=>{const u=eco.ensure(ctx.userId,metaOf(ctx.msg));if(await ctx.reply(`Welcome to the Tempest house, <b>${u.first_name||"mortal"}</b>. 🐉
+
+I'm <b>Rimuru Tempest</b> — the lord of this casino. The house always wins… but I'll let you play. ✨
+
+You start with <b>${fmt(config.startBalance)}</b> coins. 💰
+
+Tap a button below to explore — or just type a command. 👇`,{title:"🐉 RIMURU TEMPEST CASINO",color:THEME.blue,html:!0,reply_markup:MENU.main().markup,alwaysShowMarkup:!0}),config.showReplyKeyboard)try{await bot.sendMessage(ctx.chatId,"⌨️ Your quick-menu keyboard is ready below.",{reply_markup:keyboards.keyboardFor("main")})}catch(e){console.warn("[start] keyboard:",e.message)}if(!isStaff(ctx.userId)&&!(await gateAllowed(ctx.userId)).ok){const p=gatePrompt(ctx.chatId);await ctx.reply(p.text,p.opts)}},menu:async ctx=>sendMenu(ctx.chatId),casino:async ctx=>{await ctx.reply(MENU.casino().text,{title:"🎰 CASINO",color:THEME.cyan,html:!0,reply_markup:config.showReplyKeyboard?keyboards.keyboardFor("casino"):send.inlineMarkup(MENU.casino().markup)})},games:async ctx=>{await ctx.reply(MENU.games().text,{title:"🎮 GAMES",color:THEME.cyan,html:!0,reply_markup:config.showReplyKeyboard?keyboards.keyboardFor("games"):send.inlineMarkup(MENU.games().markup)})},economy:async ctx=>{await ctx.reply(MENU.economy().text,{title:"💼 ECONOMY",color:THEME.cyan,html:!0,reply_markup:config.showReplyKeyboard?keyboards.keyboardFor("economy"):send.inlineMarkup(MENU.economy().markup)})},help:async ctx=>{await ctx.reply(`<b>🎮 Games</b> (per-game cooldown)
+• /slots [amt] — 3 reels, 2×/4×
+• /dice [1-6] [amt] — animated dice, 6×
+• /cf [heads|tails] [amt] — 2×
+• /mines [amt] — 5×5, 4 mines (1 hidden) that MOVE after each pick, +25% per safe pick
+• /bj [amt] — blackjack, 3:2 on blackjack
+• /roulette [color|even|odd|low|high|dozen|column|straight|split] [amt]
+• /hl [amt] — higher or lower, streak multiplier
+• /guess [amt] — pick 1-10, 3 chances, up to 5x
+• /lottery [buy|draw|status] [n] — tickets 10k, 5 buyers = draw
+
+<b>🔥 New games</b>
+• /crash [amt] — multiplier rocket, cash out before it crashes 💥
+• /wheel [amt] — wheel of fortune, 0.5x–10x 🎡
+• /rps [rock|paper|scissors] [amt] — vs the house ✊✋✌️
+• /ttt [amt] — button tic-tac-toe vs the house (difficulty + X/O, no bet = fun) ⭕❌
+• /duel [amt] — dice duel, higher roll wins 🎲
+• /cfs [heads|tails] [amt] — coin flip streak, doubles each win 🪙
+• /num [1-10] [amt] — number roulette, rare picks pay up to 9x 🎯
+
+<b>💼 Economy</b>
+• /balance — wallet + bank
+• /dep [amt|all] — wallet → bank
+• /wd [amt|all] — bank → wallet
+• /donate [amt] (reply) — from wallet
+• /transfer [amt] (reply) — from bank
+
+<b>🕵️ Crime</b>
+• /rob (reply) — 10 min cooldown, fail = fine
+• /crime [amt] — bet on a crime, up to 7x (needs shop items)
+• /heist (reply) — 20 min, open 60s for /join, max 5 crew
+• /join — join an open heist
+
+<b>🛒 Shop</b>
+• /shop — item list · /buy [id] [qty] — buy items
+• /inv — your inventory (crowbar/gun/mask → crime, hook → /fish)
+
+<b>💵 Income</b>
+• /beg · /work · /fish · /dig — quick coins
+• /daily — 24h · /bonus — weekly
+
+<b>🎣 Activities</b>
+• /fish — needs a Fishing Hook from /shop
+• /dig — treasure hunt
+
+<b>🪪 Profile</b>
+• /p — your profile card (rank, win rate, badges)
+• /badges — your earned badges
+• /id — your ID card
+• /rank — your rank, logo, progress + time-wallet
+• /ranks — full rank ladder (Bronze → Mythic)
+
+<b>🕹️ Other</b>
+• /race [amt] — race against the house
+• /hide — 50M coins, vanish from robs &amp; heists for 60s
+• /redeem [CODE] — claim a code (coins go to BANK)
+• /verify — re-check your group membership
+• /health — bot health &amp; persistence status (anyone)
+
+<b>👑 Staff</b>
+• /redeem create [CODE] [AMT] [USES] — mint a code (mods capped at 50M)
+• /redeem list · /redeem delete [CODE] · /backup · /backups · /restore [id]
+• /sb [amount] — set a user's whole networth (wallet = amount, bank = 0)
+• /broadcast [message] (alias /bd) — announce to all users & groups
+  · owner: any message · mods: must be relevant to the bot
+• /set [type] [title] | [desc] | [reward] (alias /s) — create an event / mission / giveaway
+• /attack — Rimuru deploys attackers against a wealthy player (owner/Rimuru only)
+• /attack [number] (reply) — deploy exactly N attackers against the replied user (owner only)
+• /FBI (alias /SWAT) — reply to raid a user's home (owner only, case-sensitive escape)
+• /xleaderboard [n] (alias /xlb) — full networth list of ALL players, 1–100 (staff only)
+• /stop — pause the bot for maintenance (owner) · /run — resume
+
+<b>💝 Waifu collection</b>
+• /waifu (alias /wspawn) — spawn a random character card with a Claim button (owner only)
+• /swaifu — spawn a SUPER (golden) waifu card, re-rolled for an unclaimed character (owner only)
+• /collection (alias /waifus) — your claimed characters (numbered)
+• /viewwaifu [number] (alias /vw) — view one claimed character by number
+• /character [name] — details of one claimed character
+• /wlb — top waifu collectors
+
+<b>⚔️ Anime Hunt</b>
+• /hunt (alias /shunt) — start an anime hunt, spawn a random character (owner only)
+• /char [name] (alias /whois) — search a character and see their info (anyone)
+• /characters — your claimed characters (numbered)
+• /viewchar [number] (alias /vc) — view one claimed character by number
+• /clb [n] — top character hunters (default 10, max 100)
+• /remember [key] [value] — store a memory (owner only)
+• /recall [key] — retrieve a memory (owner only)
+
+<b>🏆 /lb</b> — top 10 richest
+<b>📜 /menu</b> — interactive menu
+☰ <i>The menu button next to the text box has all commands.</i>
+💬 <i>Reply to me or say "Rimuru" to talk.</i>`,{title:"❓ RIMURU HELP",color:THEME.gold,html:!0})},balance:async ctx=>{const u=eco.ensure(ctx.userId,metaOf(ctx.msg));await ctx.reply(`👛 Wallet (rob-able): <b>${fmt(u.wallet)}</b>
+🏦 Bank (safe): <b>${fmt(u.bank)}</b>
+💎 Net worth: <b>${fmt(u.wallet+u.bank)}</b>`,{title:`💰 ${u.first_name||"YOUR"} BALANCE`,color:THEME.gold,html:!0})},bank:async ctx=>{const u=eco.ensure(ctx.userId,metaOf(ctx.msg));await ctx.reply(`🏦 <b>BANK</b>
+
+💼 Saved: <b>${fmt(u.bank)}</b>
+👛 Wallet: <b>${fmt(u.wallet)}</b>
+
+Use <code>/dep [amount|all]</code> to deposit or <code>/wd [amount|all]</code> to withdraw.`,{title:"🏦 BANK",color:THEME.cyan,html:!0})},income:async ctx=>{await ctx.reply(`<b>💵 INCOME</b>
+
+• /beg — quick coins
+• /work — steady pay
+• /fish — lucky catch
+• /dig — treasure hunt
+• /daily — 24h reward
+• /bonus — weekly reward`,{title:"💵 INCOME",color:THEME.gold,html:!0})},dep:async ctx=>{const r=eco.deposit(ctx.userId,ctx.args[0]||"all");await ctx.reply(r.message,{title:"🏦 DEPOSIT",color:THEME.cyan})},deposit:async ctx=>{const r=eco.deposit(ctx.userId,ctx.args[0]||"all");await ctx.reply(r.message,{title:"🏦 DEPOSIT",color:THEME.cyan})},wd:async ctx=>{const r=eco.withdraw(ctx.userId,ctx.args[0]||"all");await ctx.reply(r.message,{title:"💵 WITHDRAW",color:THEME.cyan})},withdraw:async ctx=>{const r=eco.withdraw(ctx.userId,ctx.args[0]||"all");await ctx.reply(r.message,{title:"💵 WITHDRAW",color:THEME.cyan})},donate:async ctx=>{const target=repliedUser(ctx.msg);if(!target)return ctx.reply("Reply to someone with <code>/donate [amount]</code>. 🎯",{title:"💝 DONATE",color:THEME.cyan,html:!0});const r=eco.donate(ctx.userId,target.id,ctx.args[0]);await ctx.reply(r.message,{title:"💝 DONATE",color:THEME.cyan,html:!0})},transfer:async ctx=>{const target=repliedUser(ctx.msg);if(!target)return ctx.reply("Reply to someone with <code>/transfer [amount]</code>. 🎯",{title:"🏦 TRANSFER",color:THEME.cyan,html:!0});const r=eco.transfer(ctx.userId,target.id,ctx.args[0]);await ctx.reply(r.message,{title:"🏦 TRANSFER",color:THEME.cyan,html:!0})},slots:async ctx=>{const r=await slots.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"slots",ctx.args[0],r.won?"win":"lose",r.net)},dice:async ctx=>{const r=await dice.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"dice",ctx.args[0],r.won?"win":"lose",r.net)},cf:async ctx=>{const r=await coinflip.play(ctx);return r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"coinflip",r.bet||ctx.args[1]||0,r.won?"win":"lose",r.net),r},coinflip:async ctx=>{const r=await coinflip.play(ctx);return r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"coinflip",r.bet||ctx.args[1]||0,r.won?"win":"lose",r.net),r},mines:async ctx=>{const r=await mines.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"mines",ctx.args[0],r.won?"win":"lose",r.net)},bj:async ctx=>{const r=await blackjack.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"blackjack",ctx.args[0],r.won?"win":"lose",r.net)},roulette:async ctx=>{const r=await roulette.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"roulette",ctx.args[0],r.won?"win":"lose",r.net)},hl:async ctx=>{const r=await higherlower.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"higherlower",ctx.args[0],r.won?"win":"lose",r.net)},guess:async ctx=>{const r=await guess.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"guess",ctx.args[0],r.won?"win":"lose",r.net)},crash:async ctx=>{const r=await crash.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"crash",ctx.args[0],r.won?"win":"lose",r.net)},wheel:async ctx=>{const r=await wheel.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"wheel",ctx.args[0],r.won?"win":"lose",r.net)},rps:async ctx=>{const r=await rps.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"rps",ctx.args[0],r.won?"win":"lose",r.net)},ttt:async ctx=>{const r=await tictactoe.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"tictactoe",ctx.args[0],r.won?"win":"lose",r.net)},duel:async ctx=>{const r=await dicevs.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"dicevs",ctx.args[0],r.won?"win":"lose",r.net)},cfs:async ctx=>{const r=await cfstreak.play(ctx);return r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"cfstreak",r.bet||ctx.args[1]||0,r.won?"win":"lose",r.net),r},coinflipstreak:async ctx=>{const r=await cfstreak.play(ctx);return r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"cfstreak",r.bet||ctx.args[1]||0,r.won?"win":"lose",r.net),r},num:async ctx=>{const r=await numroulette.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"numroulette",ctx.args[0],r.won?"win":"lose",r.net)},race:async ctx=>{const r=await race.play(ctx);r&&typeof r.won=="boolean"&&logGame(ctx.userId,metaOf(ctx.msg),"race",ctx.args[0],r.won?"win":"lose",r.net)},lottery:async ctx=>{await lottery.play(ctx)},rob:async ctx=>{const target=repliedUser(ctx.msg);if(!target)return ctx.reply("Reply to someone with <code>/rob</code>. 🎯",{title:"🕹️ ROBBERY",color:THEME.red,html:!0});const g=cd.guard(ctx.userId,"rob","Robbery");if(g.blocked)return ctx.reply(g.message,{title:"🕹️ ROBBERY",color:THEME.red});const r=robbery.attempt(ctx.userId,target.id,metaOf(ctx.msg));r.ok&&cd.start(ctx.userId,"rob",config.cooldowns.rob),await ctx.reply(r.message,{title:"🕹️ ROBBERY",color:THEME.red})},heist:async ctx=>{const target=repliedUser(ctx.msg);if(!target)return ctx.reply("Reply to someone with <code>/heist</code>. 🎯",{title:"🏦 HEIST",color:THEME.red,html:!0});const g=cd.guard(ctx.userId,"heist","Heist");if(g.blocked)return ctx.reply(g.message,{title:"🏦 HEIST",color:THEME.red});const r=heist.start(ctx.userId,target.id,metaOf(ctx.msg));r.ok&&(cd.start(ctx.userId,"heist",config.cooldowns.heist),scheduleHeist(ctx,r.heist)),await ctx.reply(r.message,{title:"🏦 HEIST",color:THEME.red})},crime:async ctx=>{const g=cd.guard(ctx.userId,"crime","Crime");if(g.blocked)return ctx.reply(g.message,{title:"🕵️ CRIME",color:THEME.red});const r=crime.commit(ctx.userId,ctx.args[0],metaOf(ctx.msg));r.ok&&cd.start(ctx.userId,"crime",config.cooldowns.rob),await ctx.reply(r.message,{title:r.ok?r.success?"✅ CRIME":"🚔 CRIME":"🕵️ CRIME",color:r.ok&&r.success?THEME.gold:THEME.red,html:!0})},join:async ctx=>{const r=heist.join(ctx.userId,metaOf(ctx.msg));if(r.ok&&r.message){const open=db.getOpenHeists(),fullCrew=open.some(o=>o.members.length>=config.heist.maxMembers);if(await ctx.reply(r.message,{title:"🤝 JOIN HEIST",color:THEME.red}),fullCrew){const full=open.find(o=>o.members.length>=config.heist.maxMembers);if(full){const res=heist.execute(full.leader_id),timer=heistTimers.get(full.leader_id);timer&&clearTimeout(timer),heistTimers.delete(full.leader_id),await ctx.reply(res.message,{title:"🏦 HEIST RESULT",color:THEME.red,html:!0})}}}else await ctx.reply(r.message,{title:"🤝 JOIN HEIST",color:THEME.red})},daily:async ctx=>{const r=income.daily(ctx.userId,metaOf(ctx.msg));await ctx.reply(r.message,{title:"📅 DAILY",color:THEME.gold})},bonus:async ctx=>{const r=income.bonus(ctx.userId,metaOf(ctx.msg));await ctx.reply(r.message,{title:"🎁 BONUS",color:THEME.gold})},beg:async ctx=>{const r=income.earn(ctx.userId,"beg",metaOf(ctx.msg));await ctx.reply(r.message,{title:"🙏 BEG",color:THEME.cyan})},work:async ctx=>{const r=income.earn(ctx.userId,"work",metaOf(ctx.msg));await ctx.reply(r.message,{title:"💼 WORK",color:THEME.cyan})},fish:async ctx=>{const r=fishing.fish(ctx.userId,metaOf(ctx.msg));await ctx.reply(r.message,{title:"🎣 FISH",color:THEME.cyan})},dig:async ctx=>{const r=income.earn(ctx.userId,"dig",metaOf(ctx.msg));await ctx.reply(r.message,{title:"⛏️ DIG",color:THEME.cyan})},shop:async ctx=>{await ctx.reply(shop.shopList(),{title:"🛒 RIMURU'S SHOP",color:THEME.gold,html:!0})},store:async ctx=>{await ctx.reply(shop.shopList(),{title:"🛒 RIMURU'S SHOP",color:THEME.gold,html:!0})},buy:async ctx=>{const id=ctx.args[0];if(!id)return ctx.reply("🎯 Usage: <code>/buy [id] [qty]</code> — e.g. <code>/buy 4</code> or <code>/buy hook 2</code>. Check <code>/shop</code> first.",{title:"🛒 BUY",color:THEME.red,html:!0});const r=shop.buyItem(ctx.userId,id,ctx.args[1],metaOf(ctx.msg));await ctx.reply(r.message,{title:r.ok?"✅ PURCHASED":"🛒 BUY",color:r.ok?THEME.gold:THEME.red,html:!0})},inv:async ctx=>{await ctx.reply(shop.inventoryText(ctx.userId),{title:"📦 INVENTORY",color:THEME.cyan,html:!0})},inventory:async ctx=>{await ctx.reply(shop.inventoryText(ctx.userId),{title:"📦 INVENTORY",color:THEME.cyan,html:!0})},p:async ctx=>{await ctx.reply(profile.profileText(ctx,ctx.userId),{title:"🪪 PROFILE",color:THEME.gold,html:!0})},profile:async ctx=>{await ctx.reply(profile.profileText(ctx,ctx.userId),{title:"🪪 PROFILE",color:THEME.gold,html:!0})},badges:async ctx=>{await ctx.reply(profile.badgesText(ctx,ctx.userId),{title:"🎖️ BADGES",color:THEME.gold,html:!0})},id:async ctx=>{await ctx.reply(profile.idCardText(ctx,ctx.userId),{title:"🪪 ID CARD",color:THEME.gold,html:!0})},lb:async ctx=>{await ctx.reply(leaderboard.render(),{title:"🏆 LEADERBOARD",color:THEME.gold,html:!0})},leaderboard:async ctx=>{await ctx.reply(leaderboard.render(),{title:"🏆 LEADERBOARD",color:THEME.gold,html:!0})},sb:async ctx=>{await admin.setBalance(ctx)},addcoin:async ctx=>{await admin.addCoins(ctx)},stop:async ctx=>{await admin.stop(ctx)},run:async ctx=>{await admin.run(ctx)},restart:async ctx=>{await admin.restart(ctx)},ban:async ctx=>{await admin.ban(ctx)},sus:async ctx=>{await admin.suspend(ctx)},mute:async ctx=>{await admin.mute(ctx)},unban:async ctx=>{await admin.unban(ctx)},unsus:async ctx=>{await admin.unsus(ctx)},unmute:async ctx=>{await admin.unmute(ctx)},debug:async ctx=>{await admin.debug(ctx,{lastError,commitHash})},backup:async ctx=>{await backup.now(ctx)},backups:async ctx=>{await backup.list(ctx)},restore:async ctx=>{await backup.restore(ctx)},redeem:async ctx=>{await redeem.handle(ctx)},xlb:async ctx=>{await admin.xleaderboard(ctx)},xleaderboard:async ctx=>{await admin.xleaderboard(ctx)},health:async ctx=>{await admin.health(ctx,{lastError,commitHash})},verify:async ctx=>{await verifyCommand(ctx)},attack:async ctx=>{await handleAttack(ctx)},fbi:async ctx=>{await handleFbi(ctx)},swat:async ctx=>{await handleFbi(ctx)},hide:async ctx=>{await admin.hide(ctx)},rank:async ctx=>{const u=db.getUser(ctx.userId),r=profile.rankOf(ctx.userId),cur=u&&u.rank||"bronze",idx=rank.rankIndex(cur),next=rank.RANKS[idx+1],need=next?rank.THRESHOLDS[idx+1]:null,have=Number(u&&u.rank_valid_matches||0),remain=next?Math.max(0,need-have):0,emoji=["🥉","🥈","🥇","💠","💎","🔮","👑","🌌"][idx]||"🥉";await ctx.reply(`${emoji} <b>${cur.toUpperCase()}</b> — ${r.emoji} ${esc(r.title,!1)}
+Rank #${r.rank?r.rank:"—"} · Net worth: <b>${fmt(r.net)}</b>
+Valid matches: <b>${have}</b>${next?` / ${need}
+
+Next: <b>${next.toUpperCase()}</b> — ${remain} more valid ${remain===1?"match":"matches"}`:`
+
+👑 You are at the TOP rank. Legendary.`}`,{title:"🏆 RANK",color:THEME.gold,html:!0})},ranks:async ctx=>{await ctx.reply(rank.ranksList(),{title:"🏆 RANK LADDER",color:THEME.gold,html:!0})},broadcast:async ctx=>{await handleBroadcast(ctx)},bd:async ctx=>{await handleBroadcast(ctx)},set:async ctx=>{await handleSet(ctx)},s:async ctx=>{await handleSet(ctx)},waifu:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can spawn a waifu. 👑",{title:"💝 WAIFU",color:THEME.red});await waifu.spawn({chatId:ctx.chatId})},wspawn:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can spawn a waifu. 👑",{title:"💝 WAIFU",color:THEME.red});await waifu.spawn({chatId:ctx.chatId})},swaifu:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can spawn a super waifu. 👑",{title:"💍 SUPER WAIFU",color:THEME.red});const r=await waifu.spawnSuper({chatId:ctx.chatId});r.ok||await ctx.reply(r.message,{title:"💍 SUPER WAIFU",color:THEME.gold,html:!0})},collection:async ctx=>{const rows=db.getUserCharacters(ctx.userId);await ctx.reply(waifu.collectionCaption(rows),{title:"💝 WAIFU",color:"#FF80AB",html:!0})},waifus:async ctx=>{const rows=db.getUserCharacters(ctx.userId);await ctx.reply(waifu.collectionCaption(rows),{title:"💝 WAIFU",color:"#FF80AB",html:!0})},viewwaifu:async ctx=>{await viewWaifu(ctx)},vw:async ctx=>{await viewWaifu(ctx)},wlb:async ctx=>{const rows=db.getWaifuLeaderboard(100);await ctx.reply(waifu.leaderboardCaption(rows,100),{title:"💝 WAIFU LEADERBOARD",color:"#FF80AB",html:!0})},character:async ctx=>{const rows=db.getUserCharacters(ctx.userId);await ctx.reply(waifu.characterCaption(rows),{title:"💝 WAIFU",color:"#FF80AB",html:!0})},hunt:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can start a hunt. 👑",{title:"⚔️ ANIME HUNT",color:THEME.red});const r=await hunt.spawn({chatId:ctx.chatId});r.ok||await ctx.reply(r.message,{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0})},shunt:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can start a hunt. 👑",{title:"⚔️ ANIME HUNT",color:THEME.red});const r=await hunt.spawn({chatId:ctx.chatId});r.ok||await ctx.reply(r.message,{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0})},char:async ctx=>{const q=(ctx.args||[]).join(" ").trim();if(!q)return ctx.reply("Usage: <code>/char <name></code> or <code>/whois <name></code>",{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0});const r=await hunt.searchAndShow(q,{chatId:ctx.chatId});r.ok||await ctx.reply(r.message,{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0})},whois:async ctx=>{const q=(ctx.args||[]).join(" ").trim();if(!q)return ctx.reply("Usage: <code>/whois <name></code> or <code>/char <name></code>",{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0});const r=await hunt.searchAndShow(q,{chatId:ctx.chatId});r.ok||await ctx.reply(r.message,{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0})},characters:async ctx=>{const rows=db.getUserHuntCharacters(ctx.userId);await ctx.reply(hunt.collectionCaption(rows),{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0})},viewchar:async ctx=>{await viewChar(ctx)},vc:async ctx=>{await viewChar(ctx)},clb:async ctx=>{const n=Math.min(100,Math.max(1,parseInt((ctx.args||[])[0],10)||10)),rows=db.getHuntLeaderboard(n);await ctx.reply(hunt.leaderboardCaption(rows,n),{title:"⚔️ CHARACTER LEADERBOARD",color:THEME.gold,html:!0})},remember:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can store memories. 👑",{title:"🧠 MEMORY",color:THEME.red});const args=ctx.args||[];if(args.length<2)return ctx.reply("Usage: <code>/remember key value</code>",{title:"🧠 MEMORY",color:THEME.cyan,html:!0});const key=args[0].toLowerCase().replace(/[^a-z0-9_]/g,"_"),value=args.slice(1).join(" ").trim();memory.remember(key,value,"bot_fact"),await ctx.reply(`⟧ <b>Memory Stored</b>\\n\\n${key}: ${value}`,{title:"🧠 MEMORY",color:THEME.gold,html:!0})},recall:async ctx=>{if(!ctx.isOwner)return ctx.reply("Only the King can recall memories. 👑",{title:"🧠 MEMORY",color:THEME.red});const key=(ctx.args||[])[0];if(!key)return ctx.reply("Usage: <code>/recall key</code>",{title:"🧠 MEMORY",color:THEME.cyan,html:!0});const mem=memory.recall(key.toLowerCase().replace(/[^a-z0-9_-]/g,"_"));mem?await ctx.reply(`🧠 <b>Memory</b>\\n\\n${mem.key}: ${mem.value}`,{title:"🧠 MEMORY",color:THEME.gold,html:!0}):await ctx.reply(`🧠 No memory found for "${key}."`,{title:"🧠 MEMORY",color:THEME.cyan,html:!0})}};async function handleBroadcast(ctx){const actor=metaOf(ctx.msg);if(!isStaff(ctx.userId))return ctx.reply("Only the King and his moderators can broadcast. 👑",{title:"📣 BROADCAST",color:THEME.red});const text=(ctx.args||[]).join(" ").trim();if(!text)return ctx.reply(`Usage: <code>/broadcast [message]</code>
+
+Owner may broadcast any message. Moderators must keep it relevant to the Rimuru bot (economy, games, events, commands, etc.).`,{title:"📣 BROADCAST",color:THEME.cyan,html:!0});if(!ctx.isOwner){const verdict=await broadcastMod.isRelevant(text);if(!verdict.ok)return db.logActivity("mod",`Rejected broadcast from ${actor.username||ctx.userId}: ${text.slice(0,80)} (${verdict.reason})`,{target:ctx.userId}),ctx.reply(`🚫 <b>BROADCAST REJECTED</b>
+
+That message isn't relevant to the Rimuru bot (${verdict.reason}). Moderators can only broadcast about the bot, its economy, games, events, commands, or maintenance.`,{title:"📣 BROADCAST",color:THEME.red,html:!0})}const rec=db.createBroadcast(text,"all",ctx.userId);dashboard.queueBroadcast(rec.id,rec.message,"all"),db.logActivity("broadcast",`Broadcast queued by ${actor.username||ctx.userId}: ${text.slice(0,60)}`,{broadcast_id:rec.id}),db.logAudit(ctx.userId,actor.username||String(ctx.userId),"broadcast",0,"target=all"),await ctx.reply(`📣 <b>BROADCAST QUEUED</b> (#${rec.id})
+
+Delivering to all known users & groups…`,{title:"📣 BROADCAST",color:THEME.gold,html:!0})}async function handleSet(ctx){const actor=metaOf(ctx.msg);if(!isStaff(ctx.userId))return ctx.reply("Only the King and his moderators can set events. 👑",{title:"🎯 SET EVENT",color:THEME.red});const args=(ctx.args||[]).join(" ").trim();if(!args)return ctx.reply(`Usage: <code>/set [type] [title] | [description] | [reward]</code>
+
+Types: ${broadcastMod.EVENT_TYPES.join(", ")}
+Example: <code>/set mission Heist Rimuru and survive | Steal from the vault | 100000</code>
+
+The event goes live immediately (players use <code>/mission [id]</code>) and is announced to all chats.`,{title:"🎯 SET EVENT",color:THEME.cyan,html:!0});let type="mission",rest=args;const first=args.split(/\s+/)[0].toLowerCase();if(broadcastMod.EVENT_TYPES.includes(first)&&(type=first,rest=args.slice(first.length).trim()),!rest)return ctx.reply("Give the event a title: <code>/set mission Heist Rimuru | description | 100000</code>",{title:"🎯 SET EVENT",color:THEME.red,html:!0});const parts=rest.split("|").map(p=>p.trim()),title=parts[0]||"New event",description=parts[1]||"",reward=Math.max(0,Math.floor(Number(String(parts[2]||"").replace(/,/g,""))||0)),ev=db.createEvent({title,description,type,reward,ends_at:0,created_by:ctx.userId});db.logActivity("event",`Event created via /set: ${title} (${type})`,{event_id:ev.id}),db.logAudit(ctx.userId,actor.username||String(ctx.userId),"set_event",0,`${type}: ${title} reward=${reward}`);try{const rec=db.createBroadcast(broadcastMod.buildEventAnnouncement(ev),"all",ctx.userId);dashboard.queueBroadcast(rec.id,rec.message,"all"),db.logActivity("broadcast",`Event announced via /set: ${ev.title}`,{broadcast_id:rec.id,event_id:ev.id})}catch(e){console.error("[set] announce failed:",e.message)}await ctx.reply(`✅ <b>EVENT LIVE</b> (#${ev.id})
+
+${broadcastMod.buildEventAnnouncement(ev)}
+
+Players use <code>/missions</code> and <code>/mission ${ev.id}</code>.`,{title:"🎯 SET EVENT",color:THEME.gold,html:!0})}async function handleAttack(ctx){if(!ctx.isOwner)return ctx.reply("Only Rimuru (the King) can trigger an attack. 🐉👑",{title:"🐉 ATTACK",color:THEME.red});const replied=repliedUser(ctx.msg);if(replied){const raw=String((ctx.args||[])[0]||"").trim(),n=Math.floor(Number(raw.replace(/,/g,"")));if(!Number.isFinite(n)||n<1)return ctx.reply("Usage: reply to a user with <code>/attack [number]</code> — e.g. <code>/attack 100</code>.",{title:"🐉 ATTACK",color:THEME.red,html:!0});const r2=await attack.deployAgainst(replied.id,n,{chatId:ctx.chatId,actorId:ctx.userId});r2&&!r2.ok&&await ctx.reply(r2.message,{title:"🐉 ATTACK",color:THEME.red,html:!0});return}const r=await attack.trigger({manual:!0,force:!0,chatId:ctx.chatId,actorId:ctx.userId});r&&r.message&&!r.targetId||r&&!r.ok&&await ctx.reply(r.message,{title:"🐉 ATTACK",color:THEME.red,html:!0})}async function handleFbi(ctx){if(!ctx.isOwner)return ctx.reply("Only the King can deploy the FBI. 🚔👑",{title:"🚔 FBI",color:THEME.red});const replied=repliedUser(ctx.msg);if(!replied)return ctx.reply("Reply to a user with <code>/FBI</code> (or <code>/SWAT</code>) to raid their home. 🚔",{title:"🚔 FBI",color:THEME.red,html:!0});const r=await fbi.deployAgainst(replied.id,{chatId:ctx.chatId,actorId:ctx.userId});r&&!r.ok&&await ctx.reply(r.message,{title:"🚔 FBI",color:THEME.red,html:!0})}function scheduleHeist(ctx,heistRow){const timer=heistTimers.get(heistRow.leader_id);timer&&clearTimeout(timer);const t=setTimeout(async()=>{const h=db.getHeist(heistRow.leader_id);if(h&&h.status==="open"){const res=heist.execute(heistRow.leader_id);await reply(ctx.msg.chat.id,`⏰ <b>The heist window closed.</b>
+
+${res.message}`,{title:"🏦 HEIST RESULT",color:THEME.red,html:!0})}heistTimers.delete(heistRow.leader_id)},config.heist.openWindowMs);heistTimers.set(heistRow.leader_id,t)}async function viewWaifu(ctx){const n=parseInt((ctx.args||[])[0],10),row=db.getUserCharacterByIndex(ctx.userId,n);if(!row)return ctx.reply("No waifu at that number. Use <code>/collection</code> to see your list.",{title:"💝 WAIFU",color:"#FF80AB",html:!0});if(depsPhoto)try{await depsPhoto(ctx.chatId,row.image_url,{caption:waifu.detailCaption(row),parse_mode:"HTML"});return}catch(e){console.warn("[waifu] view sendPhoto failed:",e.message)}await ctx.reply(waifu.detailCaption(row),{title:"💝 WAIFU",color:"#FF80AB",html:!0})}async function viewChar(ctx){const n=parseInt((ctx.args||[])[0],10),row=db.getHuntCharacterByIndex(ctx.userId,n);if(!row)return ctx.reply("No character at that number. Use <code>/characters</code> to see your list.",{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0});const full=db.getCachedHuntCharacter(row.character_id)||row;if(depsPhoto)try{await depsPhoto(ctx.chatId,row.image_url,{caption:hunt.detailCaption(full,{claimedAt:row.claimed_at}),parse_mode:"HTML"});return}catch(e){console.warn("[hunt] view sendPhoto failed:",e.message)}await ctx.reply(hunt.detailCaption(full,{claimedAt:row.claimed_at}),{title:"⚔️ ANIME HUNT",color:THEME.gold,html:!0})}async function onCallbackQuery(query){var _a,_b,_c;const data=String(query.data||""),chatId=(_b=(_a=query.message)==null?void 0:_a.chat)==null?void 0:_b.id,messageId=(_c=query.message)==null?void 0:_c.message_id,from=query.from||{},userId=from.id,ctx=buildCtx(query.message||{chat:{id:chatId},from},[]),pinfo=db.syncInfo();if(pinfo.configured&&!pinfo.writable){try{await bot.answerCallbackQuery(query.id,{text:"Rimuru is in safe maintenance mode while the database recovers.",show_alert:!0})}catch(_){}return}const answerCb=text=>bot.answerCallbackQuery(query.id,{text}).catch(()=>{}),editMsgCb=(text,opts={})=>editMsg(chatId,messageId,text,opts),check=canInteract(userId,!0);if(!check.allowed){check.reply&&await answerCb(check.reply);return}try{if(data==="gate:verify"){(await checkMembershipFresh(userId)).ok?(await editMsg(chatId,messageId,`✅ <b>VERIFIED!</b>
+
+Welcome to the house, ${from.first_name||"mortal"}. Everything is unlocked. 🎰`,{title:"✅ VERIFIED",color:THEME.gold,html:!0}),await answerCb("✅ Verified! Enjoy the casino.")):await answerCb("Still not a member — join the group first!");return}if(data.startsWith("menu:")){const parts=data.split(":"),page=parts[1];if(page==="main"||page==="casino"||page==="games"||page==="economy"){await editMenu(chatId,messageId,page),await answerCb("");return}if(page==="lb"){await replyThreaded(chatId,messageId,leaderboard.render(),{title:"🏆 LEADERBOARD",color:THEME.gold,html:!0}),await answerCb("");return}if(page==="bal"){const u=eco.ensure(userId,{first_name:from.first_name||"",username:from.username||""});await replyThreaded(chatId,messageId,`👛 Wallet: <b>${fmt(u.wallet)}</b> · 🏦 Bank: <b>${fmt(u.bank)}</b> · 💎 Net: <b>${fmt(u.wallet+u.bank)}</b>`,{title:"💰 BALANCE",color:THEME.gold,html:!0}),await answerCb("");return}if(page==="help"){await replyThreaded(chatId,messageId,`<b>🎮 Games</b>: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /guess · /race · /lottery
+<b>💼 Economy</b>: /balance · /dep · /wd · /donate · /transfer
+<b>🕵️ Crime</b>: /rob · /crime · /heist · /join
+<b>🛒 Shop</b>: /shop · /buy · /inv
+<b>🎣 Activities</b>: /fish · /dig
+<b>💵 Income</b>: /beg · /work · /daily · /bonus
+<b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)
+<b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank
+<b>💝</b> /waifu · /collection · /viewwaifu · /wlb
+<b>⚔️</b> /hunt · /char · /characters · /viewchar · /clb
+<b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop
+💬 <i>Reply to me or say "Rimuru" to talk.</i>`,{title:"❓ HELP",color:THEME.gold,html:!0}),await answerCb("");return}if(page==="g"&&parts[2]&&GAME_USAGE[parts[2]]){await replyThreaded(chatId,messageId,GAME_USAGE[parts[2]],{title:"🎮 GAME",color:THEME.cyan,html:!0}),await answerCb("");return}if(page==="eco"){const action=parts[2];let r;action==="depAll"?r=eco.deposit(userId,"all"):action==="dep100k"?r=eco.deposit(userId,"100000"):action==="wdAll"?r=eco.withdraw(userId,"all"):action==="wd100k"&&(r=eco.withdraw(userId,"100000")),r&&await replyThreaded(chatId,messageId,r.message,{title:"💼 ECONOMY",color:THEME.cyan}),await answerCb("");return}await answerCb("Unknown button.");return}if(data.startsWith("mines:")){const action=data.split(":")[2];action==="pick"&&await mines.onPick({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco}),action==="cash"&&await mines.onCash({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data.startsWith("bj:")){await blackjack.onAction({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data.startsWith("hl:")){await higherlower.onAction({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data.startsWith("guess:")){await guess.onPick({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data.startsWith("race:")){await race.onPick({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data.startsWith("crash:")){await crash.onCash({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data.startsWith("ttt:")){await tictactoe.onAction({data},{bot,chatId,userId,reply:(t,o)=>reply(chatId,t,o),editMsg:editMsgCb,answerCb,eco});return}if(data==="waifu:claim"||data.startsWith("waifu:claim")){await waifu.claim(userId,{chatId,messageId,from,answerCb});return}if(data==="hunt:claim"||data.startsWith("hunt:claim")){await hunt.claim(userId,{chatId,messageId,from,answerCb});return}await answerCb("Unknown button.")}catch(e){console.error("[callback] error:",e.message),lastError=e,await answerCb("Something went wrong.")}}function logGame(userId,meta,game,bet,result,amount){try{db.logGameHistory({user_id:userId,username:meta.username||"",game,bet:bet||0,result:result||"",amount:amount||0}),rank.recordMatchResult(userId,bet||0,result==="win")}catch(e){}}const PAUSED_NOTICE="🔒 Rimuru is paused for maintenance. Please try again later.",PAUSE_EXEMPT_CMDS=["run","backup","backups","restore","health","debug","stop","start","help"],pausedNotified=new Set;function isPausedFor(msg){if(!db.getBotPaused())return!1;const from=msg.from||{};if(String(from.id)===String(config.ownerId))return!1;const parsed=parseCommand(String(msg.text||msg.caption||""));if(parsed&&PAUSE_EXEMPT_CMDS.includes(parsed.cmd))return!1;const key=`${msg.chat.id}:${from.id}`;if(!pausedNotified.has(key)){pausedNotified.add(key);try{bot.sendMessage(msg.chat.id,PAUSED_NOTICE).catch(()=>{})}catch(e){}}return!0}const PERSISTENCE_EXEMPT_CMDS=new Set(["health","debug","help","start","verify","stop","run"]),PERSISTENCE_NOTICE="🛠️ Rimuru is temporarily in safe maintenance mode while the database connection recovers. Your balance and progress are protected. Please try again shortly.";function isPersistenceBlockedFor(msg){return!1}async function onMessage(msg){if(!msg.from||msg.from.is_bot)return;const text=String(msg.text||msg.caption||""),userId=msg.from.id,chatId=msg.chat.id;try{attack.markSeen(userId)}catch(e){}if(isPersistenceBlockedFor(msg))return;try{db.getOrCreateUser(userId,{username:msg.from.username||"",first_name:msg.from.first_name||""})}catch(e){}if(isPausedFor(msg))return;try{db.logChat(msg)}catch(e){}msg._replyTarget=msg.message_id;const ctx=buildCtx(msg,[]);db.expirePenalties();const check=canInteract(userId,!0);if(!check.allowed){check.reply&&text.startsWith("/")&&await reply(chatId,check.reply,{title:"⛔ BLOCKED",color:THEME.red});return}await maybeReact(msg);const parsed=parseCommand(text);if(parsed){const{cmd,args}=parsed,handler=handlers[cmd];if(handler){ctx.args=args;try{const staffCmds=["ban","sus","mute","unban","unsus","unmute","restart","addcoin","sb","broadcast","bd","set","s","xleaderboard","xlb","debug","backup","backups","restore","redeem","stop","run","attack","fbi","swat"];if(!isStaff(ctx.userId)&&!["start","help","verify"].includes(cmd)&&!staffCmds.includes(cmd)&&!(await gateAllowed(ctx.userId)).ok){const p=gatePrompt(chatId);await reply(chatId,p.text,p.opts);return}await handler(ctx)}catch(e){console.error(`[cmd /${cmd}] error:`,e.message,e.stack),lastError=e,await reply(chatId,`⚠️ Something went wrong with /${cmd}. Try again.`,{title:"💥 ERROR",color:THEME.red})}return}}const kbRoute=keyboards.routeButton(text);if(kbRoute){if(kbRoute.back){await reply(chatId,"✨️ <b>Main menu</b> — pick a category.",{title:"🐉 RIMURU CASINO",color:THEME.cyan,html:!0,reply_markup:config.showReplyKeyboard?keyboards.keyboardFor("main"):void 0});return}if(kbRoute.page){const pageTexts={casino:MENU.casino().text,games:MENU.games().text,economy:MENU.economy().text};await reply(chatId,pageTexts[kbRoute.page]||"",{title:kbRoute.page==="casino"?"🎰 CASINO":kbRoute.page==="games"?"🎮 GAMES":"💼 ECONOMY",color:THEME.cyan,html:!0,reply_markup:config.showReplyKeyboard?keyboards.keyboardFor(kbRoute.page):void 0});return}const handler=handlers[kbRoute.cmd];if(handler){ctx.args=[];try{await handler(ctx)}catch(e){console.error(`[kb /${kbRoute.cmd}] error:`,e.message,e.stack),await reply(chatId,"⚠️ Something went wrong with that button. Try again.",{title:"💥 ERROR",color:THEME.red})}return}}try{if(await attack.handleInput(userId,chatId,text))return}catch(e){console.error("[attack] handleInput error:",e.message)}try{if(await fbi.handleInput(userId,chatId,text))return}catch(e){console.error("[fbi] handleInput error:",e.message)}const isReplyToBot=msg.reply_to_message&&msg.reply_to_message.from&&msg.reply_to_message.from.is_bot===!0;if(rimuru.shouldTrigger(text)||isReplyToBot){if(!isStaff(userId)&&!(await gateAllowed(userId)).ok){const p=gatePrompt(chatId);await reply(chatId,p.text,p.opts);return}const from=msg.from,owner=isOwner(userId),name=from.first_name||from.username||"mortal";try{const ans=await rimuru.reply(text,{id:userId,first_name:name,username:from.username,isOwner:owner,isStaff:isStaff(userId)}),textPromise=reply(chatId,ans,{title:"🐉 RIMURU",color:THEME.gold,reply_to_message_id:msg.message_id});await stickerAfterText(chatId,textPromise)}catch(e){console.error("[rimuru] reply error:",e.message),lastError=e,await reply(chatId,"Hmph. The void ate my words. Try again, mortal.",{title:"🐉 RIMURU",color:THEME.gold,reply_to_message_id:msg.message_id})}return}}let botMeId=null;bot.getMe().then(me=>(botMeId=me.id,bot.setMyCommands(MENU_COMMANDS).then(()=>bot.setChatMenuButton({menu_button:{type:"commands"}})).then(()=>bot.getMyCommands()))).then(cmds=>{console.log(`✰ Persistent command menu registered (setMyCommands): ${cmds.map(c=>`/${c.command}`).join(" ")}`)}).catch(e=>{console.warn("[boot] getMe/setMyCommands failed:",e.message)});try{dashboard.setActiveBot(bot)}catch(e){}setInterval(()=>{try{let drained=0;const sender=makeBroadcastSender();for(let item=dashboard.drainBroadcastQueue(sender);item&&(drained++,!(drained>=50));item=dashboard.drainBroadcastQueue(sender));drained&&console.log(`[dashboard] drained ${drained} broadcast(s)`)}catch(e){console.error("[dashboard] drain error:",e.message)}},1e4);function makeBroadcastSender(){return(item,done)=>{let count=0;const target=item.target||"all",chats=new Set;try{for(const cid of db.getSeenChatIds())chats.add(Number(cid))}catch(e){}let list=[...chats];target==="groups"?list=list.filter(c=>c<0):target==="users"&&(list=list.filter(c=>c>0)),list=[...new Set(list)].slice(0,target==="all"?1e3:500),(async()=>{for(const cid of list)try{await bot.sendMessage(cid,item.message,{parse_mode:"HTML"}),count++}catch(e){}done(count),console.log(`[dashboard] broadcast #${item.id} (${target}) delivered to ${count}/${list.length} chats`)})().catch(()=>done(count))}}try{attack.attach({reply:(chatId,text,opts)=>reply(chatId,text,opts),announce:text=>{const rec=db.createBroadcast(text,"all",Number(config.ownerId));return dashboard.queueBroadcast(rec.id,rec.message,"all"),Promise.resolve()},group:async(text,opts)=>{const groups=db.getSeenChatIds().filter(cid=>Number(cid)<0);for(const gid of groups)try{await reply(gid,text,opts)}catch(e){}}}),attack.startRandomScheduler()}catch(e){console.error("[attack] wiring failed:",e.message)}try{fbi.attach({reply:(chatId,text,opts)=>reply(chatId,text,opts),announce:text=>{const rec=db.createBroadcast(text,"all",Number(config.ownerId));return dashboard.queueBroadcast(rec.id,rec.message,"all"),Promise.resolve()}})}catch(e){console.error("[fbi] wiring failed:",e.message)}try{waifu.attach({reply:(chatId,text,opts)=>reply(chatId,text,opts),sendPhoto:(chatId,imageUrl,opts)=>bot.sendPhoto(chatId,imageUrl,opts),answerCb:text=>bot.answerCallbackQuery(text&&text.query_id?text.query_id:void 0,text&&text.text?{text:text.text}:{}).catch(()=>{})})}catch(e){console.error("[waifu] wiring failed:",e.message)}try{hunt.attach({reply:(chatId,text,opts)=>reply(chatId,text,opts),sendPhoto:(chatId,imageUrl,opts)=>bot.sendPhoto(chatId,imageUrl,opts),answerCb:text=>bot.answerCallbackQuery(text&&text.query_id?text.query_id:void 0,text&&text.text?{text:text.text}:{}).catch(()=>{})})}catch(e){console.error("[hunt] wiring failed:",e.message)}bot.on("message",onMessage),bot.on("callback_query",onCallbackQuery);try{waifu.startAutoSpawn(bot,{getChatIds:db.getSeenChatIds})}catch(e){console.error("[waifu] auto-spawn wiring failed:",e.message)}try{hunt.startAutoSpawn(bot,{getChatIds:db.getSeenChatIds})}catch(e){console.error("[hunt] auto-spawn wiring failed:",e.message)}setInterval(()=>{const expired=db.expirePenalties();for(const u of expired)console.log(`[admin] ${u.status} expired for user ${u.user_id}`)},3e4),setInterval(()=>{try{attack.sweep()}catch(e){console.error("[attack] sweep error:",e.message)}},5e3),setInterval(()=>{try{fbi.sweep()}catch(e){console.error("[fbi] sweep error:",e.message)}},5e3),setInterval(()=>{try{waifu.expireIfNeeded()}catch(e){console.error("[waifu] sweep error:",e.message)}},3e4),setInterval(()=>{try{hunt.expireIfNeeded()}catch(e){console.error("[hunt] sweep error:",e.message)}},3e4),setInterval(()=>{try{timewallet.sweep()}catch(e){console.error("[rank] time-wallet sweep error:",e.message)}},6e4);let lastPeak=rank.isPeakHour();return setInterval(()=>{try{const nowPeak=rank.isPeakHour();if(nowPeak&&!lastPeak){const rec=db.createBroadcast(`🌞 <b>PEAK HOURS STARTED</b>
+
+Every game is now a flat 50/50 until 11:00 WAT. Good luck, mortals!`,"all",Number(config.ownerId));dashboard.queueBroadcast(rec.id,rec.message,"all"),console.log("[rank] peak hours STARTED (08:00 WAT) — flat 50/50 engaged")}else if(!nowPeak&&lastPeak){const rec=db.createBroadcast(`🌙 <b>PEAK HOURS ENDED</b>
+
+Rank-based win chances are back. Top ranks face worse odds — the house protects its whales.`,"all",Number(config.ownerId));dashboard.queueBroadcast(rec.id,rec.message,"all"),console.log("[rank] peak hours ENDED (11:00 WAT) — rank-tier odds restored")}lastPeak=nowPeak}catch(e){console.error("[rank] peak-hour scheduler error:",e.message)}},6e4),bot.on("polling_error",err=>{console.error("[polling] error:",err.message)}),bot}module.exports={createBot,MENU_COMMANDS};
