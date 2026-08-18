@@ -2,313 +2,65 @@
 const config = require('./config');
 const db = require('./db');
 
-const ANILIST_URL = 'https://graphql.anilist.co';
-const KITSU_URL = 'https://kitsu.io/api/edge/characters';
+const ANILIST_URL='https://graphql.anilist.co';
+const KITSU_URL='https://kitsu.io/api/edge/characters';
+const MAX_TELEGRAM_PHOTO_BYTES=9_500_000;
+const RARITY_TIERS=[{key:'mythic',emoji:'🔴',label:'MYTHIC',min:50000},{key:'legendary',emoji:'🟠',label:'LEGENDARY',min:20000},{key:'epic',emoji:'🟣',label:'EPIC',min:5000},{key:'rare',emoji:'🔵',label:'RARE',min:500},{key:'common',emoji:'⚪',label:'COMMON',min:0}];
+const BOLD_UPPER='𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙',BOLD_LOWER='𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳',BOLD_NUM='𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗';
+function fancy(s){return String(s||'').replace(/[A-Za-z0-9]/g,(c)=>c>='A'&&c<='Z'?BOLD_UPPER[c.charCodeAt(0)-65]:c>='a'&&c<='z'?BOLD_LOWER[c.charCodeAt(0)-97]:BOLD_NUM[c.charCodeAt(0)-48]);}
+function stripUrls(s){return String(s||'').replace(/https?:\/\/\S+/gi,'').replace(/www\.\S+/gi,'').trim();}
+function stripHtml(s){return stripUrls(String(s||'').replace(/<br\s*\/?>/gi,'\n').replace(/<[^>]+>/g,'')).replace(/[ \t]+/g,' ').trim();}
+function rarityFor(favorites){const f=Number(favorites)||0;return(RARITY_TIERS.find((t)=>f>=t.min)||RARITY_TIERS[RARITY_TIERS.length-1]).key;}
+function rarityMeta(key){return RARITY_TIERS.find((t)=>t.key===key)||RARITY_TIERS[RARITY_TIERS.length-1];}
+function truncateBio(bio,max=300){const s=stripHtml(bio);return s.length<=max?s:`${s.slice(0,max-1).trim()}…`;}
+function wrapText(s,width=34,maxLines=7){const words=truncateBio(s,width*maxLines).split(/\s+/).filter(Boolean),lines=[];let line='';for(const word of words){if((line+(line?' ':'')+word).length>width){if(line)lines.push(line);line=word;if(lines.length>=maxLines-1)break;}else line+=(line?' ':'')+word;}if(line&&lines.length<maxLines)lines.push(line);return lines;}
+function sleep(ms){return new Promise((r)=>setTimeout(r,ms));}
+function isSpawnClaimable(spawn,now=Date.now()){return!!spawn&&Number(spawn.claimed)!==1&&!(Number(spawn.expires_at)>0&&Number(spawn.expires_at)<=now);}
+function secondsRemaining(spawn,now=Date.now()){return spawn?Math.max(0,Math.ceil((Number(spawn.expires_at)-now)/1000)):0;}
+function seriesNameOf(char){if(!char)return'';if(char.series)return stripUrls(char.series);const anime=Array.isArray(char.anime)?char.anime:[];return stripUrls(anime[0]&&anime[0].anime&&(anime[0].anime.title||anime[0].anime.name)||'');}
+function animeListOf(char){const anime=Array.isArray(char&&char.anime)?char.anime:[];return anime.slice(0,5).map((a)=>stripUrls(a.anime&&(a.anime.title||a.anime.name)||'')).filter(Boolean).join(', ');}
 
-const RARITY_TIERS = [
-  { key: 'mythic', emoji: '🔴', label: 'MYTHIC', min: 50000 },
-  { key: 'legendary', emoji: '🟠', label: 'LEGENDARY', min: 20000 },
-  { key: 'epic', emoji: '🟣', label: 'EPIC', min: 5000 },
-  { key: 'rare', emoji: '🔵', label: 'RARE', min: 500 },
-  { key: 'common', emoji: '⚪', label: 'COMMON', min: 0 },
-];
-
-function rarityFor(favorites) { const f = Number(favorites) || 0; return (RARITY_TIERS.find((t) => f >= t.min) || RARITY_TIERS[RARITY_TIERS.length - 1]).key; }
-function rarityMeta(key) { return RARITY_TIERS.find((t) => t.key === key) || RARITY_TIERS[RARITY_TIERS.length - 1]; }
-function esc(s) { return String(s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-function stripHtml(s) { return String(s || '').replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim(); }
-function truncateBio(bio, max = 260) { const s = stripHtml(bio); return s.length <= max ? s : `${s.slice(0, max - 1).trim()}…`; }
-function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
-
-const FALLBACK_POOL = [
-  { character_id: 'fb-1001', name: 'Gojo Satoru', series: 'Jujutsu Kaisen', favorites: 75000, bio: 'The strongest jujutsu sorcerer and a teacher at Tokyo Jujutsu High.', image_url: 'https://cdn.myanimelist.net/images/characters/15/422168.jpg' },
-  { character_id: 'fb-1002', name: 'Rem', series: 'Re:Zero', favorites: 65000, bio: 'A maid of the Roswaal mansion known for her loyalty and strength.', image_url: 'https://cdn.myanimelist.net/images/characters/9/311327.jpg' },
-  { character_id: 'fb-1012', name: 'Tanjiro Kamado', series: 'Demon Slayer', favorites: 70000, bio: 'A kind-hearted Demon Slayer searching for a cure for his sister.', image_url: 'https://cdn.myanimelist.net/images/characters/10/316805.jpg' },
-  { character_id: 'fb-1015', name: 'Levi Ackerman', series: 'Attack on Titan', favorites: 65000, bio: "Humanity's strongest soldier and captain in the Survey Corps.", image_url: 'https://cdn.myanimelist.net/images/characters/12/321544.jpg' },
-];
-
-function fallbackCard(e) { return { ...e, anime: [{ anime: { mal_id: 0, name: e.series } }], rarity: rarityFor(e.favorites), source: 'Fallback' }; }
-function pickFallbackCharacter() { const list = FALLBACK_POOL.filter((e) => !db.isHuntCharacterClaimed(e.character_id)); if (!list.length) return null; const c = fallbackCard(list[Math.floor(Math.random() * list.length)]); db.cacheHuntCharacter(c); return c; }
-function isSpawnClaimable(spawn, now = Date.now()) { return !!spawn && Number(spawn.claimed) !== 1 && !(Number(spawn.expires_at) > 0 && Number(spawn.expires_at) <= now); }
-function secondsRemaining(spawn, now = Date.now()) { return spawn ? Math.max(0, Math.ceil((Number(spawn.expires_at) - now) / 1000)) : 0; }
-function seriesNameOf(char) { if (!char) return ''; if (char.series) return String(char.series); const anime = Array.isArray(char.anime) ? char.anime : []; return anime[0] && anime[0].anime && (anime[0].anime.title || anime[0].anime.name) || ''; }
-function animeListOf(char) { const anime = Array.isArray(char && char.anime) ? char.anime : []; return anime.slice(0, 5).map((a) => a.anime && (a.anime.title || a.anime.name) || '').filter(Boolean).join(', '); }
-function announceCaption(card, spawn) {
-  const meta = rarityMeta(card.rarity);
-  const bio = truncateBio(card.bio, 230);
-  return [`<b>⚔️ ANIME HUNT</b>`, 'A new character has appeared!', '', `👤 <b>${esc(card.name)}</b>`, `🆔 #${esc(card.character_id)}`, seriesNameOf(card) ? `🎬 ${esc(seriesNameOf(card))}` : '', `${meta.emoji} ${meta.label}`, bio ? `📖 ${esc(bio)}` : '', '', `<i>⏱️ ${secondsRemaining(spawn)}s remaining — first claim wins!</i>`].filter(Boolean).join('\n');
+function announceCaption(card,spawn){
+  const meta=rarityMeta(card.rarity),secs=secondsRemaining(spawn),bioLines=wrapText(card.bio||'A mysterious fighter has crossed into the JTF hunting grounds.',34,6),series=seriesNameOf(card);
+  const lines=['╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮','          ⚔️  𝐀𝐍𝐈𝐌𝐄 𝐇𝐔𝐍𝐓  ⚔️','╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯','','      ✨ 𝐀 𝐏𝐎𝐖𝐄𝐑𝐅𝐔𝐋 𝐏𝐑𝐄𝐒𝐄𝐍𝐂𝐄 𝐉𝐔𝐒𝐓 𝐄𝐍𝐓𝐄𝐑𝐄𝐃 𝐓𝐇𝐄 𝐉𝐓𝐅 𝐇𝐔𝐍𝐓𝐈𝐍𝐆 𝐆𝐑𝐎𝐔𝐍𝐃𝐒! ✨','',`              👤 ${fancy(stripUrls(card.name||'Unknown'))}`,`                 #${stripUrls(card.character_id||'')}`,''];
+  if(series)lines.push(`      🎬 ${fancy(series)}`,'');
+  lines.push(`          ${meta.emoji} 『 ${fancy(meta.label)} 』`,'','╭──────────────────────────────╮','📖 𝐂𝐇𝐀𝐑𝐀𝐂𝐓𝐄𝐑 𝐈𝐍𝐅𝐎','',...bioLines,'╰──────────────────────────────╯','',`        ⏱️ ${fancy(String(secs))}𝐬 𝐑𝐄𝐌𝐀𝐈𝐍𝐈𝐍𝐆`,'           ⚡ 𝐅𝐢𝐫𝐬𝐭 𝐜𝐥𝐚𝐢𝐦 𝐰𝐢𝐧𝐬!');
+  return lines.join('\n').slice(0,1024);
 }
-function claimedCaption(char, claimerName) { const meta = rarityMeta(char.rarity); return `<b>⚔️ CHARACTER CLAIMED!</b>\n👤 ${esc(char.name)}\n${seriesNameOf(char) ? `🎬 ${esc(seriesNameOf(char))}\n` : ''}${meta.emoji} ${meta.label}\n🎯 Claimed by ${esc(claimerName)}`; }
-function detailCaption(char, opts = {}) {
-  const meta = rarityMeta(char.rarity);
-  const lines = [`👤 ${esc(char.name)}`, `🆔 Character ID: ${esc(char.character_id)}`];
-  if (seriesNameOf(char)) lines.push(`🎬 ${esc(seriesNameOf(char))}`);
-  const bio = truncateBio(char.bio);
-  if (bio) lines.push(`📖 About: ${esc(bio)}`);
-  const anime = animeListOf(char);
-  if (anime) lines.push(`📚 Appears in: ${esc(anime)}`);
-  lines.push(`${meta.emoji} Rarity: ${meta.label}`);
-  if (opts.claimedAt) lines.push(`📅 Claimed: ${new Date(Number(opts.claimedAt) || opts.claimedAt).toLocaleDateString()}`);
-  return lines.join('\n');
-}
-function collectionCaption(rows) { if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! ⚔️'; return `<b>⚔️ Your Collection</b> (${rows.length} characters)\n\n${rows.map((r, i) => `${i + 1}. ${rarityMeta(r.rarity).emoji} ${esc(r.name)} — ${esc(r.series || '?')}`).join('\n')}`; }
-function leaderboardCaption(rows, limit = 10) { if (!rows || !rows.length) return 'No hunters yet. Start the hunt! ⚔️'; const medals = ['🥇','🥈','🥉']; return `<b>⚔️ Character Leaderboard</b> (top ${Math.min(limit, rows.length)})\n\n${rows.map((r, i) => `${medals[i] || `${i + 1}.`} ${esc(r.username ? `@${r.username}` : r.first_name || `User ${r.user_id}`)} — ${r.count}`).join('\n')}`; }
-function claimMarkup() { return { inline_keyboard: [[{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
+function claimedCaption(char,claimerName){const meta=rarityMeta(char.rarity);return `⚔️ ${fancy('CHARACTER CLAIMED!')}\n👤 ${fancy(stripUrls(char.name))}\n${seriesNameOf(char)?`🎬 ${fancy(seriesNameOf(char))}\n`:''}${meta.emoji} ${fancy(meta.label)}\n🎯 ${fancy('Claimed by')} ${stripUrls(claimerName)}`;}
+function detailCaption(char,opts={}){const meta=rarityMeta(char.rarity),lines=[`👤 ${fancy(stripUrls(char.name))}`,`🆔 #${stripUrls(char.character_id)}`];if(seriesNameOf(char))lines.push(`🎬 ${fancy(seriesNameOf(char))}`);const bio=truncateBio(char.bio);if(bio)lines.push(`📖 ${bio}`);const anime=animeListOf(char);if(anime)lines.push(`📚 ${anime}`);lines.push(`${meta.emoji} ${fancy(meta.label)}`);if(opts.claimedAt)lines.push(`📅 ${new Date(Number(opts.claimedAt)||opts.claimedAt).toLocaleDateString()}`);return lines.join('\n');}
+function collectionCaption(rows){if(!rows||!rows.length)return'Your character collection is empty. Go hunt some! ⚔️';return `⚔️ ${fancy('YOUR COLLECTION')} (${rows.length})\n\n${rows.map((r,i)=>`${i+1}. ${rarityMeta(r.rarity).emoji} ${fancy(stripUrls(r.name))} — ${fancy(stripUrls(r.series||'?'))}`).join('\n')}`;}
+function leaderboardCaption(rows,limit=10){if(!rows||!rows.length)return'No hunters yet. Start the hunt! ⚔️';const medals=['🥇','🥈','🥉'];return `⚔️ ${fancy('CHARACTER LEADERBOARD')}\n\n${rows.map((r,i)=>`${medals[i]||`${i+1}.`} ${fancy(stripUrls(r.username?`@${r.username}`:r.first_name||`User ${r.user_id}`))} — ${r.count}`).join('\n')}`;}
+function claimMarkup(){return{inline_keyboard:[[{text:'⚔️ CLAIM CHARACTER',callback_data:'hunt:claim'}]]};}
 
-async function fetchJson(url, timeoutMs = config.hunt.fetchTimeoutMs || 10000, retries = 3, options = {}) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeoutMs);
-    timer.unref && timer.unref();
-    try {
-      const res = await fetch(url, { headers: { 'User-Agent': config.hunt.userAgent || 'RimuruTempestCasino/1.0', Accept: 'application/json', ...(options.headers || {}) }, signal: ac.signal, method: options.method || 'GET', body: options.body });
-      clearTimeout(timer);
-      if (res.ok) return await res.json();
-      if ((res.status === 429 || res.status >= 500) && attempt < retries) { await sleep(650 * attempt); continue; }
-      return null;
-    } catch (_) {
-      clearTimeout(timer);
-      if (attempt < retries) { await sleep(650 * attempt); continue; }
-      return null;
-    }
-  }
-  return null;
-}
+const FALLBACK_POOL=[{character_id:'fb-1001',name:'Gojo Satoru',series:'Jujutsu Kaisen',favorites:75000,bio:'The strongest jujutsu sorcerer and a teacher at Tokyo Jujutsu High.',image_url:'https://cdn.myanimelist.net/images/characters/15/422168.jpg'},{character_id:'fb-1002',name:'Rem',series:'Re:Zero',favorites:65000,bio:'A maid of the Roswaal mansion known for her loyalty and strength.',image_url:'https://cdn.myanimelist.net/images/characters/9/311327.jpg'},{character_id:'fb-1012',name:'Tanjiro Kamado',series:'Demon Slayer',favorites:70000,bio:'A kind-hearted Demon Slayer searching for a cure for his sister.',image_url:'https://cdn.myanimelist.net/images/characters/10/316805.jpg'},{character_id:'fb-1015',name:'Levi Ackerman',series:'Attack on Titan',favorites:65000,bio:"Humanity's strongest soldier and captain in the Survey Corps.",image_url:'https://cdn.myanimelist.net/images/characters/12/321544.jpg'}];
+function fallbackCard(e){return{...e,anime:[{anime:{name:e.series}}],rarity:rarityFor(e.favorites),source:'Fallback'};}
+function pickFallbackCharacter(){const list=FALLBACK_POOL.filter((e)=>!db.isHuntCharacterClaimed(e.character_id));if(!list.length)return null;const c=fallbackCard(list[Math.floor(Math.random()*list.length)]);db.cacheHuntCharacter(c);return c;}
 
-function normalizeJikan(raw) {
-  if (!raw || typeof raw !== 'object') return null;
-  const id = Number(raw.mal_id) || 0;
-  const imageUrl = raw.images && raw.images.jpg && (raw.images.jpg.large_image_url || raw.images.jpg.image_url) || '';
-  if (!id || !imageUrl) return null;
-  const anime = Array.isArray(raw.anime) ? raw.anime.slice(0, 8) : [];
-  const favorites = Number(raw.favorites) || 0;
-  return { character_id: String(id), name: String(raw.name || 'Unknown').trim(), series: anime[0] && anime[0].anime && (anime[0].anime.title || anime[0].anime.name) || '', anime, image_url: imageUrl, bio: String(raw.about || '').trim(), favorites, rarity: rarityFor(favorites), source: 'Jikan' };
-}
+async function fetchJson(url,timeoutMs=config.hunt.fetchTimeoutMs||10000,retries=2,options={}){for(let attempt=1;attempt<=retries;attempt++){const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),timeoutMs);timer.unref&&timer.unref();try{const res=await fetch(url,{method:options.method||'GET',headers:{'User-Agent':config.hunt.userAgent||'RimuruTempestCasino/1.0',Accept:'application/json',...(options.headers||{})},body:options.body,signal:ac.signal});clearTimeout(timer);if(res.ok)return await res.json();if((res.status===429||res.status>=500)&&attempt<retries){await sleep(500*attempt);continue;}return null;}catch(_){clearTimeout(timer);if(attempt<retries){await sleep(500*attempt);continue;}return null;}}return null;}
+function normalizeJikan(raw){if(!raw||typeof raw!=='object')return null;const id=Number(raw.mal_id)||0,imageUrl=raw.images&&raw.images.jpg&&(raw.images.jpg.large_image_url||raw.images.jpg.image_url)||'';if(!id||!imageUrl)return null;const anime=Array.isArray(raw.anime)?raw.anime.slice(0,8):[],favorites=Number(raw.favorites)||0;return{character_id:String(id),name:stripUrls(raw.name||'Unknown'),series:stripUrls(anime[0]&&anime[0].anime&&(anime[0].anime.title||anime[0].anime.name)||''),anime,image_url:imageUrl,bio:stripHtml(raw.about||''),favorites,rarity:rarityFor(favorites),source:'Jikan'};}
+function normalizeAniList(raw){if(!raw||!raw.id)return null;const imageUrl=raw.image&&(raw.image.large||raw.image.medium)||'';if(!imageUrl)return null;const media=raw.media&&raw.media.nodes||[],series=media[0]&&media[0].title&&(media[0].title.english||media[0].title.romaji||media[0].title.native)||'',favorites=Number(raw.favourites)||0;return{character_id:`anilist-${raw.id}`,name:stripUrls(raw.name&&(raw.name.full||raw.name.userPreferred)||'Unknown'),series:stripUrls(series),anime:media.slice(0,8).map((m)=>({anime:{title:m.title&&(m.title.english||m.title.romaji||m.title.native)||''}})),image_url:imageUrl,bio:stripHtml(raw.description||''),favorites,rarity:rarityFor(favorites),source:'AniList'};}
+function normalizeKitsu(raw){if(!raw||!raw.id||!raw.attributes)return null;const a=raw.attributes,image=a.image||{},imageUrl=image.original||image.large||image.medium||'';if(!imageUrl)return null;return{character_id:`kitsu-${raw.id}`,name:stripUrls(a.names&&(a.names.canonical||a.names.en||a.names.ja_jp)||a.canonicalName||'Unknown'),series:'',anime:[],image_url:imageUrl,bio:stripHtml(a.description||''),favorites:0,rarity:'common',source:'Kitsu'};}
+async function fetchRandomFromJikan(){await sleep(config.hunt.rateLimitMs||700);const json=await fetchJson(config.hunt.randomUrl||'https://api.jikan.moe/v4/random/characters');return json&&json.data?normalizeJikan(json.data):null;}
+async function searchJikanCharacter(q){q=String(q||'').trim();if(!q)return null;const base=config.hunt.searchUrl||'https://api.jikan.moe/v4/characters',json=await fetchJson(`${base}?q=${encodeURIComponent(q)}&limit=1`);return json&&Array.isArray(json.data)&&json.data[0]?normalizeJikan(json.data[0]):null;}
+async function searchAniListCharacter(q){q=String(q||'').trim();if(!q)return null;const query=`query ($search: String) { Character(search: $search) { id name { full userPreferred } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;const json=await fetchJson(ANILIST_URL,config.hunt.fetchTimeoutMs||10000,2,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({query,variables:{search:q}})});return json&&json.data&&json.data.Character?normalizeAniList(json.data.Character):null;}
+async function searchKitsuCharacter(q){q=String(q||'').trim();if(!q)return null;const json=await fetchJson(`${KITSU_URL}?filter[name]=${encodeURIComponent(q)}&page[limit]=1`);return json&&Array.isArray(json.data)&&json.data[0]?normalizeKitsu(json.data[0]):null;}
+async function imageByteScore(card){if(!card||!card.image_url)return-1;const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),5000);timer.unref&&timer.unref();try{const res=await fetch(card.image_url,{method:'HEAD',signal:ac.signal,headers:{'User-Agent':config.hunt.userAgent||'RimuruTempestCasino/1.0'}});const len=Number(res.headers.get('content-length'))||0;return len>0&&len<=MAX_TELEGRAM_PHOTO_BYTES?len:0;}catch(_){return 0;}finally{clearTimeout(timer);}}
+function mergeMetadata(primary,others=[]){const all=[primary,...others].filter(Boolean),best={...primary};if(!best.series)best.series=(all.find((x)=>x.series)||{}).series||'';if(!best.bio)best.bio=(all.find((x)=>x.bio)||{}).bio||'';best.favorites=Math.max(...all.map((x)=>Number(x.favorites)||0));best.rarity=rarityFor(best.favorites);if(!best.anime||!best.anime.length)best.anime=(all.find((x)=>Array.isArray(x.anime)&&x.anime.length)||{}).anime||[];return best;}
+async function chooseBestCharacter(seed){if(!seed)return null;const name=seed.name||'',results=await Promise.allSettled([searchJikanCharacter(name),searchAniListCharacter(name),searchKitsuCharacter(name)]),candidates=[seed,...results.filter((r)=>r.status==='fulfilled').map((r)=>r.value)].filter(Boolean).filter((c)=>!db.isHuntCharacterClaimed(c.character_id));if(!candidates.length)return null;const scored=await Promise.all(candidates.map(async(c)=>({c,score:await imageByteScore(c)})));scored.sort((a,b)=>b.score-a.score);return mergeMetadata(scored[0].c,scored.slice(1).map((x)=>x.c));}
+async function fetchSpawnCharacter(){for(let attempt=0;attempt<4;attempt++){const seed=await fetchRandomFromJikan(),card=await chooseBestCharacter(seed);if(card){db.cacheHuntCharacter(card);return card;}}const pool=db.getHuntPool(50).filter((c)=>!db.isHuntCharacterClaimed(c.character_id));if(pool.length)return pool[Math.floor(Math.random()*pool.length)];return pickFallbackCharacter();}
+async function resolveCharacter(id){const cached=db.getCachedHuntCharacter(id);if(cached)return cached;const base=config.hunt.baseUrl||'https://api.jikan.moe/v4',json=await fetchJson(`${base}/characters/${encodeURIComponent(id)}/full`),seed=json&&json.data?normalizeJikan(json.data):null,card=await chooseBestCharacter(seed);if(card)db.cacheHuntCharacter(card);return card;}
 
-function normalizeAniList(raw) {
-  if (!raw || typeof raw !== 'object' || !raw.id) return null;
-  const imageUrl = raw.image && (raw.image.large || raw.image.medium) || '';
-  if (!imageUrl) return null;
-  const media = raw.media && raw.media.nodes || [];
-  const series = media[0] && media[0].title && (media[0].title.english || media[0].title.romaji || media[0].title.native) || '';
-  const favorites = Number(raw.favourites) || 0;
-  return {
-    character_id: `anilist-${raw.id}`,
-    name: raw.name && (raw.name.full || raw.name.userPreferred) || 'Unknown',
-    series,
-    anime: media.slice(0, 8).map((m) => ({ anime: { title: m.title && (m.title.english || m.title.romaji || m.title.native) || '' } })),
-    image_url: imageUrl,
-    bio: stripHtml(raw.description || ''),
-    favorites,
-    rarity: rarityFor(favorites),
-    source: 'AniList',
-  };
-}
-
-function normalizeKitsu(raw) {
-  if (!raw || !raw.id || !raw.attributes) return null;
-  const a = raw.attributes;
-  const image = a.image || {};
-  const imageUrl = image.original || image.large || image.medium || '';
-  if (!imageUrl) return null;
-  return {
-    character_id: `kitsu-${raw.id}`,
-    name: a.names && (a.names.canonical || a.names.en || a.names.ja_jp) || a.canonicalName || 'Unknown',
-    series: '',
-    anime: [],
-    image_url: imageUrl,
-    bio: a.description || '',
-    favorites: 0,
-    rarity: 'common',
-    source: 'Kitsu',
-  };
-}
-
-function imageQuality(card) {
-  if (!card || !card.image_url) return -1;
-  let score = 0;
-  const u = String(card.image_url);
-  if (/large|original|full|xl|1200|1000/i.test(u)) score += 5;
-  if (/medium|small|thumbnail/i.test(u)) score -= 2;
-  if (/myanimelist|anilist|kitsu/i.test(u)) score += 1;
-  score += Math.min(5, Math.log10(Math.max(1, Number(card.favorites) || 1)));
-  return score;
-}
-
-function mergeMetadata(primary, others = []) {
-  const all = [primary, ...others].filter(Boolean);
-  if (!all.length) return null;
-  const best = { ...primary };
-  if (!best.series) best.series = (all.find((x) => x.series) || {}).series || '';
-  if (!best.bio) best.bio = (all.find((x) => x.bio) || {}).bio || '';
-  if (!best.favorites) best.favorites = Math.max(...all.map((x) => Number(x.favorites) || 0));
-  best.rarity = rarityFor(best.favorites);
-  if (!best.anime || !best.anime.length) best.anime = (all.find((x) => Array.isArray(x.anime) && x.anime.length) || {}).anime || [];
-  return best;
-}
-
-async function fetchRandomFromJikan() {
-  await sleep(config.hunt.rateLimitMs || 900);
-  const json = await fetchJson(config.hunt.randomUrl || 'https://api.jikan.moe/v4/random/characters');
-  return json && json.data ? normalizeJikan(json.data) : null;
-}
-
-async function searchJikanCharacter(query) {
-  const q = String(query || '').trim();
-  if (!q) return null;
-  await sleep(config.hunt.rateLimitMs || 900);
-  const base = config.hunt.searchUrl || 'https://api.jikan.moe/v4/characters';
-  const json = await fetchJson(`${base}?q=${encodeURIComponent(q)}&limit=1`);
-  return json && Array.isArray(json.data) && json.data[0] ? normalizeJikan(json.data[0]) : null;
-}
-
-async function searchAniListCharacter(query) {
-  const q = String(query || '').trim();
-  if (!q) return null;
-  const gql = `query ($search: String) { Character(search: $search) { id name { full userPreferred } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
-  const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: gql, variables: { search: q } }),
-  });
-  return json && json.data && json.data.Character ? normalizeAniList(json.data.Character) : null;
-}
-
-async function searchKitsuCharacter(query) {
-  const q = String(query || '').trim();
-  if (!q) return null;
-  const json = await fetchJson(`${KITSU_URL}?filter[name]=${encodeURIComponent(q)}&page[limit]=1`, config.hunt.fetchTimeoutMs || 10000, 2);
-  return json && Array.isArray(json.data) && json.data[0] ? normalizeKitsu(json.data[0]) : null;
-}
-
-async function chooseBestCharacter(seed) {
-  if (!seed) return null;
-  const name = seed.name || '';
-  const candidates = [seed];
-
-  const [ani, jikan, kitsu] = await Promise.all([
-    name ? searchAniListCharacter(name) : Promise.resolve(null),
-    name ? searchJikanCharacter(name) : Promise.resolve(null),
-    name ? searchKitsuCharacter(name) : Promise.resolve(null),
-  ]);
-  for (const c of [ani, jikan, kitsu]) if (c) candidates.push(c);
-
-  const unclaimed = candidates.filter((c) => c && !db.isHuntCharacterClaimed(c.character_id));
-  if (!unclaimed.length) return null;
-  unclaimed.sort((a, b) => imageQuality(b) - imageQuality(a));
-  return mergeMetadata(unclaimed[0], unclaimed.slice(1));
-}
-
-async function fetchSpawnCharacter() {
-  for (let attempt = 0; attempt < 5; attempt++) {
-    const seed = await fetchRandomFromJikan();
-    const card = await chooseBestCharacter(seed);
-    if (card) {
-      db.cacheHuntCharacter(card);
-      return card;
-    }
-  }
-  const pool = db.getHuntPool(50).filter((c) => !db.isHuntCharacterClaimed(c.character_id));
-  if (pool.length) return pool[Math.floor(Math.random() * pool.length)];
-  return pickFallbackCharacter();
-}
-
-async function resolveCharacter(id) {
-  const cached = db.getCachedHuntCharacter(id);
-  if (cached) return cached;
-  await sleep(config.hunt.rateLimitMs || 900);
-  const base = config.hunt.baseUrl || 'https://api.jikan.moe/v4';
-  const json = await fetchJson(`${base}/characters/${encodeURIComponent(id)}/full`);
-  const seed = json && json.data ? normalizeJikan(json.data) : null;
-  const card = await chooseBestCharacter(seed);
-  if (card) db.cacheHuntCharacter(card);
-  return card;
-}
-
-let deps = null;
-function attach(d) { deps = d || null; return module.exports; }
-async function reply(chatId, text, opts = {}) { if (deps && typeof deps.reply === 'function') try { return await deps.reply(chatId, text, opts); } catch (e) { console.warn('[hunt] reply:', e.message); } return null; }
-async function sendPhoto(chatId, url, caption, markup) { if (deps && typeof deps.sendPhoto === 'function') try { return await deps.sendPhoto(chatId, url, { caption, parse_mode: 'HTML', reply_markup: markup }); } catch (e) { console.warn('[hunt] photo:', e.message); return reply(chatId, caption, { title: '⚔️ ANIME HUNT', html: true }); } return null; }
-async function answerCb(text) { if (deps && typeof deps.answerCb === 'function') try { await deps.answerCb(text); } catch (_) {} }
-
-async function spawn(opts = {}) {
-  if (!config.hunt.enabled) return { ok: false, message: 'The Anime Hunt is disabled.' };
-  expireIfNeeded();
-  const existing = db.getActiveHunt();
-  if (isSpawnClaimable(existing)) return { ok: false, message: `⚔️ A character is already up for grabs (${secondsRemaining(existing)}s left).` };
-  if (existing) db.clearActiveHunt();
-  const card = await fetchSpawnCharacter();
-  if (!card) return { ok: false, message: '⚔️ The character APIs are unavailable right now. Try again shortly.' };
-
-  const expiresAt = Date.now() + config.hunt.claimWindowMs;
-  db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
-  const row = db.getActiveHunt();
-  await sendPhoto(opts.chatId, card.image_url, announceCaption(card, row), claimMarkup());
-  return { ok: true, character: card, expiresAt };
-}
-
-async function claim(userId, opts = {}) {
-  const answer = typeof opts.answerCb === 'function' ? opts.answerCb : answerCb;
-  const row = db.getActiveHunt();
-  if (!row) return await answer('No character is up for grabs right now.'), { ok: false, reason: 'no-active-hunt' };
-  if (!isSpawnClaimable(row)) return await answer('This character already expired or was claimed.'), { ok: false, reason: 'not-claimable' };
-  const char = { character_id: row.character_id, name: row.name, series: row.series, image_url: row.image_url, bio: row.bio, favorites: row.favorites, rarity: row.rarity };
-  if (!db.claimHuntCharacter(userId, char)) return await answer('Someone else already claimed this character!'), { ok: false, reason: 'already-claimed' };
-  db.clearActiveHunt();
-  const user = db.getUser(userId) || {};
-  const claimer = user.username ? `@${user.username}` : user.first_name || `user ${userId}`;
-  await reply(opts.chatId || row.chat_id, claimedCaption(char, claimer), { title: '⚔️ CLAIMED', color: '#FFB300', html: true });
-  return { ok: true, character: char, userId };
-}
-
-function expireIfNeeded(now = Date.now()) { const row = db.getActiveHunt(); if (!row || isSpawnClaimable(row, now)) return 0; db.clearActiveHunt(); return 1; }
-
-async function searchAndShow(query, opts = {}) {
-  const q = String(query || '').trim();
-  if (!q) return { ok: false, message: 'Usage: <code>/char &lt;name&gt;</code>' };
-  const [ani, jikan, kitsu] = await Promise.all([
-    searchAniListCharacter(q),
-    searchJikanCharacter(q),
-    searchKitsuCharacter(q),
-  ]);
-  const candidates = [ani, jikan, kitsu].filter(Boolean);
-  if (!candidates.length) return { ok: false, message: `No character found for <b>${esc(q)}</b>.` };
-  candidates.sort((a, b) => imageQuality(b) - imageQuality(a));
-  const card = mergeMetadata(candidates[0], candidates.slice(1));
-  db.cacheHuntCharacter(card);
-  await sendPhoto(opts.chatId, card.image_url, detailCaption(card), null);
-  return { ok: true, character: card };
-}
-
-let autoSpawnTimer = null;
-async function autoSpawnTick(env = {}) {
-  expireIfNeeded();
-  if (isSpawnClaimable(db.getActiveHunt())) return;
-  const groups = (typeof env.getChatIds === 'function' ? env.getChatIds() : []).filter((id) => Number(id) < 0);
-  if (!groups.length) return;
-  const card = await fetchSpawnCharacter();
-  if (!card) return;
-  const expiresAt = Date.now() + config.hunt.claimWindowMs;
-  db.setActiveHunt(card, expiresAt, groups[0]);
-  const row = db.getActiveHunt();
-  for (const gid of groups) await sendPhoto(gid, card.image_url, announceCaption(card, row), claimMarkup());
-}
-
-function startAutoSpawn(_bot, env = {}) {
-  if (autoSpawnTimer || !config.hunt.enabled) return autoSpawnTimer;
-  autoSpawnTimer = setInterval(() => autoSpawnTick(env).catch((e) => console.warn('[hunt] auto:', e.message)), config.hunt.autoSpawnIntervalMs || 3600000);
-  autoSpawnTimer.unref && autoSpawnTimer.unref();
-  return autoSpawnTimer;
-}
-
-function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
-
-module.exports = {
-  RARITY_TIERS, rarityFor, rarityMeta, isSpawnClaimable, secondsRemaining, seriesNameOf,
-  animeListOf, truncateBio, announceCaption, claimedCaption, detailCaption, collectionCaption,
-  leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
-  fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
-  fetchSpawnCharacter, resolveCharacter, attach, spawn, claim, expireIfNeeded, searchAndShow,
-  startAutoSpawn, autoSpawnTick, state, FALLBACK_POOL, fallbackCard, pickFallbackCharacter,
-  imageQuality, mergeMetadata, _clear: () => db.clearActiveHunt(),
-};
+let deps=null;function attach(d){deps=d||null;return module.exports;}async function reply(chatId,text,opts={}){if(deps&&typeof deps.reply==='function')try{return await deps.reply(chatId,text,opts);}catch(e){console.warn('[hunt] reply:',e.message);}return null;}
+async function fetchImageBuffer(url){const ac=new AbortController(),timer=setTimeout(()=>ac.abort(),config.hunt.fetchTimeoutMs||10000);timer.unref&&timer.unref();try{const res=await fetch(url,{headers:{Accept:'image/*','User-Agent':config.hunt.userAgent||'RimuruTempestCasino/1.0'},signal:ac.signal});if(!res.ok)throw new Error(`image HTTP ${res.status}`);const type=String(res.headers.get('content-type')||'image/jpeg').split(';')[0];if(!type.startsWith('image/'))throw new Error(`not an image (${type})`);const arr=await res.arrayBuffer();if(arr.byteLength>MAX_TELEGRAM_PHOTO_BYTES)throw new Error('image too large for Telegram photo');return{buffer:Buffer.from(arr),contentType:type};}finally{clearTimeout(timer);}}
+async function sendPhoto(chatId,url,caption,markup){if(!deps||typeof deps.sendPhoto!=='function')return null;try{const img=await fetchImageBuffer(url);return await deps.sendPhoto(chatId,img.buffer,{caption,reply_markup:markup},{filename:`hunt.${img.contentType.includes('png')?'png':'jpg'}`,contentType:img.contentType});}catch(e){console.warn('[hunt] buffered photo:',e.message);}try{return await deps.sendPhoto(chatId,url,{caption,reply_markup:markup});}catch(e){console.warn('[hunt] URL photo:',e.message);}return reply(chatId,caption,{title:'⚔️ ANIME HUNT',reply_markup:markup,alwaysShowMarkup:true});}
+async function answerCb(text){if(deps&&typeof deps.answerCb==='function')try{await deps.answerCb(text);}catch(_){} }
+async function spawn(opts={}){if(!config.hunt.enabled)return{ok:false,message:'The Anime Hunt is disabled.'};expireIfNeeded();const existing=db.getActiveHunt();if(isSpawnClaimable(existing))return{ok:false,message:`⚔️ A character is already up for grabs (${secondsRemaining(existing)}s left).`};if(existing)db.clearActiveHunt();const card=await fetchSpawnCharacter();if(!card)return{ok:false,message:'⚔️ The hunting grounds are quiet right now. Try again shortly.'};const expiresAt=Date.now()+config.hunt.claimWindowMs;db.setActiveHunt(card,expiresAt,Number(opts.chatId)||0);const row=db.getActiveHunt();await sendPhoto(opts.chatId,card.image_url,announceCaption(card,row),claimMarkup());return{ok:true,character:card,expiresAt};}
+async function claim(userId,opts={}){const answer=typeof opts.answerCb==='function'?opts.answerCb:answerCb,row=db.getActiveHunt();if(!row)return await answer('No character is up for grabs right now.'),{ok:false,reason:'no-active-hunt'};if(!isSpawnClaimable(row))return await answer('This character already expired or was claimed.'),{ok:false,reason:'not-claimable'};const char={character_id:row.character_id,name:row.name,series:row.series,image_url:row.image_url,bio:row.bio,favorites:row.favorites,rarity:row.rarity};if(!db.claimHuntCharacter(userId,char))return await answer('Someone else already claimed this character!'),{ok:false,reason:'already-claimed'};db.clearActiveHunt();const user=db.getUser(userId)||{},claimer=user.username?`@${user.username}`:user.first_name||`user ${userId}`;await reply(opts.chatId||row.chat_id,claimedCaption(char,claimer),{title:'⚔️ CLAIMED'});return{ok:true,character:char,userId};}
+function expireIfNeeded(now=Date.now()){const row=db.getActiveHunt();if(!row||isSpawnClaimable(row,now))return 0;db.clearActiveHunt();return 1;}
+async function searchAndShow(query,opts={}){const q=String(query||'').trim();if(!q)return{ok:false,message:'Usage: /char <name>'};const results=await Promise.allSettled([searchJikanCharacter(q),searchAniListCharacter(q),searchKitsuCharacter(q)]),candidates=results.filter((r)=>r.status==='fulfilled'&&r.value).map((r)=>r.value);if(!candidates.length)return{ok:false,message:`No character found for ${stripUrls(q)}.`};const scored=await Promise.all(candidates.map(async(c)=>({c,score:await imageByteScore(c)})));scored.sort((a,b)=>b.score-a.score);const card=mergeMetadata(scored[0].c,scored.slice(1).map((x)=>x.c));db.cacheHuntCharacter(card);await sendPhoto(opts.chatId,card.image_url,detailCaption(card),null);return{ok:true,character:card};}
+async function autoSpawnTick(env={}){expireIfNeeded();if(isSpawnClaimable(db.getActiveHunt()))return;const groups=(typeof env.getChatIds==='function'?env.getChatIds():[]).filter((id)=>Number(id)<0);if(!groups.length)return;const card=await fetchSpawnCharacter();if(!card)return;const expiresAt=Date.now()+config.hunt.claimWindowMs;db.setActiveHunt(card,expiresAt,groups[0]);const row=db.getActiveHunt();for(const gid of groups)await sendPhoto(gid,card.image_url,announceCaption(card,row),claimMarkup());}
+let autoSpawnTimer=null,autoSpawnKickoff=null;function msUntilMinute(minute){const now=new Date(),next=new Date(now);next.setSeconds(0,0);next.setMinutes(minute);if(next<=now)next.setHours(next.getHours()+1);return next-now;}
+function startAutoSpawn(_bot,env={}){if(autoSpawnTimer||autoSpawnKickoff||!config.hunt.enabled)return autoSpawnTimer||autoSpawnKickoff;autoSpawnKickoff=setTimeout(()=>{autoSpawnKickoff=null;autoSpawnTick(env).catch((e)=>console.warn('[hunt] auto:',e.message));autoSpawnTimer=setInterval(()=>autoSpawnTick(env).catch((e)=>console.warn('[hunt] auto:',e.message)),3600000);autoSpawnTimer.unref&&autoSpawnTimer.unref();},msUntilMinute(25));autoSpawnKickoff.unref&&autoSpawnKickoff.unref();console.log('[hunt] hourly auto-spawn scheduled at :25');return autoSpawnKickoff;}
+function state(){return{activeSpawn:db.getActiveHunt()||null,enabled:config.hunt.enabled};}
+module.exports={RARITY_TIERS,rarityFor,rarityMeta,isSpawnClaimable,secondsRemaining,seriesNameOf,animeListOf,truncateBio,announceCaption,claimedCaption,detailCaption,collectionCaption,leaderboardCaption,claimMarkup,normalizeJikan,normalizeAniList,normalizeKitsu,fetchRandomFromJikan,searchJikanCharacter,searchAniListCharacter,searchKitsuCharacter,fetchSpawnCharacter,resolveCharacter,attach,spawn,claim,expireIfNeeded,searchAndShow,startAutoSpawn,autoSpawnTick,state,FALLBACK_POOL,fallbackCard,pickFallbackCharacter,mergeMetadata,_clear:()=>db.clearActiveHunt()};
