@@ -45,7 +45,7 @@ t('backup: creates snapshot with counts + coins in circulation', () => {
   db.getOrCreateUser(5101, { first_name: 'A', username: 'a' });
   db.setWallet(5101, 1234567);
   db.setBank(5101, 7654321);
-  db.addInventory(5101, 'hook', 2);
+  db.addItem(5101, 'hook', 2);
   // Two more users so the regression test can show a real USER drop too.
   db.getOrCreateUser(5102, { first_name: 'B', username: 'b' });
   db.setWallet(5102, 500000);
