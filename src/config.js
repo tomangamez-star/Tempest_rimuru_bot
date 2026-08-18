@@ -54,8 +54,10 @@ const config = {
   // Owner reactions
   reactions: { die: '☠️', lol: '😂', haha: '😂', win: '💰', rich: '💰', lose: '💸', broke: '💸', love: '❤️', mad: '😡', angry: '😡', gg: '👏', nice: '👏', '?': '🤔', fallback: ['🐉', '🔥', '😎'] },
 
-  // Dashboard
-  dashboard: { enabled: String(process.env.DASHBOARD_ENABLED || 'true').toLowerCase() !== 'false', password: process.env.DASHBOARD_PASSWORD || 'RimuruTempest2024!', sessionTtlMs: 7 * 24 * 3600 * 1000, feedLimit: 100 },
+  // Dashboard — owner password is HARDCODED to 000777 (see ensureOwnerPassword
+  // in dashboard/server.js) so the owner can always log in, even if the
+  // database is wiped. DASHBOARD_PASSWORD env is ignored for the owner.
+  dashboard: { enabled: String(process.env.DASHBOARD_ENABLED || 'true').toLowerCase() !== 'false', password: '000777', sessionTtlMs: 7 * 24 * 3600 * 1000, feedLimit: 100 },
 
   // Economy
   startBalance: 500000,

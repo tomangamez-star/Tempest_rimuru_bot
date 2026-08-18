@@ -206,6 +206,16 @@ async function main() {
   if (config.dashboard.enabled) {
     dashboard = createDashboard(server, null);
     console.log(`🖥️  Admin dashboard mounted (login: owner Telegram ID ${config.ownerId})`);
+    // HARDCODED OWNER ACCESS: upsert the owner admin row NOW so dashboard
+    // ownership (Telegram ID 8781690556 / password 000777) never depends on
+    // Postgres data surviving. This was previously never called — the owner
+    // account was never created, which is why dashboard ownership was lost.
+    try {
+      const pw = ensureOwnerPassword();
+      console.log(`[dashboard] Owner account enforced (user_id ${config.ownerId}, password ${pw ? 'hardcoded' : 'unset'}).`);
+    } catch (e) {
+      console.warn('[dashboard] ensureOwnerPassword failed:', e.message);
+    }
   }
 
 

@@ -1566,13 +1566,12 @@ function createBot() {
   const PERSISTENCE_NOTICE = '🛠️ Rimuru is temporarily in safe maintenance mode while the database connection recovers. Your balance and progress are protected. Please try again shortly.';
 
   function isPersistenceBlockedFor(msg) {
-    const info = db.syncInfo();
-    if (!info.configured || info.writable) return false;
-    const from = msg.from || {};
-    const parsed = parseCommand(String(msg.text || msg.caption || ''));
-    if (parsed && PERSISTENCE_EXEMPT_CMDS.has(parsed.cmd)) return false;
-    try { bot.sendMessage(msg.chat.id, PERSISTENCE_NOTICE).catch(() => {}); } catch (_) {}
-    return true;
+    // NON-BLOCKING: SQLite is the live read/write store and writes are queued
+    // to the mirror until Postgres recovers. Blocking every command while PG
+    // is degraded made the bot appear completely dead — the gate is removed
+    // so all commands (including /health, /stats, /waifu, /redeem, /attack)
+    // always respond. Postgres degradation is surfaced via /health instead.
+    return false;
   }
 
   async function onMessage(msg) {
