@@ -9,17 +9,10 @@ const config = require('../config');
 const { fmt } = require('../utils');
 const rank = require('../rank');
 
-/** Simulate the streak: how many correct flips before a miss.
- *  Capped at MAX_STREAK_WINS so bet * 2^wins can never overflow a
- *  Postgres/SQLite integer column (that overflow was the root cause
- *  of the /cf /cfs "postgres disconnect" bug — an uncapped streak
- *  could occasionally produce a payout too large for the DB, which
- *  choked the write pipeline into degraded/maintenance mode).
- */
-const MAX_STREAK_WINS = 20; // bet * 2^20 (~1,048,576x) is already a huge win; plenty of headroom under any INTEGER/BIGINT column
+/** Simulate the streak: how many correct flips before a miss. */
 function streak(choice, winChance = 0.5) {
   let wins = 0;
-  while (wins < MAX_STREAK_WINS) {
+  while (true) {
     const flip = Math.random() < winChance ? choice : (choice === 'heads' ? 'tails' : 'heads');
     if (flip === choice) wins++;
     else break;
@@ -28,11 +21,9 @@ function streak(choice, winChance = 0.5) {
 }
 
 /** Pure logic: { wins, payout } — payout = bet \u00d7 2^wins. */
-const MAX_PAYOUT = 5_000_000_000; // hard ceiling regardless of bet size — protects the DB even if config.js maxBet is ever raised
 function playStreak(bet, choice, winChance = 0.5) {
   const { wins } = streak(choice, winChance);
-  const raw = wins > 0 ? Math.floor(bet * Math.pow(2, wins)) : 0;
-  const payout = Math.min(raw, MAX_PAYOUT);
+  const payout = wins > 0 ? Math.floor(bet * Math.pow(2, wins)) : 0;
   return { wins, payout, bet, choice };
 }
 
