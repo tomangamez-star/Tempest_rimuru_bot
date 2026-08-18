@@ -3,6 +3,8 @@ const config = require('./config');
 const db = require('./db');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
+const WAIFU_IM_URL = 'https://api.waifu.im/images';
+
 const RARITY_TIERS = [
   { key: 'mythic', emoji: '🔴', label: 'MYTHIC', min: 50000 },
   { key: 'legendary', emoji: '🟠', label: 'LEGENDARY', min: 20000 },
@@ -57,7 +59,6 @@ function normalizeCharacter(raw, source = 'anilist') {
       source: 'AniList',
     };
   }
-  // Compatibility path for old tests/helpers that pass {url: ...}.
   const imageUrl = String(raw.url || '').trim();
   if (!imageUrl) return null;
   return { character_id: characterIdFor(imageUrl), name: randomCharacterName(), series: '', image_url: imageUrl, bio: '', favorites: 0, rarity: 'common', source };
@@ -138,8 +139,48 @@ async function fetchFromJikanByName(name) {
   } catch (_) { return null; } finally { clearTimeout(timer); }
 }
 
-async function fetchFromNekos() { return fetchCharacter(); }
-async function fetchFromWaifuPics() { return fetchCharacter(); }
+async function fetchFromWaifuIm() {
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), config.waifu.fetchTimeoutMs || 10000);
+  timer.unref && timer.unref();
+  try {
+    const qs = new URLSearchParams();
+    qs.append('IncludedTags', 'waifu');
+    qs.append('IsNsfw', 'False');
+    qs.append('PageSize', '30');
+    const res = await fetch(`${WAIFU_IM_URL}?${qs.toString()}`, {
+      headers: { Accept: 'application/json', 'User-Agent': config.waifu.userAgent || 'RimuruTempestCasino/1.0' },
+      signal: ac.signal,
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const items = Array.isArray(json && json.items) ? json.items : [];
+    if (!items.length) return null;
+
+    const score = (x) => {
+      const width = Number(x.width) || 0;
+      const height = Number(x.height) || 0;
+      const area = width * height;
+      const size = Number(x.byte_size || x.file_size || x.filesize) || 0;
+      return area + Math.min(size, 25_000_000);
+    };
+    items.sort((a, b) => score(b) - score(a));
+    const best = items[0] || {};
+    const imageUrl = best.url || best.image_url || '';
+    if (!imageUrl) return null;
+    const rawId = best.image_id || best.id || imageUrl;
+    return {
+      character_id: `waifuim-${String(rawId).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)}`,
+      name: 'Super Waifu',
+      series: '',
+      image_url: String(imageUrl),
+      bio: 'Premium waifu drop.',
+      favorites: 20000,
+      rarity: 'legendary',
+      source: 'Waifu.im',
+    };
+  } catch (_) { return null; } finally { clearTimeout(timer); }
+}
 
 async function fetchCharacter() {
   for (let attempt = 0; attempt < 5; attempt++) {
@@ -152,7 +193,6 @@ async function fetchCharacter() {
       if (card && !db.isWaifuCharacterClaimed(card.character_id)) return card;
     }
   }
-  // Token-free secondary source with real character identity.
   for (let attempt = 0; attempt < 4; attempt++) {
     const card = await fetchFromJikanByName(randomCharacterName());
     if (card && !db.isWaifuCharacterClaimed(card.character_id)) return card;
@@ -187,18 +227,19 @@ async function spawnSuper(opts = {}) {
   const existing = db.getActiveWaifu();
   if (isSpawnClaimable(existing)) return { ok: false, message: `💍 A waifu is already up for grabs (${secondsRemaining(existing)}s left).` };
   if (existing) db.clearActiveWaifu();
-  let best = null;
-  for (let i = 0; i < 3; i++) {
-    const c = await fetchCharacter();
-    if (c && (!best || Number(c.favorites) > Number(best.favorites))) best = c;
+
+  let card = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const candidate = await fetchFromWaifuIm();
+    if (candidate && !db.isWaifuCharacterClaimed(candidate.character_id)) { card = candidate; break; }
   }
-  if (!best) return { ok: false, message: '💔 The waifu API is unavailable right now. Try again shortly.' };
-  best.rarity = Number(best.favorites) >= 20000 ? rarityFor(best.favorites) : 'legendary';
+  if (!card) return { ok: false, message: '💔 Waifu.im is unavailable right now. Try again shortly.' };
+
   const expiresAt = Date.now() + config.waifu.claimWindowMs;
-  db.setActiveWaifu(best, expiresAt, Number(opts.chatId) || 0);
+  db.setActiveWaifu(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveWaifu();
-  await sendPhoto(opts.chatId, best.image_url, cardCaption(best, row, null, true), claimMarkup());
-  return { ok: true, character: best, expiresAt, super: true };
+  await sendPhoto(opts.chatId, card.image_url, cardCaption(card, row, null, true), claimMarkup());
+  return { ok: true, character: card, expiresAt, super: true };
 }
 
 async function claim(userId, opts = {}) {
@@ -214,28 +255,33 @@ async function claim(userId, opts = {}) {
   await reply(opts.chatId || row.chat_id, cardCaption(char, row, claimer), { title: '💝 CLAIMED', color: '#FF80AB', html: true });
   return { ok: true, character: char, userId };
 }
-
 function expireIfNeeded(now = Date.now()) { const row = db.getActiveWaifu(); if (!row || isSpawnClaimable(row, now)) return 0; db.clearActiveWaifu(); return 1; }
 let autoSpawnTimer = null;
 async function autoSpawnTick(env = {}) {
   expireIfNeeded();
   if (isSpawnClaimable(db.getActiveWaifu())) return;
-  const groupIds = (typeof env.getChatIds === 'function' ? env.getChatIds() : []).filter((id) => Number(id) < 0);
-  if (!groupIds.length) return;
+  const groups = (typeof env.getChatIds === 'function' ? env.getChatIds() : []).filter((id) => Number(id) < 0);
+  if (!groups.length) return;
   const card = await fetchCharacter();
   if (!card) return;
   const expiresAt = Date.now() + config.waifu.claimWindowMs;
-  db.setActiveWaifu(card, expiresAt, groupIds[0]);
+  db.setActiveWaifu(card, expiresAt, groups[0]);
   const row = db.getActiveWaifu();
-  for (const gid of groupIds) await sendPhoto(gid, card.image_url, cardCaption(card, row), claimMarkup());
+  for (const gid of groups) await sendPhoto(gid, card.image_url, cardCaption(card, row), claimMarkup());
 }
-function startAutoSpawn(_bot, env = {}) { if (autoSpawnTimer || !config.waifu.enabled) return autoSpawnTimer; autoSpawnTimer = setInterval(() => autoSpawnTick(env).catch((e) => console.warn('[waifu] auto:', e.message)), config.waifu.autoSpawnIntervalMs || 3600000); autoSpawnTimer.unref && autoSpawnTimer.unref(); return autoSpawnTimer; }
+function startAutoSpawn(_bot, env = {}) {
+  if (autoSpawnTimer || !config.waifu.enabled) return autoSpawnTimer;
+  autoSpawnTimer = setInterval(() => autoSpawnTick(env).catch((e) => console.warn('[waifu] auto:', e.message)), config.waifu.autoSpawnIntervalMs || 3600000);
+  autoSpawnTimer.unref && autoSpawnTimer.unref();
+  return autoSpawnTimer;
+}
 function state() { return { activeSpawn: db.getActiveWaifu() || null, enabled: config.waifu.enabled }; }
 
 module.exports = {
-  CHARACTER_NAMES, isCleanEnglishName, randomCharacterName, characterIdFor, normalizeCharacter,
-  isSpawnClaimable, secondsRemaining, cardCaption, collectionCaption, detailCaption,
-  leaderboardCaption, characterCaption, claimMarkup, fetchCharacter, fetchFromNekos,
-  fetchFromWaifuPics, attach, spawn, spawnSuper, claim, expireIfNeeded, startAutoSpawn,
-  autoSpawnTick, state, rarityFor, rarityMeta, _clear: () => db.clearActiveWaifu(),
+  CHARACTER_NAMES, RARITY_TIERS, isCleanEnglishName, randomCharacterName, characterIdFor,
+  rarityFor, rarityMeta, normalizeCharacter, isSpawnClaimable, secondsRemaining,
+  cardCaption, collectionCaption, detailCaption, leaderboardCaption, characterCaption,
+  claimMarkup, fetchCharacter, fetchAniListPage, fetchFromJikanByName, fetchFromWaifuIm,
+  attach, spawn, spawnSuper, claim, expireIfNeeded, startAutoSpawn, autoSpawnTick, state,
+  _clear: () => db.clearActiveWaifu(),
 };
