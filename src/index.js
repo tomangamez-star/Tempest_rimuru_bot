@@ -189,17 +189,8 @@ async function main() {
         );
       } else {
         console.log(`[instance] acquired PG advisory lock ${PG_LOCK_KEY} — I am the bot owner (write pipeline enabled).`);
-        // ── FIX PART 1: Start the mirror loop so SQLite→Postgres writes are drained
-        // periodically. Without this, queued writes never reach Postgres.
+        // Start mirror loop on lock acquisition (fire-and-forget, non-blocking)
         if (db.startMirrorLoop) db.startMirrorLoop();
-        // ── FIX PART 2: On boot after lock acquisition, do ONE extra fullMirror()
-        // immediately to ensure any queued writes from before the redeploy are
-        // synced to Postgres BEFORE we hydrate from it. This prevents: deploy 
-        // overlap → old instance writes queued → new instance hydrates stale data
-        // → user sees "regressed" balance. Wait 2s for old instance to fully close.
-        await new Promise(r => setTimeout(r, 2000));
-        console.log('[db] Running immediate post-lock mirror to sync any pending writes...');
-        if (db.fullMirror) await db.fullMirror();
       }
     } else {
       // No lock support (SQLite-only dev): enable writes for the sole instance.
@@ -327,13 +318,10 @@ async function main() {
     console.log(`\n[${signal}] Shutting down…`);
     try {
       if (primaryRetryTimer) clearInterval(primaryRetryTimer);
-      // ── FIX PART 3: Before closing, drain the mirror queue ONE FINAL TIME.
-      // This ensures any writes queued during bot runtime are persisted to
-      // Postgres BEFORE the instance dies. Without this, writes sit in the queue
-      // and are lost, causing the next redeploy to see stale data.
+      // Final mirror drain (non-blocking fire-and-forget to avoid shutdown delays)
       if (!standby && db.drainMirrorQueue) {
         console.log('[shutdown] Final mirror drain to persist pending writes...');
-        await db.drainMirrorQueue();
+        db.drainMirrorQueue().catch(e => console.warn('[shutdown] mirror drain error:', e.message));
       }
       server.close();
       if (bot) bot.stopPolling();
