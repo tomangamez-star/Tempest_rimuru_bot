@@ -500,7 +500,7 @@ async function fetchGelbooruTagBatch(card, tags, seriesTag = '') {
 }
 async function searchGelbooruArtwork(card) {
   if (!gelbooruCredentials()) {
-    console.warn('[hunt] GELBOORU_API_KEY/GELBOORU_USER_ID missing — using AniList emergency portrait.');
+    console.warn('[hunt] GELBOORU_API_KEY/GELBOORU_USER_ID missing — artwork lookup unavailable.');
     return [];
   }
   const seriesTag = gelbooruSeriesTag(card);
@@ -652,15 +652,20 @@ async function chooseBestCharacter(seed) {
     console.warn(`[hunt] ${merged.name}: Gelbooru candidates found but GROQ_API_KEY is missing; refusing unverified artwork.`);
   }
 
-  // Identity must stay correct. If artwork cannot be visually verified, use the
-  // trusted AniList portrait only as an emergency display fallback.
-  const p = await probeImage(identity.image_url);
-  if (p.ok) {
-    merged.image_url = identity.image_url;
-    merged.image_source = 'AniListEmergency';
-    console.warn(`[hunt] ${merged.name}: no verified Gelbooru artwork; using AniList emergency portrait.`);
+  // Never use AniList as the displayed Hunt image. If vision is unavailable or
+  // rejects every candidate, an exact Gelbooru character-tag result is still a
+  // better artwork source than silently falling back to the AniList portrait.
+  for (const candidate of candidates.slice(0, 5)) {
+    const displayUrl = await displayUrlForCandidate(candidate);
+    if (!displayUrl) continue;
+    merged.image_url = displayUrl;
+    merged.image_source = 'GelbooruExactTag';
+    merged.image_tag = candidate.query_tag;
+    merged.image_score = candidate.score;
+    console.warn(`[hunt] ${merged.name}: using exact-tag Gelbooru artwork without vision approval (tag=${candidate.query_tag}).`);
     return merged;
   }
+  console.warn(`[hunt] ${merged.name}: no usable Gelbooru artwork; skipping this character (AniList image disabled).`);
   return null;
 }
 
@@ -675,7 +680,10 @@ async function fetchSpawnCharacter() {
   // Only re-use modern AniList identities from cache; do not resurrect old
   // Jikan/Kitsu cache entries from previous builds.
   const pool = db.getHuntPool(50).filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id));
-  if (pool.length) return pool[Math.floor(Math.random() * pool.length)];
+  for (const cached of pool.sort(() => Math.random() - 0.5).slice(0, 8)) {
+    const card = await chooseBestCharacter({ ...cached, source: 'AniList', reference_image_url: cached.image_url });
+    if (card) { db.cacheHuntCharacter(card); return card; }
+  }
 
   // Keep the historical fallback pool for offline regression tests only. In
   // production, do not regress to old MAL/Jikan-era portrait artwork.
@@ -814,7 +822,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[hunt-v1.0.7] AniList identity + Gelbooru artwork + Groq vision (${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL})`);
+  console.log(`[hunt-v1.0.8] AniList metadata + Gelbooru display artwork; AniList display fallback DISABLED; vision=${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }

@@ -195,6 +195,21 @@ function deleteCode(userId, codeRaw, meta = {}) {
   return { ok: true, message: `🗑️ Code <code>${code}</code> deleted. The vault door closes.` };
 }
 
+/** Command router used by bot.js. */
+async function handle(ctx) {
+  const args = Array.isArray(ctx.args) ? ctx.args : [];
+  const sub = String(args[0] || '').toLowerCase();
+  const from = ctx.msg && ctx.msg.from || {};
+  const meta = { username: from.username || '', first_name: from.first_name || '' };
+  let result;
+  if (sub === 'create') result = createCode(ctx.userId, args.slice(1), meta);
+  else if (sub === 'list') result = listCodes(ctx.userId);
+  else if (sub === 'delete') result = deleteCode(ctx.userId, args[1], meta);
+  else result = redeemCode(ctx.userId, args[0], meta);
+  await ctx.reply(result.message, { title: result.ok ? '🎟️ REDEEM' : '🎟️ REDEEM', html: true });
+  return result;
+}
+
 module.exports = {
   MOD_MAX_AMOUNT,
   isOwner,
@@ -205,4 +220,5 @@ module.exports = {
   redeemCode,
   listCodes,
   deleteCode,
+  handle,
 };

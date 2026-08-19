@@ -139,10 +139,10 @@ const TABLE_PKS = {
   redeem_claims: 'id',
   redeem_redemptions: 'code, user_id',
   waifu_cache: 'character_id',
-  waifu_claims: 'id',
+  waifu_claims: 'character_id',
   waifu_spawn: 'character_id',
   hunt_cache: 'character_id',
-  hunt_claims: 'id',
+  hunt_claims: 'character_id',
   hunt_spawn: 'character_id',
   bot_memory: 'key',
   settings: 'key',
@@ -702,7 +702,7 @@ function getLottery() {
 function saveLottery(pot, ticketCount, tickets) {
   prep('UPDATE lottery SET pot = ?, ticket_count = ?, tickets = ? WHERE id = 1')
     .run(pot, ticketCount, JSON.stringify(tickets || []));
-  queuePgWrite('lottery', [pot, ticketCount, JSON.stringify(tickets || [])]);
+  queuePgWrite('lottery', [1, pot, ticketCount, JSON.stringify(tickets || [])]);
 }
 
 /* ===================== HEISTS ===================== */
@@ -1020,7 +1020,7 @@ function createRedeemCode(code, amount, maxUses, createdBy, creatorRole = 'owner
     return null; // duplicate code (PRIMARY KEY)
   }
   const row = prep('SELECT * FROM redeem_codes WHERE code = ?').get(c);
-  queuePgWrite('redeem_codes', [c, amount, maxUses || 1, 0, createdBy || 0, creatorRole || 'owner', Date.now()]);
+  queuePgWrite('redeem_codes', [c, amount, 0, maxUses || 1, createdBy || 0, creatorRole || 'owner', Date.now()]);
   return row;
 }
 
@@ -1461,6 +1461,7 @@ async function ensurePgTables() {
   for (const [table, cols] of Object.entries(TABLE_COLS)) {
     const colDefs = cols.split(', ').map((c) => {
       const [name] = c.split(' ');
+      if (name === 'id' && (table === 'waifu_claims' || table === 'hunt_claims')) return 'id BIGINT';
       if (name === 'id') return 'id SERIAL PRIMARY KEY';
       if (name === 'user_id' && table === 'users') return 'user_id BIGINT PRIMARY KEY';
       if (name === 'code' && table === 'redeem_codes') return 'code TEXT PRIMARY KEY';
@@ -1580,13 +1581,14 @@ async function migratePgColumns() {
     await pgPool.query(`UPDATE chat_logs SET text = message WHERE (text IS NULL OR text = '') AND message IS NOT NULL AND message != ''`);
   } catch (e) { console.warn('[db] chat_logs message→text copy skipped:', e.message); }
   try {
-    // redeem_codes.uses → used_count (old schema named it `uses`).
-    await pgPool.query(`UPDATE redeem_codes SET used_count = uses WHERE (used_count IS NULL OR used_count = 0) AND uses IS NOT NULL AND uses > 0`);
-  } catch (e) { console.warn('[db] redeem_codes uses→used_count copy skipped:', e.message); }
+    const legacyRedeem = await pgPool.query(`SELECT 1 FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'redeem_codes' AND column_name = 'uses'`);
+    if (legacyRedeem.rowCount) await pgPool.query(`UPDATE redeem_codes SET used_count = uses WHERE (used_count IS NULL OR used_count = 0) AND uses IS NOT NULL AND uses > 0`);
+  } catch (e) { console.warn('[db] redeem legacy reconciliation:', e.message); }
   try {
-    // lottery.jackpot/buyers/entries → pot/ticket_count/tickets (old names).
-    await pgPool.query(`UPDATE lottery SET pot = jackpot, ticket_count = buyers, tickets = entries WHERE (pot IS NULL OR pot = 0) AND jackpot IS NOT NULL`);
-  } catch (e) { console.warn('[db] lottery legacy-column copy skipped:', e.message); }
+    const legacyLottery = await pgPool.query(`SELECT column_name FROM information_schema.columns WHERE table_schema = 'public' AND table_name = 'lottery' AND column_name IN ('jackpot','buyers','entries')`);
+    const have = new Set(legacyLottery.rows.map((r) => r.column_name));
+    if (have.has('jackpot') && have.has('buyers') && have.has('entries')) await pgPool.query(`UPDATE lottery SET pot = jackpot, ticket_count = buyers, tickets = entries WHERE (pot IS NULL OR pot = 0) AND jackpot IS NOT NULL`);
+  } catch (e) { console.warn('[db] lottery legacy reconciliation:', e.message); }
 }
 
 async function mirrorTable(table) {

@@ -73,7 +73,7 @@ const config = {
   perGameCooldownMs: Number(process.env.PER_GAME_COOLDOWN_MS || 2 * 60 * 1000),
 
   // Lottery
-  lottery: { ticketPrice: 10000, minBuyers: 5, baseJackpot: 5000000 },
+  lottery: { ticketPrice: 1000000000, minBuyers: 5, baseJackpot: 500000000000 },
 
   // Heist
   heist: { openWindowMs: 60 * 1000, maxMembers: 5, leaderBaseRisk: 0.65, minNetworthShare: 0.30, winShare: 0.50, failPenalty: 0.10 },
