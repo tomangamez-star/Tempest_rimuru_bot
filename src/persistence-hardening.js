@@ -202,8 +202,10 @@ async function syncClaimRow(table, row) {
   // local SQLite-style `id` column must work exactly the same as newer ones.
   const sql = `
     INSERT INTO ${table} (${CLAIM_COLS.join(', ')})
-    VALUES (${placeholders})
-    ON CONFLICT (character_id) DO NOTHING`;
+    SELECT ${placeholders}
+    WHERE NOT EXISTS (
+      SELECT 1 FROM ${table} WHERE character_id = $2
+    )`;
   return db.pgRun(table, sql, values);
 }
 
@@ -255,7 +257,7 @@ if (originalInitPersistence) {
     const claimsRestored = restoreClaimSnapshots(claimBefore);
     normalizeAllLocalUsers();
     if (restored) console.warn(`[persist-v1.0.3] preserved ${restored} newer local user row(s) after hydration`);
-    if (claimsRestored) console.warn(`[persist-collections-v1.0.8] preserved ${claimsRestored} local claim(s) after hydration`);
+    if (claimsRestored) console.warn(`[persist-collections-v1.0.9] preserved ${claimsRestored} local claim(s) after hydration`);
     return result;
   };
 }
@@ -270,7 +272,7 @@ if (originalHydrate) {
     const claimsRestored = restoreClaimSnapshots(claimBefore);
     normalizeAllLocalUsers();
     if (restored) console.warn(`[persist-v1.0.3] preserved ${restored} newer local user row(s) after re-hydration`);
-    if (claimsRestored) console.warn(`[persist-collections-v1.0.8] preserved ${claimsRestored} local claim(s) after re-hydration`);
+    if (claimsRestored) console.warn(`[persist-collections-v1.0.9] preserved ${claimsRestored} local claim(s) after re-hydration`);
     return result;
   };
 }
@@ -304,7 +306,7 @@ function wrapClaimMutation(name, table) {
     const row = original.apply(db, args);
     if (row) {
       // Immediate direct write: claims should not wait for the 30-second mirror.
-      syncClaimRow(table, row).catch((e) => console.warn(`[persist-collections-v1.0.8] immediate ${table} sync failed:`, e.message));
+      syncClaimRow(table, row).catch((e) => console.warn(`[persist-collections-v1.0.9] immediate ${table} sync failed:`, e.message));
     }
     return row;
   };
@@ -365,7 +367,7 @@ db.startMirrorLoop = async function hardenedStartMirrorLoop() {
 };
 
 console.log('[persist-v1.0.3] persistence hardening loaded');
-console.log('[persist-collections-v1.0.8] waifu/hunt claim durability + schema compatibility loaded');
+console.log('[persist-collections-v1.0.9] waifu/hunt claim durability + id-less PG hydration loaded');
 
 module.exports = {
   epoch, syncUserRow, syncUserId, syncAllUsers, restoreNewerLocal,

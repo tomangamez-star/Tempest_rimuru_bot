@@ -5,6 +5,8 @@ const db = require('./db');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const GELBOORU_API_URL = 'https://gelbooru.com/index.php';
+const SAFEBOORU_API_URL = 'https://safebooru.org/index.php';
+const DANBOORU_SAFE_URL = 'https://safebooru.donmai.us';
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MAX_TELEGRAM_PHOTO_BYTES = 9_500_000;
 const DEFAULT_VISION_MODEL = 'qwen/qwen3.6-27b';
@@ -247,6 +249,7 @@ function normalizeAniList(raw) {
   return {
     character_id: `anilist-${id}`,
     anilist_id: id,
+    gender: String(raw.gender || '').trim(),
     name: stripUrls(name),
     aliases,
     series: stripUrls(series),
@@ -299,7 +302,7 @@ function normalizeKitsu(raw) {
 async function searchAniListCharacter(query) {
   const q = String(query || '').trim();
   if (!q) return null;
-  const gql = `query ($search: String) { Character(search: $search) { id name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
+  const gql = `query ($search: String) { Character(search: $search) { id gender name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
   const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: gql, variables: { search: q } }), label: 'AniList search',
@@ -309,7 +312,7 @@ async function searchAniListCharacter(query) {
 async function fetchAniListById(id) {
   const n = Number(String(id || '').replace(/^anilist-/, ''));
   if (!n) return null;
-  const gql = `query ($id: Int) { Character(id: $id) { id name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
+  const gql = `query ($id: Int) { Character(id: $id) { id gender name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
   const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: gql, variables: { id: n } }), label: 'AniList detail',
@@ -318,7 +321,7 @@ async function fetchAniListById(id) {
 }
 async function fetchRandomFromAniList() {
   const page = 1 + Math.floor(Math.random() * 120);
-  const gql = `query ($page: Int) { Page(page: $page, perPage: 25) { characters(sort: FAVOURITES_DESC) { id name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } } }`;
+  const gql = `query ($page: Int) { Page(page: $page, perPage: 25) { characters(sort: FAVOURITES_DESC) { id gender name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } } }`;
   const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ query: gql, variables: { page } }), label: 'AniList random',
@@ -452,6 +455,8 @@ function normalizeGelbooruPost(raw, queryTag) {
     height: Number(raw.height || 0),
     score: Number(raw.score || 0),
     rating,
+    provider: 'Gelbooru',
+    exact_tag: true,
   };
 }
 function gelbooruSearchUrl(tag, seriesTag = '') {
@@ -517,6 +522,158 @@ async function searchGelbooruArtwork(card) {
   return found.slice(0, 8);
 }
 
+
+function safebooruSearchUrl(tag, seriesTag = '') {
+  const u = new URL(SAFEBOORU_API_URL);
+  u.searchParams.set('page', 'dapi');
+  u.searchParams.set('s', 'post');
+  u.searchParams.set('q', 'index');
+  u.searchParams.set('json', '1');
+  u.searchParams.set('limit', '50');
+  u.searchParams.set('tags', `${tag}${seriesTag ? ` ${seriesTag}` : ''}`);
+  return u.toString();
+}
+function normalizeSafebooruPost(raw, queryTag) {
+  const post = normalizeGelbooruPost(raw, queryTag);
+  if (!post) return null;
+  post.provider = 'Safebooru';
+  post.exact_tag = true;
+  // Safebooru is SFW-only; don't reject an omitted/legacy rating field.
+  return post;
+}
+async function fetchSafebooruTagBatch(card, tags, seriesTag = '') {
+  const queries = [];
+  for (const tag of tags.slice(0, 4)) {
+    if (seriesTag) queries.push({ tag, series: seriesTag });
+    queries.push({ tag, series: '' });
+  }
+  const settled = await Promise.all(queries.map(async ({ tag, series }) => {
+    const json = await fetchJson(safebooruSearchUrl(tag, series), Math.min(7000, config.hunt.fetchTimeoutMs || 10000), 0, { label: `Safebooru tag ${tag}` });
+    return gelbooruPosts(json).map((post) => normalizeSafebooruPost(post, tag)).filter(Boolean);
+  }));
+  const seen = new Set();
+  const out = [];
+  for (const posts of settled) {
+    for (const post of posts) {
+      const key = post.file_url || post.sample_url;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(post);
+    }
+  }
+  out.sort((a, b) => artworkRank(b) - artworkRank(a));
+  return out.slice(0, 12);
+}
+async function searchSafebooruArtwork(card) {
+  const direct = gelbooruTagVariants(card);
+  const seriesTag = gelbooruSeriesTag(card);
+  let found = await fetchSafebooruTagBatch(card, direct.slice(0, 4), seriesTag);
+  if (!found.length && direct.length > 4) found = await fetchSafebooruTagBatch(card, direct.slice(4, 8), seriesTag);
+  console.log(`[hunt] ${card.name}: Safebooru candidates=${found.length}${found[0] ? ` tag=${found[0].query_tag}` : ''}`);
+  return found.slice(0, 8);
+}
+
+function normalizeDanbooruPost(raw, queryTag) {
+  if (!raw || typeof raw !== 'object') return null;
+  const fileUrl = String(raw.file_url || raw.large_file_url || '').trim();
+  const sampleUrl = String(raw.preview_file_url || raw.large_file_url || raw.file_url || '').trim();
+  if (!fileUrl && !sampleUrl) return null;
+  const rating = String(raw.rating || '').toLowerCase();
+  // General only. The safe Danbooru host is already conservative, but this
+  // keeps the contract explicit for Rimuru's public groups.
+  if (rating && rating !== 'g') return null;
+  const tags = String(raw.tag_string || '').split(/\s+/).filter(Boolean);
+  return {
+    id: String(raw.id || ''),
+    query_tag: queryTag,
+    tags,
+    file_url: fileUrl || sampleUrl,
+    sample_url: sampleUrl || fileUrl,
+    width: Number(raw.image_width || 0),
+    height: Number(raw.image_height || 0),
+    score: Number(raw.score || 0),
+    rating,
+    provider: 'DanbooruSafe',
+    exact_tag: true,
+  };
+}
+function danbooruPostsUrl(tag) {
+  const u = new URL('/posts.json', DANBOORU_SAFE_URL);
+  u.searchParams.set('limit', '40');
+  u.searchParams.set('tags', `${tag} rating:g`);
+  return u.toString();
+}
+function danbooruTagsUrl(pattern) {
+  const u = new URL('/tags.json', DANBOORU_SAFE_URL);
+  u.searchParams.set('limit', '20');
+  u.searchParams.set('search[fuzzy_name_matches]', pattern);
+  u.searchParams.set('search[order]', 'similarity');
+  return u.toString();
+}
+async function discoverDanbooruCharacterTags(card) {
+  const direct = gelbooruTagVariants(card);
+  const seen = new Set(direct);
+  const out = [];
+  const patterns = [normalizeGelbooruTag(card && card.name || ''), ...distinctiveNameTokens(card)].filter(Boolean).slice(0, 3);
+  for (const pattern of patterns) {
+    const json = await fetchJson(danbooruTagsUrl(pattern), Math.min(7000, config.hunt.fetchTimeoutMs || 10000), 0, { label: `Danbooru tag lookup ${pattern}` });
+    for (const raw of Array.isArray(json) ? json : []) {
+      if (Number(raw.category) !== 4 || raw.is_deprecated) continue;
+      const name = String(raw.name || '').trim();
+      if (!name || seen.has(name)) continue;
+      const normalized = normalizeGelbooruTag(name);
+      const hits = distinctiveNameTokens(card).filter((t) => normalized.includes(t)).length;
+      if (!hits) continue;
+      seen.add(name);
+      out.push({ name, count: Number(raw.post_count || 0), hits });
+    }
+  }
+  out.sort((a, b) => (b.hits - a.hits) || (b.count - a.count));
+  return [...direct, ...out.map((x) => x.name)].slice(0, 8);
+}
+async function searchDanbooruSafeArtwork(card) {
+  const tags = await discoverDanbooruCharacterTags(card);
+  const seen = new Set();
+  const out = [];
+  for (const tag of tags.slice(0, 6)) {
+    const json = await fetchJson(danbooruPostsUrl(tag), Math.min(7000, config.hunt.fetchTimeoutMs || 10000), 0, { label: `DanbooruSafe tag ${tag}` });
+    for (const raw of Array.isArray(json) ? json : []) {
+      const post = normalizeDanbooruPost(raw, tag);
+      if (!post) continue;
+      const key = post.file_url || post.sample_url;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(post);
+    }
+    if (out.length >= 12) break;
+  }
+  out.sort((a, b) => artworkRank(b) - artworkRank(a));
+  console.log(`[hunt] ${card.name}: DanbooruSafe candidates=${out.length}${out[0] ? ` tag=${out[0].query_tag}` : ''}`);
+  return out.slice(0, 8);
+}
+
+async function searchArtworkSources(card) {
+  const settled = await Promise.allSettled([
+    searchDanbooruSafeArtwork(card),
+    searchSafebooruArtwork(card),
+    searchGelbooruArtwork(card),
+  ]);
+  const seen = new Set();
+  const out = [];
+  for (const item of settled) {
+    if (item.status !== 'fulfilled' || !Array.isArray(item.value)) continue;
+    for (const post of item.value) {
+      const key = post.file_url || post.sample_url;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(post);
+    }
+  }
+  out.sort((a, b) => artworkRank(b) - artworkRank(a));
+  console.log(`[hunt] ${card.name}: combined artwork candidates=${out.length} providers=${[...new Set(out.map((x) => x.provider))].join(',') || 'none'}`);
+  return out.slice(0, 14);
+}
+
 function parseVisionJson(value) {
   const text = String(value || '').trim();
   if (!text) return null;
@@ -531,6 +688,16 @@ async function verifyArtworkWithVision(card, candidate) {
   const reference = card.reference_image_url || card.image_url;
   const candidateUrl = candidate.sample_url || candidate.file_url;
   if (!reference || !candidateUrl) return { ok: false, confidence: 0, reason: 'missing image URL' };
+  let referenceData;
+  let candidateData;
+  try {
+    const [refImg, candImg] = await Promise.all([fetchImageBuffer(reference), fetchImageBuffer(candidateUrl)]);
+    referenceData = `data:${refImg.contentType};base64,${refImg.buffer.toString('base64')}`;
+    candidateData = `data:${candImg.contentType};base64,${candImg.buffer.toString('base64')}`;
+  } catch (e) {
+    console.warn(`[hunt] vision image download failed (${candidate.provider || 'art'}): ${e.message}`);
+    return { ok: false, unavailable: true, confidence: 0, reason: 'image download failed' };
+  }
   const model = String(process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL).trim();
   const minConfidence = Math.min(0.95, Math.max(0.5, Number(process.env.HUNT_VISION_MIN_CONFIDENCE || 0.72)));
   const body = {
@@ -545,8 +712,8 @@ async function verifyArtworkWithVision(card, candidate) {
           type: 'text',
           text: `Image 1 is a trusted AniList reference portrait of the anime character "${card.name}"${card.series ? ` from "${card.series}"` : ''}. Image 2 is candidate fan/artwork from a tagged anime image database. Decide whether Image 2 clearly depicts the SAME character as Image 1. Different pose, clothes, art style, age rendering, or background are allowed. Match distinctive face, hair, eyes, and character design. It is okay if other characters also appear, but the target must be clearly visible. Also reject nudity, explicit sexual content, or clearly sexualized imagery even if the character matches. Return JSON only: {"match":true|false,"safe":true|false,"confidence":0.0,"reason":"short reason"}.`,
         },
-        { type: 'image_url', image_url: { url: reference } },
-        { type: 'image_url', image_url: { url: candidateUrl } },
+        { type: 'image_url', image_url: { url: referenceData } },
+        { type: 'image_url', image_url: { url: candidateData } },
       ],
     }],
   };
@@ -623,50 +790,62 @@ function mergeMetadata(identity, others = []) {
   return best;
 }
 
-async function chooseBestCharacter(seed) {
-  if (!seed) return null;
-  const identity = seed.source === 'AniList' ? seed : await searchAniListCharacter(seed.name || '');
+async function selectArtworkForIdentity(identity, opts = {}) {
   if (!identity) return null;
-  if (db.isHuntCharacterClaimed(identity.character_id)) return null;
-  const merged = mergeMetadata(identity, [seed]);
+  const merged = { ...identity };
   merged.reference_image_url = identity.reference_image_url || identity.image_url;
+  const candidates = await searchArtworkSources(merged);
+  if (!candidates.length) {
+    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: no booru artwork candidates; AniList display fallback disabled.`);
+    return null;
+  }
 
-  const candidates = await searchGelbooruArtwork(merged);
   const hasVision = !!String(process.env.GROQ_API_KEY || '').trim();
-  if (candidates.length && hasVision) {
-    for (const candidate of candidates.slice(0, 4)) {
+  if (hasVision) {
+    for (const candidate of candidates.slice(0, 6)) {
       const verdict = await verifyArtworkWithVision(merged, candidate);
-      console.log(`[hunt] ${merged.name}: vision tag=${candidate.query_tag} match=${!!verdict.match} confidence=${Number(verdict.confidence || 0).toFixed(2)}`);
+      console.log(`[${opts.context || 'hunt'}] ${merged.name}: ${candidate.provider} vision tag=${candidate.query_tag} match=${!!verdict.match} safe=${verdict.safe !== false} confidence=${Number(verdict.confidence || 0).toFixed(2)}`);
       if (!verdict.ok) continue;
       const displayUrl = await displayUrlForCandidate(candidate);
       if (!displayUrl) continue;
-      merged.image_url = displayUrl;
-      merged.image_source = 'Gelbooru+GroqVision';
-      merged.image_tag = candidate.query_tag;
-      merged.image_score = candidate.score;
-      merged.vision_confidence = verdict.confidence;
-      console.log(`[hunt] ${merged.name}: selected Gelbooru artwork tag=${candidate.query_tag} score=${candidate.score} vision=${verdict.confidence.toFixed(2)}`);
-      return merged;
+      return {
+        ...merged,
+        image_url: displayUrl,
+        image_source: `${candidate.provider}+GroqVision`,
+        image_tag: candidate.query_tag,
+        image_score: candidate.score,
+        vision_confidence: verdict.confidence,
+      };
     }
-  } else if (candidates.length && !hasVision) {
-    console.warn(`[hunt] ${merged.name}: Gelbooru candidates found but GROQ_API_KEY is missing; refusing unverified artwork.`);
+  } else {
+    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: GROQ_API_KEY missing; only exact-tag safe artwork can be used.`);
   }
 
-  // Never use AniList as the displayed Hunt image. If vision is unavailable or
-  // rejects every candidate, an exact Gelbooru character-tag result is still a
-  // better artwork source than silently falling back to the AniList portrait.
-  for (const candidate of candidates.slice(0, 5)) {
+  // Safe exact-character tags are a last artwork fallback. Still never expose
+  // the AniList portrait as the game image; source failures stay visible.
+  for (const candidate of candidates.filter((x) => x.exact_tag).slice(0, 6)) {
     const displayUrl = await displayUrlForCandidate(candidate);
     if (!displayUrl) continue;
-    merged.image_url = displayUrl;
-    merged.image_source = 'GelbooruExactTag';
-    merged.image_tag = candidate.query_tag;
-    merged.image_score = candidate.score;
-    console.warn(`[hunt] ${merged.name}: using exact-tag Gelbooru artwork without vision approval (tag=${candidate.query_tag}).`);
-    return merged;
+    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: using unverified exact-tag ${candidate.provider} artwork (tag=${candidate.query_tag}).`);
+    return {
+      ...merged,
+      image_url: displayUrl,
+      image_source: `${candidate.provider}ExactTag`,
+      image_tag: candidate.query_tag,
+      image_score: candidate.score,
+    };
   }
-  console.warn(`[hunt] ${merged.name}: no usable Gelbooru artwork; skipping this character (AniList image disabled).`);
+  console.warn(`[${opts.context || 'hunt'}] ${merged.name}: artwork candidates existed but none were usable; AniList display fallback disabled.`);
   return null;
+}
+
+async function chooseBestCharacter(seed) {
+  if (!seed) return null;
+  const identity = seed.source === 'AniList' ? seed : await searchAniListCharacter(seed.name || '');
+  if (!identity || db.isHuntCharacterClaimed(identity.character_id)) return null;
+  const merged = mergeMetadata(identity, [seed]);
+  merged.reference_image_url = identity.reference_image_url || identity.image_url;
+  return selectArtworkForIdentity(merged, { context: 'hunt' });
 }
 
 async function fetchSpawnCharacter() {
@@ -783,7 +962,8 @@ async function searchAndShow(query, opts = {}) {
   if (!q) return { ok: false, message: 'Usage: /char <name>' };
   const seed = await searchAniListCharacter(q);
   if (!seed) return { ok: false, message: `No character found for ${stripUrls(q)}.` };
-  const card = await chooseBestCharacter(seed) || seed;
+  const card = await chooseBestCharacter(seed);
+  if (!card) return { ok: false, message: `Found ${stripUrls(seed.name)}, but no usable non-AniList artwork source responded.` };
   db.cacheHuntCharacter(card);
   await sendPhoto(opts.chatId, card.image_url, detailCaption(card), null);
   return { ok: true, character: card };
@@ -822,7 +1002,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[hunt-v1.0.8] AniList metadata + Gelbooru display artwork; AniList display fallback DISABLED; vision=${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL}`);
+  console.log(`[hunt-v1.0.9] AniList metadata + DanbooruSafe/Safebooru/Gelbooru artwork; AniList display fallback DISABLED; vision=${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -835,6 +1015,7 @@ module.exports = {
   fetchJikanPictures, fetchRandomFromAniList, fetchAniListById, fetchSpawnCharacter, resolveCharacter,
   attach, spawn, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state,
   FALLBACK_POOL, fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
-  normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork, verifyArtworkWithVision,
+  normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork,
+  searchSafebooruArtwork, searchDanbooruSafeArtwork, searchArtworkSources, selectArtworkForIdentity, verifyArtworkWithVision,
   _clear: () => db.clearActiveHunt(),
 };

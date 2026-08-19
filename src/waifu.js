@@ -2,12 +2,14 @@
 const crypto = require('crypto');
 const config = require('./config');
 const db = require('./db');
+const huntArtwork = require('./hunt');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const WAIFU_IM_URL = 'https://api.waifu.im/images';
 const WAIFUBOT_API = String(process.env.WAIFUBOT_API_URL || 'https://waifuapi.karitham.dev').replace(/\/$/, '');
 let waifuBotPoolCache = { at: 0, rows: [] };
 const WAIFUBOT_POOL_TTL_MS = 10 * 60 * 1000;
+const waifuIdentityCache = new Map();
 const MAX_TELEGRAM_PHOTO_BYTES = 9_500_000;
 
 const RARITY_TIERS = [
@@ -273,20 +275,83 @@ function generatedNameFor(value) {
 function normalizeWaifuBotCharacter(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = raw.id != null ? raw.id : raw.character_id;
-  const imageUrl = String(raw.image || raw.image_url || '').trim();
-  if (id == null || !imageUrl || !/^https?:\/\//i.test(imageUrl)) return null;
+  if (id == null) return null;
   const sourceName = sanitizeApiText(raw.name || '');
-  const name = isCleanEnglishName(sourceName) ? sourceName : generatedNameFor(id);
+  const sourceImageUrl = String(raw.image || raw.image_url || '').trim();
   const favorites = Number(raw.favorites) || 0;
   return {
     character_id: `waifubot-${String(id).replace(/[^a-zA-Z0-9_-]/g, '').slice(0, 48)}`,
-    name,
+    source_id: String(id),
+    source_name: sourceName,
+    source_image_url: /^https?:\/\//i.test(sourceImageUrl) ? sourceImageUrl : '',
+    name: isCleanEnglishName(sourceName) ? sourceName : generatedNameFor(id),
     series: displaySeries(raw.media_title || raw.series || ''),
-    image_url: imageUrl,
-    bio: sanitizeApiText(raw.description || '') || 'A mysterious anime visitor has entered the JTF doors.',
+    image_url: '', // WaifuBot image is intentionally NOT used for display.
+    bio: sanitizeApiText(raw.description || ''),
     favorites,
     rarity: rarityFor(favorites),
     source: 'WaifuBot',
+  };
+}
+
+async function resolveFemaleWaifuIdentity(card) {
+  if (!card) return null;
+  const cacheKey = `${card.source_id || ''}|${card.source_name || card.name || ''}`;
+  const cached = waifuIdentityCache.get(cacheKey);
+  if (cached && Date.now() - cached.at < 30 * 60 * 1000) return cached.identity;
+
+  let identity = null;
+  if (/^\d+$/.test(String(card.source_id || ''))) {
+    identity = await huntArtwork.fetchAniListById(`anilist-${card.source_id}`);
+  }
+  // Older WaifuBot catalogues have used AniList IDs, but do not assume that
+  // forever. Name search is the compatibility fallback.
+  if (!identity && card.source_name) identity = await huntArtwork.searchAniListCharacter(card.source_name);
+
+  if (!identity || String(identity.gender || '').toLowerCase() !== 'female') {
+    const got = identity && identity.gender ? identity.gender : 'unverified';
+    console.warn(`[waifu] rejected ${card.source_name || card.source_id}: gender=${got}`);
+    waifuIdentityCache.set(cacheKey, { at: Date.now(), identity: null });
+    return null;
+  }
+  waifuIdentityCache.set(cacheKey, { at: Date.now(), identity });
+  return identity;
+}
+
+async function buildVerifiedWaifu(card, superDrop = false) {
+  const identity = await resolveFemaleWaifuIdentity(card);
+  if (!identity) return null;
+
+  // The stored WaifuBot image is AniList-backed in the current catalogue. Use
+  // it only as identity evidence through AniList; displayed art must come from
+  // the separate safe artwork pipeline.
+  const art = await huntArtwork.selectArtworkForIdentity(identity, { context: superDrop ? 'swaifu' : 'waifu' });
+  if (!art || !art.image_url || /anilist/i.test(String(art.image_source || ''))) {
+    console.warn(`[waifu] ${identity.name}: no usable non-AniList artwork; skipping candidate.`);
+    return null;
+  }
+
+  let name = isCleanEnglishName(card.source_name) ? card.source_name : '';
+  if (!name && isCleanEnglishName(identity.name)) name = identity.name;
+  if (!name) name = generatedNameFor(card.source_id || identity.character_id);
+  const favorites = Math.max(Number(card.favorites) || 0, Number(identity.favorites) || 0);
+  let rarity = rarityFor(favorites);
+  if (superDrop && ['common', 'rare', 'epic'].includes(rarity)) rarity = 'legendary';
+  const series = displaySeries(identity.series || card.series || '');
+  const bio = sanitizeApiText(identity.bio || card.bio || '');
+
+  return {
+    character_id: card.character_id,
+    name,
+    series,
+    image_url: art.image_url,
+    bio: bio || (series ? `A verified female character from ${series}.` : 'A verified female anime character.'),
+    favorites,
+    rarity,
+    source: 'WaifuBot+VerifiedFemale',
+    artwork_source: art.image_source,
+    anilist_id: identity.anilist_id,
+    gender: 'Female',
   };
 }
 
@@ -321,7 +386,7 @@ async function fetchWaifuBotPool(force = false) {
   }
   const unique = [...new Map(cards.map((c) => [c.character_id, c])).values()];
   waifuBotPoolCache = { at: Date.now(), rows: unique };
-  console.log(`[waifu-v1.0.8] WaifuBot pool loaded: ${unique.length} character(s) from ${ids.length} source account(s)`);
+  console.log(`[waifu-v1.0.9] WaifuBot pool loaded: ${unique.length} character(s) from ${ids.length} source account(s)`);
   return unique;
 }
 
@@ -333,14 +398,21 @@ async function fetchFromWaifuBot(superDrop = false) {
     open = pool.filter((c) => !db.isWaifuCharacterClaimed(c.character_id));
   }
   if (!open.length) return null;
-  if (superDrop) {
-    open.sort((a, b) => Number(b.favorites || 0) - Number(a.favorites || 0));
-    const elite = open.slice(0, Math.max(1, Math.ceil(open.length * 0.25)));
-    const card = { ...elite[Math.floor(Math.random() * elite.length)] };
-    if (['common', 'rare'].includes(card.rarity)) card.rarity = 'legendary';
+
+  if (superDrop) open.sort((a, b) => Number(b.favorites || 0) - Number(a.favorites || 0));
+  else open = open.slice().sort(() => Math.random() - 0.5);
+
+  // Never spawn an unverified character. Male/unknown genders and candidates
+  // with no real external artwork are simply skipped.
+  const maxChecks = Math.min(open.length, superDrop ? 18 : 14);
+  for (const candidate of open.slice(0, maxChecks)) {
+    const card = await buildVerifiedWaifu(candidate, superDrop);
+    if (!card) continue;
+    console.log(`[waifu-v1.0.9] selected ${card.name} gender=Female artwork=${card.artwork_source || 'unknown'}`);
     return card;
   }
-  return { ...open[Math.floor(Math.random() * open.length)] };
+  console.warn(`[waifu-v1.0.9] no verified female ${superDrop ? 'SUPER ' : ''}waifu with non-AniList artwork found in ${maxChecks} candidates.`);
+  return null;
 }
 
 async function fetchFromWaifuIm() {
@@ -419,7 +491,7 @@ async function spawn(opts = {}) {
   if (isSpawnClaimable(existing)) return { ok: false, message: `💝 A waifu is already up for grabs (${secondsRemaining(existing)}s left).` };
   if (existing) db.clearActiveWaifu();
   const card = await fetchCharacter();
-  if (!card) return { ok: false, message: '💔 WaifuBot did not return a usable waifu image right now. Try again shortly.' };
+  if (!card) return { ok: false, message: '💔 No verified female waifu with a usable artwork source was available. Try again shortly.' };
   const expiresAt = Date.now() + config.waifu.claimWindowMs;
   db.setActiveWaifu(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveWaifu();
@@ -438,7 +510,7 @@ async function spawnSuper(opts = {}) {
     const candidate = await fetchFromWaifuBot(true);
     if (candidate && !db.isWaifuCharacterClaimed(candidate.character_id)) { card = candidate; break; }
   }
-  if (!card) return { ok: false, message: '💔 WaifuBot did not return a usable SUPER waifu image right now. Try again shortly.' };
+  if (!card) return { ok: false, message: '💔 No verified female SUPER waifu with a usable artwork source was available. Try again shortly.' };
   const expiresAt = Date.now() + config.waifu.claimWindowMs;
   db.setActiveWaifu(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveWaifu();
@@ -509,7 +581,7 @@ module.exports = {
   rarityFor, rarityMeta, normalizeCharacter, isSpawnClaimable, secondsRemaining,
   fancy, sanitizeApiText, cardCaption, waifuCaption, collectionCaption, detailCaption,
   leaderboardCaption, characterCaption, claimMarkup, fetchCharacter, fetchAniListPage,
-  fetchFromJikanByName, fetchFromWaifuIm, fetchFromWaifuBot, fetchWaifuBotPool, normalizeWaifuBotCharacter, attach, spawn, spawnSuper, claim,
+  fetchFromJikanByName, fetchFromWaifuIm, fetchFromWaifuBot, fetchWaifuBotPool, normalizeWaifuBotCharacter, resolveFemaleWaifuIdentity, buildVerifiedWaifu, attach, spawn, spawnSuper, claim,
   expireIfNeeded, startAutoSpawn, autoSpawnTick, state,
   _clear: () => db.clearActiveWaifu(),
 };
