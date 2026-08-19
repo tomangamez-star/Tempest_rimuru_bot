@@ -821,19 +821,27 @@ async function selectArtworkForIdentity(identity, opts = {}) {
     console.warn(`[${opts.context || 'hunt'}] ${merged.name}: GROQ_API_KEY missing; only exact-tag safe artwork can be used.`);
   }
 
-  // Safe exact-character tags are a last artwork fallback. Still never expose
-  // the AniList portrait as the game image; source failures stay visible.
-  for (const candidate of candidates.filter((x) => x.exact_tag).slice(0, 6)) {
-    const displayUrl = await displayUrlForCandidate(candidate);
-    if (!displayUrl) continue;
-    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: using unverified exact-tag ${candidate.provider} artwork (tag=${candidate.query_tag}).`);
-    return {
-      ...merged,
-      image_url: displayUrl,
-      image_source: `${candidate.provider}ExactTag`,
-      image_tag: candidate.query_tag,
-      image_score: candidate.score,
-    };
+  // Hunt must never accept a merely tagged image as proof of identity. That
+  // fallback is what allowed searches such as Gojo to display unrelated anime
+  // artwork whenever vision was unavailable or rejected every candidate.
+  // Waifu keeps the legacy exact-tag fallback because its separate female
+  // identity gate already runs before artwork selection and the owner approved
+  // that current image style.
+  if (opts.requireVerified !== true) {
+    for (const candidate of candidates.filter((x) => x.exact_tag).slice(0, 6)) {
+      const displayUrl = await displayUrlForCandidate(candidate);
+      if (!displayUrl) continue;
+      console.warn(`[${opts.context || 'hunt'}] ${merged.name}: using unverified exact-tag ${candidate.provider} artwork (tag=${candidate.query_tag}).`);
+      return {
+        ...merged,
+        image_url: displayUrl,
+        image_source: `${candidate.provider}ExactTag`,
+        image_tag: candidate.query_tag,
+        image_score: candidate.score,
+      };
+    }
+  } else {
+    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: no vision-verified artwork matched; rejecting character instead of showing random art.`);
   }
   console.warn(`[${opts.context || 'hunt'}] ${merged.name}: artwork candidates existed but none were usable; AniList display fallback disabled.`);
   return null;
@@ -845,7 +853,7 @@ async function chooseBestCharacter(seed) {
   if (!identity || db.isHuntCharacterClaimed(identity.character_id)) return null;
   const merged = mergeMetadata(identity, [seed]);
   merged.reference_image_url = identity.reference_image_url || identity.image_url;
-  return selectArtworkForIdentity(merged, { context: 'hunt' });
+  return selectArtworkForIdentity(merged, { context: 'hunt', requireVerified: true });
 }
 
 async function fetchSpawnCharacter() {
@@ -1002,7 +1010,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[hunt-v1.0.9] AniList metadata + DanbooruSafe/Safebooru/Gelbooru artwork; AniList display fallback DISABLED; vision=${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL}`);
+  console.log(`[hunt-v1.0.10] AniList metadata + STRICT vision-verified DanbooruSafe/Safebooru/Gelbooru artwork; unverified Hunt fallback DISABLED; vision=${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }

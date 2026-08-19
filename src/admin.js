@@ -16,6 +16,7 @@ const config = require('./config');
 const backup = require('./backup');
 const leaderboard = require('./leaderboard');
 const { fmt, humanDuration } = require('./utils');
+const crypto = require('crypto');
 
 const STATUS = {
   BANNED: 'banned',
@@ -138,6 +139,183 @@ function gateAllowed() {
   return { ok: true };
 }
 
+/* ===================== owner purge lock ===================== */
+
+let purgeState = null;
+
+function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+function isPurgeLocked() { return !!purgeState; }
+
+function purgeAmount(raw) {
+  const amt = Math.floor(Number(String(raw == null ? '' : raw).replace(/,/g, '')));
+  return Number.isFinite(amt) && amt >= 0 ? amt : null;
+}
+
+function clearPurgeState() {
+  if (purgeState && purgeState.timeout) clearTimeout(purgeState.timeout);
+  purgeState = null;
+}
+
+async function beginPurge(ctx, rawAmount) {
+  if (!isOwner(ctx.userId)) {
+    return ctx.reply('Only the King can purge the realm. 👑', { title: '🔒 OWNER ONLY', color: '#F44336' });
+  }
+  const amount = purgeAmount(rawAmount);
+  if (amount === null) {
+    return ctx.reply('Usage: <code>/sb [amount] all</code> or <code>/purge [amount]</code>. Amount must be zero or greater.', { title: '💀 PURGE', color: '#F44336', html: true });
+  }
+  if (purgeState) {
+    return ctx.reply('A purge sequence is already active.', { title: '💀 PURGE', color: '#F44336' });
+  }
+
+  const code = String(crypto.randomInt(100000, 1000000));
+  const ownerName = (ctx.msg && ctx.msg.from && (ctx.msg.from.first_name || ctx.msg.from.username)) || 'King';
+  purgeState = {
+    ownerId: Number(ctx.userId),
+    chatId: Number(ctx.chatId),
+    amount,
+    code,
+    phase: 'confirm',
+    startedAt: Date.now(),
+    timeout: null,
+  };
+
+  // Lock first: from this point until success/cancel, ordinary commands and
+  // callback buttons are ignored so nobody can observe a half-finished purge.
+  await ctx.reply(`☠️ <b>THE PURGE HAS BEGUN...</b>
+
+The gates are sealed. Rimuru has gone silent across the realm.`, { title: '💀 PURGE PROTOCOL', color: '#F44336', html: true });
+  await sleep(1200);
+  await ctx.reply(
+    `⚠️ <b>${ownerName}</b>, are you sure you want to rewrite every player's net worth?
+
+` +
+    `Wallet → <b>${fmt(amount)}</b>
+Bank → <b>0</b>
+
+` +
+    `Ranks, items, stats, waifus and characters will remain untouched.
+
+` +
+    `Text <code>${code}</code> to confirm.`,
+    { title: '⚠️ FINAL CONFIRMATION', color: '#FFD700', html: true }
+  );
+
+  purgeState.timeout = setTimeout(() => {
+    if (!purgeState || purgeState.code !== code || purgeState.phase !== 'confirm') return;
+    const reply = ctx.reply;
+    clearPurgeState();
+    Promise.resolve(reply('🕯️ Purge confirmation expired. The realm has been unlocked; no balances were changed.', { title: '💀 PURGE CANCELLED', color: '#00BCD4' })).catch(() => {});
+  }, 90000);
+  purgeState.timeout.unref && purgeState.timeout.unref();
+}
+
+async function applyPurgeDurably(amount) {
+  const stamp = Date.now();
+  const pInfo = db.syncInfo();
+  if (pInfo.configured) {
+    if (!pInfo.ready || !pInfo.writable) throw new Error('Postgres persistence is not writable');
+    const ok = await db.pgRun('users', 'UPDATE users SET wallet = $1, bank = 0, networth = $1, updated_at = $2', [amount, stamp]);
+    if (!ok) throw new Error('Postgres balance purge failed');
+  }
+  return db.setAllNetworth(amount, stamp);
+}
+
+async function handlePurgeMessage(ctx, text) {
+  if (!purgeState) return false;
+  if (!isOwner(ctx.userId)) return true; // global silence for everyone else
+
+  const clean = String(text || '').trim();
+  if (purgeState.phase === 'confirm' && /^\/cancelpurge(?:@\w+)?$/i.test(clean)) {
+    clearPurgeState();
+    await ctx.reply('🕯️ Purge cancelled. No balances were changed.', { title: '💀 PURGE CANCELLED', color: '#00BCD4' });
+    return true;
+  }
+  if (purgeState.phase !== 'confirm') return true;
+  if (clean !== purgeState.code) {
+    if (/^\d{6}$/.test(clean)) await ctx.reply('❌ Wrong confirmation code. The purge remains locked.', { title: '💀 PURGE', color: '#F44336' });
+    return true;
+  }
+
+  if (purgeState.timeout) clearTimeout(purgeState.timeout);
+  purgeState.timeout = null;
+  purgeState.phase = 'executing';
+  const amount = purgeState.amount;
+  const actor = metaOf(ctx.msg);
+  await ctx.reply(`🩸 <b>CLEARING USERS’ NET WORTH...</b>
+
+Rimuru is rewriting the ledger. No one may speak until judgment is complete.`, { title: '☠️ PURGE IN PROGRESS', color: '#F44336', html: true });
+
+  // The delay is theatrical, but the actual database mutation is one bulk
+  // update in each datastore so players cannot be left half-purged.
+  await sleep(8000);
+  let affected = 0;
+  try {
+    affected = await applyPurgeDurably(amount);
+    db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'purge_balances', amount, `global users=${affected}`);
+    db.logActivity('admin', `/purge ${fmt(amount)} by ${actor.username || ctx.userId} — ${affected} users`, { actor: ctx.userId, affected, amount });
+  } catch (e) {
+    clearPurgeState();
+    await ctx.reply(`⚠️ <b>PURGE ABORTED</b>
+
+The persistent ledger refused the operation: ${String(e.message || e).slice(0, 180)}
+
+No local purge was committed.`, { title: '💀 PURGE FAILED', color: '#F44336', html: true });
+    return true;
+  }
+
+  await sleep(52000);
+  clearPurgeState();
+  await ctx.reply(
+    `💀💀💀 <b>PURGE SUCCESSFUL</b> 💀💀💀
+
+` +
+    `<b>${affected}</b> users were judged.
+` +
+    `👛 Every wallet: <b>${fmt(amount)}</b>
+🏦 Every bank: <b>0</b>
+
+` +
+    `Ranks, items, stats and collections survived. The realm may speak again.`,
+    { title: '💀 PURGE COMPLETE', color: '#FFD700', html: true }
+  );
+  return true;
+}
+
+async function purge(ctx) {
+  return beginPurge(ctx, (ctx.args || [])[0]);
+}
+
+async function mod(ctx) {
+  if (!isOwner(ctx.userId)) return ctx.reply('Only the King can appoint moderators. 👑', { title: '🔒 OWNER ONLY', color: '#F44336' });
+  const target = repliedUser(ctx.msg);
+  if (!target) return ctx.reply('Reply to the person you want to promote with <code>/mod</code>.', { title: '🛡️ ADD MODERATOR', color: '#F44336', html: true });
+  if (target.is_bot) return ctx.reply('Bots cannot be appointed as Rimuru moderators.', { title: '🛡️ ADD MODERATOR', color: '#F44336' });
+  if (String(target.id) === String(config.ownerId)) return ctx.reply('You are already the permanent owner. 👑', { title: '🛡️ MODERATOR', color: '#FFD700' });
+
+  db.getOrCreateUser(target.id, { username: target.username || '', first_name: target.first_name || '' });
+  const existing = db.getAdminUser(Number(target.id));
+  const row = db.addAdminUser(Number(target.id), target.username || target.first_name || '', 'mod', existing ? existing.password : '', Number(ctx.userId));
+  const actor = metaOf(ctx.msg);
+  db.logAudit(ctx.userId, actor.username || String(ctx.userId), 'add_mod', Number(target.id), target.username || target.first_name || '');
+  db.logActivity('mod', `Moderator ${existing ? 'refreshed' : 'added'}: ${target.username || target.first_name || target.id}`, { target: Number(target.id), actor: Number(ctx.userId) });
+  const shown = target.username ? `@${target.username}` : (target.first_name || 'Unnamed user');
+  await ctx.reply(
+    `🛡️ <b>MODERATOR ${existing ? 'UPDATED' : 'APPOINTED'}</b>
+
+` +
+    `User: <b>${shown}</b>
+Telegram ID: <code>${target.id}</code>
+` +
+    `Role: <b>${row && row.role ? row.role : 'mod'}</b>
+
+` +
+    `Saved to Rimuru's moderator list and visible in the dashboard.`,
+    { title: '🛡️ NEW MODERATOR', color: '#00BCD4', html: true }
+  );
+}
+
 /* ===================== staff handlers ===================== */
 
 async function health(ctx, opts = {}) {
@@ -208,6 +386,10 @@ async function debug(ctx, opts = {}) {
 }
 
 async function setBalance(ctx) {
+  const args = ctx.args || [];
+  if (args.some((a) => String(a).toLowerCase() === 'all')) {
+    return beginPurge(ctx, args[0]);
+  }
   const r = staffCoin(ctx, 'set');
   await ctx.reply(r.message, { title: r.title, color: r.color, html: true });
 }
@@ -434,4 +616,8 @@ module.exports = {
   unmute,
   hide,
   xleaderboard,
+  mod,
+  purge,
+  isPurgeLocked,
+  handlePurgeMessage,
 };

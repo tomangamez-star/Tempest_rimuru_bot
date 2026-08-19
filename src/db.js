@@ -514,6 +514,14 @@ function setNetworth(userId, amount) {
   prep('UPDATE users SET wallet = ?, bank = 0, networth = ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(amount, amount, userId);
 }
 
+function setAllNetworth(amount, updatedAt = Date.now()) {
+  const value = Math.floor(Number(amount));
+  if (!Number.isFinite(value) || value < 0) throw new Error('amount must be zero or greater');
+  const count = Number(prep('SELECT COUNT(*) AS c FROM users').get().c) || 0;
+  prep('UPDATE users SET wallet = ?, bank = 0, networth = ?, updated_at = ?').run(value, value, Number(updatedAt) || Date.now());
+  return count;
+}
+
 function setWallet(userId, amount) {
   prep('UPDATE users SET wallet = ?, networth = bank + ?, updated_at = datetime(\'now\') WHERE user_id = ?').run(amount, amount, userId);
 }
@@ -615,9 +623,25 @@ function isAdminUser(userId) {
   return !!row;
 }
 
+function normalizeAdminTimestamp(value) {
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) return Math.floor(n);
+  const parsed = Date.parse(String(value || ''));
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : Date.now();
+}
+
 function addAdminUser(userId, username, role, password, addedBy) {
-  prep('INSERT INTO admin_users (user_id, username, role, password, added_by) VALUES (?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, role = excluded.role, password = excluded.password')
-    .run(userId, username || '', role || 'mod', password || '', addedBy || 0);
+  const uid = Number(userId);
+  const existing = prep('SELECT * FROM admin_users WHERE user_id = ?').get(uid);
+  const addedAt = normalizeAdminTimestamp(existing && existing.added_at);
+  const keepPassword = password === undefined || password === null || String(password) === '';
+  const finalPassword = keepPassword && existing ? String(existing.password || '') : String(password || '');
+  const finalAddedBy = Number(addedBy || (existing && existing.added_by) || 0);
+  prep('INSERT INTO admin_users (user_id, username, role, password, added_by, added_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET username = excluded.username, role = excluded.role, password = excluded.password, added_by = excluded.added_by, added_at = excluded.added_at')
+    .run(uid, username || '', role || 'mod', finalPassword, finalAddedBy, addedAt);
+  const row = prep('SELECT * FROM admin_users WHERE user_id = ?').get(uid);
+  if (row) queuePgWrite('admin_users', [Number(row.user_id), row.username || '', row.role || 'mod', row.password || '', Number(row.added_by) || 0, normalizeAdminTimestamp(row.added_at)]);
+  return row || null;
 }
 
 function getAdminUser(userId) {
@@ -633,7 +657,9 @@ function setAdminLastLogin(userId) {
 }
 
 function removeAdminUser(userId) {
-  prep('DELETE FROM admin_users WHERE user_id = ?').run(userId);
+  const uid = Number(userId);
+  prep('DELETE FROM admin_users WHERE user_id = ?').run(uid);
+  pgRun('admin_users', 'DELETE FROM admin_users WHERE user_id = $1', [uid]).catch(() => {});
 }
 
 function getUserStatus(userId) {
@@ -1463,7 +1489,7 @@ async function ensurePgTables() {
       const [name] = c.split(' ');
       if (name === 'id' && (table === 'waifu_claims' || table === 'hunt_claims')) return 'id BIGINT';
       if (name === 'id') return 'id SERIAL PRIMARY KEY';
-      if (name === 'user_id' && table === 'users') return 'user_id BIGINT PRIMARY KEY';
+      if (name === 'user_id' && TABLE_PKS[table] === 'user_id') return 'user_id BIGINT PRIMARY KEY';
       if (name === 'code' && table === 'redeem_codes') return 'code TEXT PRIMARY KEY';
       if (name === 'character_id' && (table.includes('waifu') || table.includes('hunt'))) return 'character_id TEXT PRIMARY KEY';
       if (name === 'key' && table === 'bot_memory') return 'key TEXT PRIMARY KEY';
@@ -1572,6 +1598,12 @@ async function migratePgColumns() {
   }
   // ---- Legacy data reconciliation (each guarded; no-op when the legacy
   // column doesn't exist on this install) ----
+  try {
+    // admin_users is keyed by Telegram user_id in SQLite. Some earlier PG
+    // auto-DDL builds accidentally created it without a unique constraint,
+    // which makes ON CONFLICT(user_id) moderator persistence impossible.
+    await pgPool.query(`CREATE UNIQUE INDEX IF NOT EXISTS admin_users_user_id_uq ON admin_users (user_id)`);
+  } catch (e) { console.warn('[db] admin_users unique index skipped:', e.message); }
   try {
     // users.networth: legacy rows never wrote it → net worth = wallet + bank.
     await pgPool.query(`UPDATE users SET networth = COALESCE(networth, wallet + bank, 500000) WHERE networth IS NULL`);
@@ -1936,7 +1968,7 @@ function close() {
 
 module.exports = {
   // User / economy
-  getOrCreateUser, getUser, addWallet, addBank, setNetworth, setWallet, setBank,
+  getOrCreateUser, getUser, addWallet, addBank, setNetworth, setAllNetworth, setWallet, setBank,
   getNetWorth, findUserByUsername, leaderboard, leaderboardCount, dashboardStats,
   getCooldownCount, getAllUsers, listUsersByNetWorth, searchUsers,
   getUserCooldowns, setRankStats,
