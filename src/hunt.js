@@ -1,10 +1,13 @@
 'use strict';
+
 const config = require('./config');
 const db = require('./db');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
-const KITSU_URL = 'https://kitsu.io/api/edge/characters';
+const GELBOORU_API_URL = 'https://gelbooru.com/index.php';
+const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const MAX_TELEGRAM_PHOTO_BYTES = 9_500_000;
+const DEFAULT_VISION_MODEL = 'qwen/qwen3.6-27b';
 
 const RARITY_TIERS = [
   { key: 'mythic', emoji: '🔴', label: 'MYTHIC', min: 50000 },
@@ -25,12 +28,14 @@ function fancy(value) {
     return BOLD_NUM[c.charCodeAt(0) - 48];
   });
 }
+
 function stripUrls(value) {
   return String(value == null ? '' : value)
     .replace(/https?:\/\/[^\s)\]}]+/gi, '')
     .replace(/www\.[^\s)\]}]+/gi, '')
     .trim();
 }
+
 function sanitizeApiText(value) {
   let s = String(value == null ? '' : value);
   s = s.replace(/<br\s*\/?>/gi, '\n').replace(/<[^>]+>/g, '');
@@ -48,6 +53,7 @@ function sanitizeApiText(value) {
     .replace(/\n{3,}/g, '\n\n')
     .trim();
 }
+
 function safeUserName(value, fallback = 'Unknown user') {
   const s = String(value == null ? '' : value)
     .replace(/[\u0000-\u001F\u007F]/g, ' ')
@@ -55,7 +61,11 @@ function safeUserName(value, fallback = 'Unknown user') {
     .trim();
   return s || fallback;
 }
-function rarityFor(favorites) { const f = Number(favorites) || 0; return (RARITY_TIERS.find((t) => f >= t.min) || RARITY_TIERS[RARITY_TIERS.length - 1]).key; }
+
+function rarityFor(favorites) {
+  const f = Number(favorites) || 0;
+  return (RARITY_TIERS.find((t) => f >= t.min) || RARITY_TIERS[RARITY_TIERS.length - 1]).key;
+}
 function rarityMeta(key) { return RARITY_TIERS.find((t) => t.key === key) || RARITY_TIERS[RARITY_TIERS.length - 1]; }
 function truncateBio(value, max = 300) {
   const s = sanitizeApiText(value);
@@ -143,17 +153,17 @@ function collectionCaption(rows) {
   if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! ⚔️';
   return `⚔️ ${fancy('YOUR COLLECTION')} (${rows.length})\n\n${rows.map((r, i) => `${i + 1}. ${rarityMeta(r.rarity).emoji} ${fancy(stripUrls(r.name))} — ${fancy(stripUrls(r.series || '?'))}`).join('\n')}`;
 }
-function leaderboardCaption(rows, limit = 10) {
+function leaderboardCaption(rows) {
   if (!rows || !rows.length) return 'No hunters yet. Start the hunt! ⚔️';
   const medals = ['🥇', '🥈', '🥉'];
   return `⚔️ ${fancy('CHARACTER LEADERBOARD')}\n\n${rows.map((r, i) => {
     const user = r.username ? `@${r.username}` : (r.first_name || `User ${r.user_id}`);
-    // User names stay exactly as Telegram supplied them; no decorative font conversion.
     return `${medals[i] || `${i + 1}.`} ${safeUserName(user)} — ${Number(r.count) || 0}`;
   }).join('\n')}`;
 }
 function claimMarkup() { return { inline_keyboard: [[{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
 
+// Offline-only emergency pool. Runtime sourcing is AniList identity + Gelbooru artwork.
 const FALLBACK_POOL = [
   { character_id: 'fb-1001', name: 'Gojo Satoru', series: 'Jujutsu Kaisen', favorites: 75000, bio: 'The strongest jujutsu sorcerer and a teacher at Tokyo Jujutsu High.', image_url: 'https://cdn.myanimelist.net/images/characters/15/422168.jpg' },
   { character_id: 'fb-1002', name: 'Rem', series: 'Re:Zero', favorites: 65000, bio: 'A maid of the Roswaal mansion known for her loyalty and strength.', image_url: 'https://cdn.myanimelist.net/images/characters/9/311327.jpg' },
@@ -169,168 +179,402 @@ const FALLBACK_POOL = [
   { character_id: 'fb-1012', name: 'Tanjiro Kamado', series: 'Demon Slayer', favorites: 70000, bio: 'A kind-hearted Demon Slayer searching for a cure for his sister.', image_url: 'https://cdn.myanimelist.net/images/characters/10/316805.jpg' },
   { character_id: 'fb-1015', name: 'Levi Ackerman', series: 'Attack on Titan', favorites: 65000, bio: "Humanity's strongest soldier and captain in the Survey Corps.", image_url: 'https://cdn.myanimelist.net/images/characters/12/321544.jpg' },
 ];
-function fallbackCard(entry) { return { ...entry, anime: [{ anime: { name: entry.series } }], rarity: rarityFor(entry.favorites), source: 'Fallback' }; }
+function fallbackCard(entry) {
+  if (!entry) return null;
+  return {
+    ...entry,
+    rarity: rarityFor(entry.favorites),
+    source: 'OfflineEmergency',
+    image_source: 'OfflineEmergency',
+    anime: [{ anime: { name: entry.series, title: entry.series } }],
+  };
+}
 function pickFallbackCharacter() {
-  const list = FALLBACK_POOL.filter((e) => !db.isHuntCharacterClaimed(e.character_id));
-  if (!list.length) return null;
-  const card = fallbackCard(list[Math.floor(Math.random() * list.length)]);
-  db.cacheHuntCharacter(card);
-  return card;
+  const available = FALLBACK_POOL.filter((x) => !db.isHuntCharacterClaimed(x.character_id));
+  if (!available.length) return null;
+  return fallbackCard(available[Math.floor(Math.random() * available.length)]);
 }
 
-async function fetchJson(url, timeoutMs = config.hunt.fetchTimeoutMs || 10000, retries = 2, options = {}) {
-  for (let attempt = 1; attempt <= retries; attempt++) {
+async function fetchJson(url, timeoutMs = config.hunt.fetchTimeoutMs || 10000, retries = 1, options = {}) {
+  const label = options.label || 'request';
+  for (let attempt = 0; attempt <= retries; attempt++) {
     const ac = new AbortController();
     const timer = setTimeout(() => ac.abort(), timeoutMs);
     timer.unref && timer.unref();
     try {
       const res = await fetch(url, {
         method: options.method || 'GET',
-        headers: { 'User-Agent': config.hunt.userAgent || 'RimuruTempestCasino/1.0', Accept: 'application/json', ...(options.headers || {}) },
+        headers: {
+          Accept: 'application/json',
+          'User-Agent': config.hunt.userAgent || 'RimuruTempestCasino/1.0',
+          ...(options.headers || {}),
+        },
         body: options.body,
         signal: ac.signal,
       });
-      clearTimeout(timer);
-      if (res.ok) return await res.json();
-      if (options.label) console.warn(`[hunt] ${options.label} HTTP ${res.status}`);
-      if ((res.status === 429 || res.status >= 500) && attempt < retries) {
-        await sleep(600 * attempt);
-        continue;
+      if (!res.ok) {
+        console.warn(`[hunt] ${label} HTTP ${res.status}${attempt < retries ? ' — retrying' : ''}`);
+        if (attempt < retries) { await sleep(350 * (attempt + 1)); continue; }
+        return null;
       }
-      return null;
+      return await res.json();
     } catch (e) {
-      clearTimeout(timer);
-      if (options.label) console.warn(`[hunt] ${options.label} error: ${e.message}`);
-      if (attempt < retries) { await sleep(600 * attempt); continue; }
+      console.warn(`[hunt] ${label} failed: ${e && e.name === 'AbortError' ? 'timeout' : e.message}`);
+      if (attempt < retries) { await sleep(350 * (attempt + 1)); continue; }
       return null;
-    }
+    } finally { clearTimeout(timer); }
   }
   return null;
 }
 
+function normalizeAniList(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  const id = Number(raw.id) || 0;
+  const nameObj = raw.name || {};
+  const name = nameObj.full || nameObj.userPreferred || '';
+  const imageUrl = raw.image && (raw.image.large || raw.image.medium) || '';
+  if (!id || !name || !imageUrl) return null;
+  const media = raw.media && Array.isArray(raw.media.nodes) ? raw.media.nodes : [];
+  const first = media[0] || {};
+  const title = first.title || {};
+  const series = title.english || title.romaji || title.native || '';
+  const aliases = [];
+  for (const item of [nameObj.full, nameObj.userPreferred, ...(Array.isArray(nameObj.alternative) ? nameObj.alternative : [])]) {
+    const cleaned = stripUrls(item || '').trim();
+    if (cleaned && !aliases.includes(cleaned)) aliases.push(cleaned);
+  }
+  const favorites = Number(raw.favourites) || 0;
+  return {
+    character_id: `anilist-${id}`,
+    anilist_id: id,
+    name: stripUrls(name),
+    aliases,
+    series: stripUrls(series),
+    image_url: imageUrl,
+    reference_image_url: imageUrl,
+    bio: sanitizeApiText(raw.description || ''),
+    favorites,
+    rarity: rarityFor(favorites),
+    source: 'AniList',
+    image_source: 'AniListReference',
+    anime: media.map((m) => ({ anime: { name: (m.title && (m.title.english || m.title.romaji || m.title.native)) || '' } })),
+  };
+}
+
+// Legacy normalizers kept so existing tests/older callers do not break. They are
+// not used by the v1.0.7 runtime sourcing path.
 function normalizeJikan(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const id = Number(raw.mal_id) || 0;
   const imageUrl = raw.images && raw.images.jpg && (raw.images.jpg.large_image_url || raw.images.jpg.image_url) || '';
   if (!id || !imageUrl) return null;
-  const anime = Array.isArray(raw.anime) ? raw.anime.slice(0, 8) : [];
   const favorites = Number(raw.favorites) || 0;
+  const anime = Array.isArray(raw.anime) ? raw.anime : [];
   return {
     character_id: String(id),
-    name: stripUrls(raw.name || 'Unknown'),
-    series: stripUrls(anime[0] && anime[0].anime && (anime[0].anime.title || anime[0].anime.name) || ''),
-    anime,
+    name: stripUrls(raw.name || `Character ${id}`),
+    series: seriesNameOf({ anime }),
     image_url: imageUrl,
     bio: sanitizeApiText(raw.about || ''),
     favorites,
     rarity: rarityFor(favorites),
-    source: 'Jikan',
-  };
-}
-function normalizeAniList(raw) {
-  if (!raw || !raw.id) return null;
-  const imageUrl = raw.image && (raw.image.large || raw.image.medium) || '';
-  if (!imageUrl) return null;
-  const media = raw.media && raw.media.nodes || [];
-  const series = media[0] && media[0].title && (media[0].title.english || media[0].title.romaji || media[0].title.native) || '';
-  const favorites = Number(raw.favourites) || 0;
-  return {
-    character_id: `anilist-${raw.id}`,
-    name: stripUrls(raw.name && (raw.name.full || raw.name.userPreferred) || 'Unknown'),
-    series: stripUrls(series),
-    anime: media.slice(0, 8).map((m) => ({ anime: { title: m.title && (m.title.english || m.title.romaji || m.title.native) || '' } })),
-    image_url: imageUrl,
-    bio: sanitizeApiText(raw.description || ''),
-    favorites,
-    rarity: rarityFor(favorites),
-    source: 'AniList',
+    anime,
+    source: 'JikanLegacy',
   };
 }
 function normalizeKitsu(raw) {
-  if (!raw || !raw.id || !raw.attributes) return null;
-  const a = raw.attributes;
+  if (!raw || typeof raw !== 'object') return null;
+  const a = raw.attributes || {};
   const image = a.image || {};
   const imageUrl = image.original || image.large || image.medium || '';
-  if (!imageUrl) return null;
+  if (!raw.id || !imageUrl) return null;
   return {
     character_id: `kitsu-${raw.id}`,
-    name: stripUrls(a.names && (a.names.canonical || a.names.en || a.names.ja_jp) || a.canonicalName || 'Unknown'),
-    series: '',
-    anime: [],
-    image_url: imageUrl,
-    bio: sanitizeApiText(a.description || ''),
-    favorites: 0,
-    rarity: 'common',
-    source: 'Kitsu',
+    name: stripUrls(a.canonicalName || a.name || `Character ${raw.id}`),
+    series: '', image_url: imageUrl, bio: sanitizeApiText(a.description || ''), favorites: 0,
+    rarity: 'common', source: 'KitsuLegacy',
   };
 }
 
-function normalizedName(value) {
-  return String(value || '').toLowerCase().normalize('NFKD').replace(/[^a-z0-9]+/g, ' ').trim();
-}
-function sameCharacterName(a, b) {
-  const x = normalizedName(a);
-  const y = normalizedName(b);
-  if (!x || !y) return false;
-  if (x === y || x.includes(y) || y.includes(x)) return true;
-  const xa = new Set(x.split(' ').filter(Boolean));
-  const ya = new Set(y.split(' ').filter(Boolean));
-  const common = [...xa].filter((t) => ya.has(t));
-  return common.length >= Math.min(2, xa.size, ya.size);
-}
-
-async function fetchRandomFromJikan() {
-  await sleep(config.hunt.rateLimitMs || 700);
-  const json = await fetchJson(config.hunt.randomUrl || 'https://api.jikan.moe/v4/random/characters', config.hunt.fetchTimeoutMs || 10000, 2, { label: 'Jikan random' });
-  return json && json.data ? normalizeJikan(json.data) : null;
-}
-async function searchJikanCharacter(query) {
-  const q = String(query || '').trim();
-  if (!q) return null;
-  const base = config.hunt.searchUrl || 'https://api.jikan.moe/v4/characters';
-  const json = await fetchJson(`${base}?q=${encodeURIComponent(q)}&limit=1`, config.hunt.fetchTimeoutMs || 10000, 2, { label: 'Jikan search' });
-  return json && Array.isArray(json.data) && json.data[0] ? normalizeJikan(json.data[0]) : null;
-}
-async function fetchJikanPictures(characterId) {
-  if (!characterId || String(characterId).startsWith('anilist-') || String(characterId).startsWith('kitsu-')) return [];
-  const base = config.hunt.baseUrl || 'https://api.jikan.moe/v4';
-  const json = await fetchJson(`${base}/characters/${encodeURIComponent(characterId)}/pictures`, config.hunt.fetchTimeoutMs || 10000, 2, { label: 'Jikan pictures' });
-  if (!json || !Array.isArray(json.data)) return [];
-  return json.data.map((item, index) => {
-    const imageUrl = item && item.jpg && (item.jpg.large_image_url || item.jpg.image_url) || '';
-    return imageUrl ? { image_url: imageUrl, source: 'JikanPictures', picture_index: index } : null;
-  }).filter(Boolean);
-}
 async function searchAniListCharacter(query) {
   const q = String(query || '').trim();
   if (!q) return null;
-  const gql = `query ($search: String) { Character(search: $search) { id name { full userPreferred } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
+  const gql = `query ($search: String) { Character(search: $search) { id name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
   const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: gql, variables: { search: q } }),
-    label: 'AniList search',
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: gql, variables: { search: q } }), label: 'AniList search',
+  });
+  return json && json.data && json.data.Character ? normalizeAniList(json.data.Character) : null;
+}
+async function fetchAniListById(id) {
+  const n = Number(String(id || '').replace(/^anilist-/, ''));
+  if (!n) return null;
+  const gql = `query ($id: Int) { Character(id: $id) { id name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } }`;
+  const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: gql, variables: { id: n } }), label: 'AniList detail',
   });
   return json && json.data && json.data.Character ? normalizeAniList(json.data.Character) : null;
 }
 async function fetchRandomFromAniList() {
   const page = 1 + Math.floor(Math.random() * 120);
-  const gql = `query ($page: Int) { Page(page: $page, perPage: 25) { characters(sort: FAVOURITES_DESC) { id name { full userPreferred } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } } }`;
+  const gql = `query ($page: Int) { Page(page: $page, perPage: 25) { characters(sort: FAVOURITES_DESC) { id name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } } }`;
   const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: gql, variables: { page } }),
-    label: 'AniList random fallback',
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ query: gql, variables: { page } }), label: 'AniList random',
   });
   const rows = json && json.data && json.data.Page && Array.isArray(json.data.Page.characters) ? json.data.Page.characters : [];
   if (!rows.length) return null;
-  return normalizeAniList(rows[Math.floor(Math.random() * rows.length)]);
+  const shuffled = rows.slice().sort(() => Math.random() - 0.5);
+  for (const raw of shuffled) {
+    const card = normalizeAniList(raw);
+    if (card && !db.isHuntCharacterClaimed(card.character_id)) return card;
+  }
+  return null;
 }
-async function searchKitsuCharacter(query) {
-  const q = String(query || '').trim();
-  if (!q) return null;
-  const json = await fetchJson(`${KITSU_URL}?filter[name]=${encodeURIComponent(q)}&page[limit]=1`, config.hunt.fetchTimeoutMs || 10000, 2, { label: 'Kitsu search' });
-  return json && Array.isArray(json.data) && json.data[0] ? normalizeKitsu(json.data[0]) : null;
+
+function normalizeGelbooruTag(value) {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[’'"`]/g, '')
+    .replace(/[^A-Za-z0-9]+/g, '_')
+    .replace(/^_+|_+$/g, '')
+    .replace(/_+/g, '_')
+    .toLowerCase();
+}
+function gelbooruTagVariants(card) {
+  const names = [card && card.name, ...((card && Array.isArray(card.aliases)) ? card.aliases : [])].filter(Boolean);
+  const out = [];
+  for (const raw of names) {
+    if (!/^[\x00-\x7F]+$/.test(raw)) continue;
+    const tag = normalizeGelbooruTag(raw);
+    if (tag && !out.includes(tag)) out.push(tag);
+    const parts = tag.split('_').filter(Boolean);
+    if (parts.length >= 2) {
+      const reversed = [...parts].reverse().join('_');
+      if (!out.includes(reversed)) out.push(reversed);
+      const lastFirst = `${parts[parts.length - 1]}_${parts.slice(0, -1).join('_')}`;
+      if (!out.includes(lastFirst)) out.push(lastFirst);
+    }
+  }
+  return out.slice(0, 8);
+}
+function gelbooruCredentials() {
+  const apiKey = String(process.env.GELBOORU_API_KEY || '').trim();
+  const userId = String(process.env.GELBOORU_USER_ID || '').trim();
+  return apiKey && userId ? { apiKey, userId } : null;
+}
+function gelbooruPosts(json) {
+  if (Array.isArray(json)) return json;
+  if (json && Array.isArray(json.post)) return json.post;
+  if (json && json.post && typeof json.post === 'object') return [json.post];
+  return [];
+}
+function gelbooruTags(json) {
+  if (Array.isArray(json)) return json;
+  if (json && Array.isArray(json.tag)) return json.tag;
+  if (json && json.tag && typeof json.tag === 'object') return [json.tag];
+  return [];
+}
+function gelbooruSeriesTag(card) {
+  const series = normalizeGelbooruTag(card && card.series || '');
+  return series.length >= 3 ? series : '';
+}
+function gelbooruTagLookupUrl(pattern) {
+  const creds = gelbooruCredentials();
+  if (!creds || !pattern) return null;
+  const u = new URL(GELBOORU_API_URL);
+  u.searchParams.set('page', 'dapi');
+  u.searchParams.set('s', 'tag');
+  u.searchParams.set('q', 'index');
+  u.searchParams.set('json', '1');
+  u.searchParams.set('limit', '100');
+  u.searchParams.set('name_pattern', `%${pattern}%`);
+  u.searchParams.set('api_key', creds.apiKey);
+  u.searchParams.set('user_id', creds.userId);
+  return u.toString();
+}
+function distinctiveNameTokens(card) {
+  const values = [card && card.name, ...((card && Array.isArray(card.aliases)) ? card.aliases : [])].filter(Boolean);
+  const tokens = [];
+  for (const value of values) {
+    for (const token of normalizeGelbooruTag(value).split('_')) {
+      if (token.length < 3 || /^\d+$/.test(token) || tokens.includes(token)) continue;
+      tokens.push(token);
+    }
+  }
+  return tokens.sort((a, b) => b.length - a.length).slice(0, 3);
+}
+async function discoverGelbooruTags(card) {
+  const direct = new Set(gelbooruTagVariants(card));
+  const seriesTag = gelbooruSeriesTag(card);
+  const rows = [];
+  for (const token of distinctiveNameTokens(card).slice(0, 2)) {
+    const url = gelbooruTagLookupUrl(token);
+    const json = await fetchJson(url, config.hunt.fetchTimeoutMs || 10000, 1, { label: `Gelbooru tag lookup ${token}` });
+    for (const raw of gelbooruTags(json)) {
+      const name = String(raw && raw.name || '').trim();
+      if (!name) continue;
+      const normalized = normalizeGelbooruTag(name);
+      const tokenHits = distinctiveNameTokens(card).filter((t) => normalized.includes(t)).length;
+      if (!tokenHits) continue;
+      let score = tokenHits * 25 + Math.min(20, Math.log10(Math.max(1, Number(raw.count) || 1)) * 5);
+      if (direct.has(normalized)) score += 100;
+      if (seriesTag && normalized.includes(seriesTag)) score += 20;
+      rows.push({ name, normalized, score });
+    }
+  }
+  rows.sort((a, b) => b.score - a.score);
+  const out = [];
+  for (const row of rows) {
+    if (!out.includes(row.name)) out.push(row.name);
+    if (out.length >= 6) break;
+  }
+  if (out.length) console.log(`[hunt] ${card.name}: discovered Gelbooru tags=${out.slice(0, 4).join(',')}`);
+  return out;
+}
+function normalizeGelbooruPost(raw, queryTag) {
+  if (!raw || typeof raw !== 'object') return null;
+  const fileUrl = String(raw.file_url || raw.fileUrl || '').trim();
+  const sampleUrl = String(raw.sample_url || raw.sampleUrl || raw.preview_url || raw.previewUrl || '').trim();
+  if (!fileUrl && !sampleUrl) return null;
+  const rating = String(raw.rating || '').toLowerCase();
+  if (rating && !['safe', 's', 'general', 'g'].includes(rating)) return null;
+  const tags = String(raw.tags || '').split(/\s+/).filter(Boolean);
+  return {
+    id: String(raw.id || ''),
+    query_tag: queryTag,
+    tags,
+    file_url: fileUrl || sampleUrl,
+    sample_url: sampleUrl || fileUrl,
+    width: Number(raw.width || 0),
+    height: Number(raw.height || 0),
+    score: Number(raw.score || 0),
+    rating,
+  };
+}
+function gelbooruSearchUrl(tag, seriesTag = '') {
+  const creds = gelbooruCredentials();
+  if (!creds) return null;
+  const u = new URL(GELBOORU_API_URL);
+  u.searchParams.set('page', 'dapi');
+  u.searchParams.set('s', 'post');
+  u.searchParams.set('q', 'index');
+  u.searchParams.set('json', '1');
+  u.searchParams.set('limit', '50');
+  u.searchParams.set('tags', `${tag}${seriesTag ? ` ${seriesTag}` : ''} rating:safe sort:score:desc`);
+  u.searchParams.set('api_key', creds.apiKey);
+  u.searchParams.set('user_id', creds.userId);
+  return u.toString();
+}
+function artworkRank(post) {
+  const goodResolution = post.width >= 700 && post.height >= 700 ? 1 : 0;
+  const solo = post.tags.includes('solo') ? 1 : 0;
+  const area = Math.min(25_000_000, Math.max(0, post.width * post.height));
+  return (goodResolution * 1e12) + (solo * 1e11) + (Math.max(-1000, post.score) * 1e7) + area;
+}
+async function fetchGelbooruTagBatch(card, tags, seriesTag = '') {
+  const queries = [];
+  for (const tag of tags.slice(0, 4)) {
+    if (seriesTag) queries.push({ tag, series: seriesTag });
+    queries.push({ tag, series: '' });
+  }
+  const settled = await Promise.all(queries.map(async ({ tag, series }) => {
+    const url = gelbooruSearchUrl(tag, series);
+    const json = await fetchJson(url, Math.min(7000, config.hunt.fetchTimeoutMs || 10000), 0, { label: `Gelbooru tag ${tag}` });
+    return gelbooruPosts(json).map((post) => normalizeGelbooruPost(post, tag)).filter(Boolean);
+  }));
+  const seen = new Set();
+  const out = [];
+  for (const posts of settled) {
+    for (const post of posts) {
+      const key = post.file_url || post.sample_url;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(post);
+    }
+  }
+  out.sort((a, b) => artworkRank(b) - artworkRank(a));
+  return out.slice(0, 12);
+}
+async function searchGelbooruArtwork(card) {
+  if (!gelbooruCredentials()) {
+    console.warn('[hunt] GELBOORU_API_KEY/GELBOORU_USER_ID missing — using AniList emergency portrait.');
+    return [];
+  }
+  const seriesTag = gelbooruSeriesTag(card);
+  const direct = gelbooruTagVariants(card);
+
+  let found = await fetchGelbooruTagBatch(card, direct.slice(0, 4), seriesTag);
+  if (!found.length && direct.length > 4) found = await fetchGelbooruTagBatch(card, direct.slice(4, 8), seriesTag);
+  if (!found.length) {
+    const discovered = await discoverGelbooruTags(card);
+    found = await fetchGelbooruTagBatch(card, discovered, seriesTag);
+  }
+
+  console.log(`[hunt] ${card.name}: Gelbooru candidates=${found.length}${found[0] ? ` tag=${found[0].query_tag}` : ''}`);
+  return found.slice(0, 8);
+}
+
+function parseVisionJson(value) {
+  const text = String(value || '').trim();
+  if (!text) return null;
+  try { return JSON.parse(text); } catch (_) {}
+  const m = text.match(/\{[\s\S]*\}/);
+  if (!m) return null;
+  try { return JSON.parse(m[0]); } catch (_) { return null; }
+}
+async function verifyArtworkWithVision(card, candidate) {
+  const apiKey = String(process.env.GROQ_API_KEY || '').trim();
+  if (!apiKey) return { ok: false, unavailable: true, confidence: 0, reason: 'GROQ_API_KEY missing' };
+  const reference = card.reference_image_url || card.image_url;
+  const candidateUrl = candidate.sample_url || candidate.file_url;
+  if (!reference || !candidateUrl) return { ok: false, confidence: 0, reason: 'missing image URL' };
+  const model = String(process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL).trim();
+  const minConfidence = Math.min(0.95, Math.max(0.5, Number(process.env.HUNT_VISION_MIN_CONFIDENCE || 0.72)));
+  const body = {
+    model,
+    temperature: 0.1,
+    max_tokens: 140,
+    response_format: { type: 'json_object' },
+    messages: [{
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: `Image 1 is a trusted AniList reference portrait of the anime character "${card.name}"${card.series ? ` from "${card.series}"` : ''}. Image 2 is candidate fan/artwork from a tagged anime image database. Decide whether Image 2 clearly depicts the SAME character as Image 1. Different pose, clothes, art style, age rendering, or background are allowed. Match distinctive face, hair, eyes, and character design. It is okay if other characters also appear, but the target must be clearly visible. Also reject nudity, explicit sexual content, or clearly sexualized imagery even if the character matches. Return JSON only: {"match":true|false,"safe":true|false,"confidence":0.0,"reason":"short reason"}.`,
+        },
+        { type: 'image_url', image_url: { url: reference } },
+        { type: 'image_url', image_url: { url: candidateUrl } },
+      ],
+    }],
+  };
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), Math.max(12000, config.hunt.fetchTimeoutMs || 10000));
+  timer.unref && timer.unref();
+  try {
+    const res = await fetch(GROQ_CHAT_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify(body),
+      signal: ac.signal,
+    });
+    if (!res.ok) {
+      console.warn(`[hunt] Groq vision HTTP ${res.status} (${model})`);
+      return { ok: false, unavailable: true, confidence: 0, reason: `HTTP ${res.status}` };
+    }
+    const json = await res.json();
+    const content = json && json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content;
+    const parsed = parseVisionJson(content) || {};
+    const confidence = Math.max(0, Math.min(1, Number(parsed.confidence) || 0));
+    const match = parsed.match === true || String(parsed.match).toLowerCase() === 'true';
+    const safe = parsed.safe === true || String(parsed.safe).toLowerCase() === 'true';
+    return { ok: match && safe && confidence >= minConfidence, match, safe, confidence, reason: sanitizeApiText(parsed.reason || '') };
+  } catch (e) {
+    console.warn(`[hunt] Groq vision failed: ${e && e.name === 'AbortError' ? 'timeout' : e.message}`);
+    return { ok: false, unavailable: true, confidence: 0, reason: 'vision request failed' };
+  } finally { clearTimeout(timer); }
 }
 
 async function probeImage(url) {
@@ -338,7 +582,7 @@ async function probeImage(url) {
   const headers = { 'User-Agent': config.hunt.userAgent || 'RimuruTempestCasino/1.0', Accept: 'image/*' };
   const check = async (method, extraHeaders = {}) => {
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), 5000);
+    const timer = setTimeout(() => ac.abort(), 6000);
     timer.unref && timer.unref();
     try {
       const res = await fetch(url, { method, signal: ac.signal, headers: { ...headers, ...extraHeaders } });
@@ -351,9 +595,21 @@ async function probeImage(url) {
   };
   const head = await check('HEAD');
   if (head.ok) return head;
-  // Some CDNs reject HEAD but serve the image correctly. A one-byte range GET
-  // verifies reachability without downloading the full artwork.
   return check('GET', { Range: 'bytes=0-0' });
+}
+
+async function displayUrlForCandidate(candidate) {
+  const full = candidate.file_url;
+  if (full) {
+    const p = await probeImage(full);
+    if (p.ok) return full;
+  }
+  const sample = candidate.sample_url;
+  if (sample) {
+    const p = await probeImage(sample);
+    if (p.ok) return sample;
+  }
+  return '';
 }
 
 function mergeMetadata(identity, others = []) {
@@ -369,80 +625,82 @@ function mergeMetadata(identity, others = []) {
 
 async function chooseBestCharacter(seed) {
   if (!seed) return null;
-  const name = seed.name || '';
-  const results = await Promise.allSettled([
-    searchJikanCharacter(name),
-    searchKitsuCharacter(name),
-    searchAniListCharacter(name),
-  ]);
-  const jikan = results[0].status === 'fulfilled' && results[0].value && sameCharacterName(name, results[0].value.name) ? results[0].value : null;
-  const kitsu = results[1].status === 'fulfilled' && results[1].value && sameCharacterName(name, results[1].value.name) ? results[1].value : null;
-  const anilist = results[2].status === 'fulfilled' && results[2].value && sameCharacterName(name, results[2].value.name) ? results[2].value : null;
-
-  // If the initial seed came from AniList but Jikan resolved the same character,
-  // promote the Jikan identity/ID. AniList remains the final image fallback.
-  const identity = jikan || seed;
+  const identity = seed.source === 'AniList' ? seed : await searchAniListCharacter(seed.name || '');
+  if (!identity) return null;
   if (db.isHuntCharacterClaimed(identity.character_id)) return null;
-  const merged = mergeMetadata(identity, [seed, jikan, kitsu, anilist]);
+  const merged = mergeMetadata(identity, [seed]);
+  merged.reference_image_url = identity.reference_image_url || identity.image_url;
 
-  const jikanForPictures = jikan || (seed.source === 'Jikan' ? seed : null);
-  const jikanPictures = jikanForPictures ? (await fetchJikanPictures(jikanForPictures.character_id)).slice(0, 12) : [];
-  const imageCandidates = [];
-  for (const picture of jikanPictures) imageCandidates.push({ ...picture, priority: 400 });
-  if (jikan && jikan.image_url) imageCandidates.push({ image_url: jikan.image_url, source: 'Jikan', priority: 350 });
-  if (kitsu && kitsu.image_url) imageCandidates.push({ image_url: kitsu.image_url, source: 'Kitsu', priority: 250 });
-  // Explicitly last: AniList profile portraits are only used when better sources fail.
-  if (anilist && anilist.image_url) imageCandidates.push({ image_url: anilist.image_url, source: 'AniList', priority: 10 });
-  if (seed.source === 'AniList' && seed.image_url && !anilist) imageCandidates.push({ image_url: seed.image_url, source: 'AniList', priority: 10 });
-  if (seed.source !== 'AniList' && seed.image_url) imageCandidates.push({ image_url: seed.image_url, source: seed.source || 'Seed', priority: 300 });
+  const candidates = await searchGelbooruArtwork(merged);
+  const hasVision = !!String(process.env.GROQ_API_KEY || '').trim();
+  if (candidates.length && hasVision) {
+    for (const candidate of candidates.slice(0, 4)) {
+      const verdict = await verifyArtworkWithVision(merged, candidate);
+      console.log(`[hunt] ${merged.name}: vision tag=${candidate.query_tag} match=${!!verdict.match} confidence=${Number(verdict.confidence || 0).toFixed(2)}`);
+      if (!verdict.ok) continue;
+      const displayUrl = await displayUrlForCandidate(candidate);
+      if (!displayUrl) continue;
+      merged.image_url = displayUrl;
+      merged.image_source = 'Gelbooru+GroqVision';
+      merged.image_tag = candidate.query_tag;
+      merged.image_score = candidate.score;
+      merged.vision_confidence = verdict.confidence;
+      console.log(`[hunt] ${merged.name}: selected Gelbooru artwork tag=${candidate.query_tag} score=${candidate.score} vision=${verdict.confidence.toFixed(2)}`);
+      return merged;
+    }
+  } else if (candidates.length && !hasVision) {
+    console.warn(`[hunt] ${merged.name}: Gelbooru candidates found but GROQ_API_KEY is missing; refusing unverified artwork.`);
+  }
 
-  const scored = await Promise.all(imageCandidates.map(async (item) => ({
-    ...item,
-    probe: await probeImage(item.image_url),
-  })));
-  const usable = scored.filter((x) => x.probe && x.probe.ok);
-  usable.sort((a, b) => (b.priority - a.priority) || ((b.probe.bytes || 0) - (a.probe.bytes || 0)));
-  const selected = usable[0] || null;
-  if (!selected) return null;
-  merged.image_url = selected.image_url;
-  merged.image_source = selected.source;
-  console.log(`[hunt] ${merged.name}: image=${selected.source}; Jikan=${!!jikan}; Kitsu=${!!kitsu}; AniList=${!!anilist}`);
-  return merged;
+  // Identity must stay correct. If artwork cannot be visually verified, use the
+  // trusted AniList portrait only as an emergency display fallback.
+  const p = await probeImage(identity.image_url);
+  if (p.ok) {
+    merged.image_url = identity.image_url;
+    merged.image_source = 'AniListEmergency';
+    console.warn(`[hunt] ${merged.name}: no verified Gelbooru artwork; using AniList emergency portrait.`);
+    return merged;
+  }
+  return null;
 }
 
 async function fetchSpawnCharacter() {
-  // Strong priority: Jikan random/identity first. If Jikan cannot produce a
-  // seed after multiple attempts, only then use AniList as the seed fallback.
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const seed = await fetchRandomFromJikan();
-    if (!seed) continue;
-    const card = await chooseBestCharacter(seed);
-    if (card) { db.cacheHuntCharacter(card); return card; }
-  }
-
-  console.warn('[hunt] Jikan random did not yield a usable character; trying fallback seed sources.');
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < 5; attempt++) {
     const seed = await fetchRandomFromAniList();
     if (!seed) continue;
     const card = await chooseBestCharacter(seed);
     if (card) { db.cacheHuntCharacter(card); return card; }
   }
 
-  const pool = db.getHuntPool(50).filter((c) => !db.isHuntCharacterClaimed(c.character_id));
+  // Only re-use modern AniList identities from cache; do not resurrect old
+  // Jikan/Kitsu cache entries from previous builds.
+  const pool = db.getHuntPool(50).filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id));
   if (pool.length) return pool[Math.floor(Math.random() * pool.length)];
-  return pickFallbackCharacter();
+
+  // Keep the historical fallback pool for offline regression tests only. In
+  // production, do not regress to old MAL/Jikan-era portrait artwork.
+  if (process.env.NODE_ENV === 'test') return pickFallbackCharacter();
+  console.warn('[hunt] no AniList identity/cache available; skipping spawn instead of using legacy artwork.');
+  return null;
 }
 
 async function resolveCharacter(id) {
   const cached = db.getCachedHuntCharacter(id);
   if (cached) return cached;
-  const base = config.hunt.baseUrl || 'https://api.jikan.moe/v4';
-  const json = await fetchJson(`${base}/characters/${encodeURIComponent(id)}/full`, config.hunt.fetchTimeoutMs || 10000, 2, { label: 'Jikan character detail' });
-  const seed = json && json.data ? normalizeJikan(json.data) : null;
+  if (!String(id || '').startsWith('anilist-')) return null;
+  const seed = await fetchAniListById(id);
   const card = await chooseBestCharacter(seed);
   if (card) db.cacheHuntCharacter(card);
   return card;
 }
+
+// Hard-disabled legacy runtime sources. Kept as exported no-ops so older code
+// importing these names does not crash while guaranteeing Jikan/Kitsu are not
+// consulted by Hunt v1.0.7.
+async function fetchRandomFromJikan() { return null; }
+async function searchJikanCharacter() { return null; }
+async function fetchJikanPictures() { return []; }
+async function searchKitsuCharacter() { return null; }
 
 let deps = null;
 function attach(d) { deps = d || null; return module.exports; }
@@ -515,11 +773,7 @@ function expireIfNeeded(now = Date.now()) {
 async function searchAndShow(query, opts = {}) {
   const q = String(query || '').trim();
   if (!q) return { ok: false, message: 'Usage: /char <name>' };
-  const results = await Promise.allSettled([searchJikanCharacter(q), searchKitsuCharacter(q), searchAniListCharacter(q)]);
-  const jikan = results[0].status === 'fulfilled' ? results[0].value : null;
-  const kitsu = results[1].status === 'fulfilled' ? results[1].value : null;
-  const anilist = results[2].status === 'fulfilled' ? results[2].value : null;
-  const seed = jikan || kitsu || anilist;
+  const seed = await searchAniListCharacter(q);
   if (!seed) return { ok: false, message: `No character found for ${stripUrls(q)}.` };
   const card = await chooseBestCharacter(seed) || seed;
   db.cacheHuntCharacter(card);
@@ -560,6 +814,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
+  console.log(`[hunt-v1.0.7] AniList identity + Gelbooru artwork + Groq vision (${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL})`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -569,8 +824,9 @@ module.exports = {
   animeListOf, truncateBio, announceCaption, claimedCaption, detailCaption, collectionCaption,
   leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
   fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
-  fetchJikanPictures, fetchSpawnCharacter, resolveCharacter, attach, spawn, claim,
-  expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state, FALLBACK_POOL,
-  fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
+  fetchJikanPictures, fetchRandomFromAniList, fetchAniListById, fetchSpawnCharacter, resolveCharacter,
+  attach, spawn, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state,
+  FALLBACK_POOL, fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
+  normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork, verifyArtworkWithVision,
   _clear: () => db.clearActiveHunt(),
 };
