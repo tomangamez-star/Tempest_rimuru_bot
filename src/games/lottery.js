@@ -1,101 +1,65 @@
 'use strict';
-/**
- * Rimuru Tempest Casino — Lottery 🎟️
- * Ticket = 10,000 coins. Users can buy multiple tickets (better odds, not guaranteed).
- * Needs 5 buyers for a draw. Base jackpot 5,000,000; grows with tickets sold.
- * Winner takes the pot. Winner picked weighted by tickets held.
- */
 const config = require('../config');
 const db = require('../db');
 const { fmt, esc } = require('../utils');
 
-/**
- * Buy tickets.
- * @returns {ok, message, pot, buyers, ticketCount}
- */
-function buy(userId, count, meta = {}) {
-  const countN = Math.floor(Number(count) || 1);
-  if (!Number.isFinite(countN) || countN < 1) {
-    return { ok: false, message: '🎩 Usage: `/lottery buy [tickets]` — e.g. `/lottery buy 3`' };
-  }
+function buy(userId, count = 1, meta = {}) {
+  const countN = Math.max(1, Math.min(1000, Math.floor(Number(count) || 1)));
   const u = db.getOrCreateUser(userId, meta);
   const cost = config.lottery.ticketPrice * countN;
-  if (u.wallet < cost) {
-    return { ok: false, message: `❌ ${countN} ticket(s) cost ${fmt(cost)} — your wallet has ${fmt(u.wallet)}.` };
-  }
-
+  if (Number(u.wallet) < cost) return { ok: false, message: `❌ ${countN} ticket(s) cost <b>${fmt(cost)}</b> — your wallet has <b>${fmt(u.wallet)}</b>.` };
   const lot = db.getLottery();
-  const tickets = lot.tickets;
-  const existing = tickets.find((t) => t.user_id === userId);
-  if (existing) existing.count += countN;
-  else tickets.push({ user_id: userId, name: meta.first_name || meta.username || String(userId), count: countN });
-
-  const newPot = lot.pot + cost;
-  const newCount = lot.ticket_count + countN;
+  const tickets = Array.isArray(lot.tickets) ? lot.tickets : [];
+  const existing = tickets.find((t) => Number(t.user_id) === Number(userId));
+  if (existing) existing.count = (Number(existing.count) || 0) + countN;
+  else tickets.push({ user_id: Number(userId), name: meta.first_name || meta.username || String(userId), count: countN });
+  const newPot = Number(lot.pot) + cost;
+  const newCount = Number(lot.ticket_count) + countN;
   db.addWallet(userId, -cost);
   db.saveLottery(newPot, newCount, tickets);
-
-  const buyerCount = tickets.length;
-  const msg =
-    `🎟️ **TICKET BOUGHT!** ${countN}× (${fmt(cost)})\n\n` +
-    `📊 Pot: **${fmt(newPot)}** | Tickets in draw: ${newCount} | Buyers: ${buyerCount}/${config.lottery.minBuyers}\n` +
-    (buyerCount >= config.lottery.minBuyers
-      ? `\n✅ **Enough buyers!** The draw happens on the next ticket purchase, or with \`/lottery draw\`.`
-      : `\n⏳ Need ${config.lottery.minBuyers - buyerCount} more buyer(s) for the draw.`);
-
-  return { ok: true, message: msg, pot: newPot, buyers: buyerCount, ticketCount: newCount };
+  return { ok: true, pot: newPot, buyers: tickets.length, ticketCount: newCount, count: countN, cost };
 }
 
-/**
- * Run the draw. Only possible with >= minBuyers buyers.
- * Winner weighted by ticket count. Pot fully awarded to winner (house takes nothing).
- */
 function draw() {
   const lot = db.getLottery();
-  if (lot.tickets.length < config.lottery.minBuyers) {
-    return {
-      ok: false,
-      message: `⏳ Only ${lot.tickets.length}/${config.lottery.minBuyers} buyers — not enough for a draw yet.`,
-    };
-  }
-
-  // Weighted pick by ticket count
-  const total = lot.tickets.reduce((s, t) => s + t.count, 0);
-  let r = Math.floor(Math.random() * total);
-  let winner = lot.tickets[0];
-  for (const t of lot.tickets) {
-    r -= t.count;
-    if (r < 0) { winner = t; break; }
-  }
-
-  const pot = lot.pot;
-  db.addWallet(winner.user_id, pot);
+  const tickets = Array.isArray(lot.tickets) ? lot.tickets : [];
+  if (tickets.length < config.lottery.minBuyers) return { ok: false, message: `⏳ Only <b>${tickets.length}/${config.lottery.minBuyers}</b> unique buyers — not enough for a draw yet.` };
+  const total = tickets.reduce((sum, t) => sum + Math.max(0, Number(t.count) || 0), 0);
+  if (!total) return { ok: false, message: '🎟️ No valid tickets are in the draw.' };
+  let roll = Math.floor(Math.random() * total);
+  let winner = tickets[0];
+  for (const t of tickets) { roll -= Number(t.count) || 0; if (roll < 0) { winner = t; break; } }
+  const pot = Number(lot.pot) || config.lottery.baseJackpot;
+  db.getOrCreateUser(Number(winner.user_id), { first_name: winner.name || '' });
+  db.addWallet(Number(winner.user_id), pot);
   db.saveLottery(config.lottery.baseJackpot, 0, []);
-
-  return {
-    ok: true,
-    winner,
-    pot,
-    message:
-      `🎉 <b>LOTTERY DRAW!</b>\n\n` +
-      `🏆 Winner: <a href="tg://user?id=${winner.user_id}">${esc(winner.name, false)}</a>\n` +
-      `💰 Prize: <b>${fmt(pot)}</b>\n\n` +
-      `The jackpot resets to ${fmt(config.lottery.baseJackpot)} for the next round. 🎟️ /lottery`,
-  };
+  return { ok: true, winner, pot, message: `🎉 <b>LOTTERY DRAW!</b>\n\n🏆 Winner: <a href="tg://user?id=${winner.user_id}">${esc(winner.name || String(winner.user_id), false)}</a>\n🎫 Winning tickets: <b>${Number(winner.count) || 1}/${total}</b>\n💰 Prize: <b>${fmt(pot)}</b>\n\nThe jackpot resets to <b>${fmt(config.lottery.baseJackpot)}</b>.` };
 }
 
-/** Status of the current lottery. */
 function status() {
   const lot = db.getLottery();
-  return (
-    `🎟️ **LOTTERY**\n\n` +
-    `Pot: **${fmt(lot.pot)}**\n` +
-    `Tickets: ${lot.ticket_count} | Buyers: ${lot.tickets.length}/${config.lottery.minBuyers}\n` +
-    `Ticket price: ${fmt(config.lottery.ticketPrice)}\n\n` +
-    (lot.tickets.length
-      ? `Buyers:\n${lot.tickets.map((t) => `• ${t.name} — ${t.count} ticket(s)`).join('\n')}`
-      : 'No tickets yet — be the first! 🎟️')
-  );
+  const tickets = Array.isArray(lot.tickets) ? lot.tickets : [];
+  return `🎟️ <b>JTF LOTTERY</b>\n\n💰 Pot: <b>${fmt(lot.pot)}</b>\n🎫 Tickets: <b>${lot.ticket_count}</b>\n👥 Buyers: <b>${tickets.length}/${config.lottery.minBuyers}</b>\n💵 Ticket price: <b>${fmt(config.lottery.ticketPrice)}</b>\n\nEvery extra ticket improves your odds, but nothing is guaranteed.`;
 }
 
-module.exports = { buy, draw, status };
+async function play(ctx) {
+  const args = Array.isArray(ctx.args) ? ctx.args : [];
+  const first = String(args[0] || '').toLowerCase();
+  if (first === 'status') return ctx.reply(status(), { title: '🎟️ LOTTERY', html: true });
+  if (first === 'draw') {
+    const r = draw();
+    return ctx.reply(r.message, { title: '🎟️ LOTTERY', html: true });
+  }
+  const count = first === 'buy' ? args[1] : (first && /^\d+$/.test(first) ? first : 1);
+  const from = ctx.msg && ctx.msg.from || {};
+  const r = buy(ctx.userId, count, { username: from.username || '', first_name: from.first_name || '' });
+  if (!r.ok) return ctx.reply(r.message, { title: '🎟️ LOTTERY', html: true });
+  let msg = `🎟️ <b>TICKET${r.count === 1 ? '' : 'S'} BOUGHT!</b>\n\nYou bought <b>${r.count}</b> for <b>${fmt(r.cost)}</b>.\n💰 Pot: <b>${fmt(r.pot)}</b>\n🎫 Tickets: <b>${r.ticketCount}</b>\n👥 Buyers: <b>${r.buyers}/${config.lottery.minBuyers}</b>`;
+  if (r.buyers >= config.lottery.minBuyers) {
+    const d = draw();
+    msg += `\n\n${d.message}`;
+  } else msg += `\n\n⏳ ${config.lottery.minBuyers - r.buyers} more unique buyer(s) needed.`;
+  return ctx.reply(msg, { title: '🎟️ LOTTERY', html: true });
+}
+
+module.exports = { buy, draw, status, play };
