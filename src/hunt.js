@@ -5,6 +5,7 @@ const db = require('./db');
 const cardRenderer = require('./hunt-card');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
+const ANIME_PICTURES_API_URL = 'https://api.anime-pictures.net/api/v3';
 const GELBOORU_API_URL = 'https://gelbooru.com/index.php';
 const SAFEBOORU_API_URL = 'https://safebooru.org/index.php';
 const DANBOORU_SAFE_URL = 'https://safebooru.donmai.us';
@@ -802,6 +803,310 @@ function trustedArtworkRank(candidate) {
   return providerBoost + artworkRank(candidate || {});
 }
 
+
+// ===================== ANIME-PICTURES CARD ARTWORK =====================
+// Cards use Anime-Pictures as their only live fan-art catalogue. Waifu keeps
+// its already-approved legacy providers below and is intentionally isolated.
+const animePicturesPoolCache = new Map();
+let animePicturesRequestChain = Promise.resolve();
+let animePicturesLastRequestAt = 0;
+const ANIME_PICTURES_CACHE_MS = 6 * 60 * 60 * 1000;
+const ANIME_PICTURES_EMPTY_CACHE_MS = 15 * 60 * 1000;
+const ANIME_PICTURES_MIN_GAP_MS = 650;
+
+function normalizeAnimePicturesUrl(value) {
+  let url = String(value || '').trim();
+  if (!url) return '';
+  if (url.startsWith('//')) url = `https:${url}`;
+  if (url.startsWith('/')) url = `https://anime-pictures.net${url}`;
+  // Anime-Pictures preview fields can add a negotiated .webp/.avif suffix to
+  // an otherwise normal JPG/PNG URL. The underlying URL is more portable for
+  // Sharp/Render, so strip only that final negotiated suffix.
+  url = url.replace(/(\.(?:jpe?g|png|gif))\.(?:webp|avif)(?=\?|$)/i, '$1');
+  return /^https:\/\//i.test(url) ? url : '';
+}
+
+function animePicturesDerivedPreview(post) {
+  const md5 = String(post && post.md5 || '').trim();
+  if (!/^[a-f0-9]{32}$/i.test(md5)) return '';
+  return `https://opreviews.anime-pictures.net/${md5.slice(0, 3)}/${md5}_bp.png`;
+}
+
+function animePicturesPreviewUrl(post) {
+  return normalizeAnimePicturesUrl(post && (post.big_preview || post.medium_preview || post.small_preview)) || animePicturesDerivedPreview(post);
+}
+
+async function animePicturesJson(url, label, retries = 1) {
+  const task = async () => {
+    const wait = Math.max(0, ANIME_PICTURES_MIN_GAP_MS - (Date.now() - animePicturesLastRequestAt));
+    if (wait) await sleep(wait);
+    animePicturesLastRequestAt = Date.now();
+    return fetchJson(url, Math.max(10000, config.hunt.fetchTimeoutMs || 10000), retries, { label: label || 'Anime-Pictures' });
+  };
+  const run = animePicturesRequestChain.then(task, task);
+  // Keep the queue alive even if a future implementation throws unexpectedly.
+  animePicturesRequestChain = run.catch(() => null);
+  return run;
+}
+
+function simpleTagText(value) {
+  return String(value || '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/\([^)]*\)/g, ' ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function animePicturesNameVariants(card) {
+  const out = [];
+  const push = (value) => {
+    const clean = stripUrls(value || '').replace(/\s+/g, ' ').trim();
+    if (clean && !out.some((x) => x.toLowerCase() === clean.toLowerCase())) out.push(clean);
+  };
+  push(card && card.name);
+  for (const alias of Array.isArray(card && card.aliases) ? card.aliases : []) push(alias);
+
+  // Anime-Pictures commonly stores Japanese names family-name first. Add the
+  // reversed form without changing the canonical AniList identity.
+  for (const value of out.slice()) {
+    const parts = value.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2 && parts.length <= 4) push([...parts].reverse().join(' '));
+  }
+
+  // Common Hepburn long-vowel spelling used by the site's Gojo/Gojou tag and
+  // a few similar surnames. Smart-tag search still decides the final match.
+  for (const value of out.slice()) {
+    push(value.replace(/\bgojo\b/ig, 'gojou'));
+  }
+
+  // Parenthetical series qualifiers are common when a short character name is
+  // ambiguous (for example "makima (chainsaw man)").
+  const series = stripUrls(card && card.series || '').trim();
+  if (series) {
+    for (const value of out.slice(0, 4)) push(`${value} (${series})`);
+  }
+  return out.slice(0, 10);
+}
+
+function animePicturesTagScore(tag, query, card) {
+  if (!tag || Number(tag.type) !== 1) return -Infinity; // category 1 = character
+  const name = simpleTagText(tag.tag);
+  const fullName = String(tag.tag || '')
+    .normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const q = simpleTagText(query);
+  if (!name || !q) return -Infinity;
+  let score = 0;
+  if (name === q) score += 1000;
+  else if (name.startsWith(`${q} `) || name.endsWith(` ${q}`)) score += 800;
+  else if (name.includes(q) || q.includes(name)) score += 500;
+
+  const qWords = new Set(q.split(' '));
+  const nWords = name.split(' ');
+  score += nWords.filter((x) => qWords.has(x)).length * 90;
+  const series = simpleTagText(card && card.series || '');
+  if (series && fullName.includes(series)) score += 160;
+  score += Math.min(120, Math.log10(Math.max(1, Number(tag.num_pub || tag.num || 0))) * 25);
+  return score;
+}
+
+async function resolveAnimePicturesCharacterTag(card) {
+  const variants = animePicturesNameVariants(card);
+  let best = null;
+  let bestScore = -Infinity;
+  // Smart tag search is cheap, but cap attempts so a weird AniList alias list
+  // cannot turn one /hunt into dozens of upstream requests.
+  for (const query of variants.slice(0, 6)) {
+    const u = new URL(`${ANIME_PICTURES_API_URL}/tags`);
+    u.searchParams.set('tag:smart', query.toLowerCase());
+    u.searchParams.set('lang', 'en');
+    u.searchParams.set('limit', '20');
+    const json = await animePicturesJson(u, `Anime-Pictures tag ${query}`, 1);
+    const tags = json && Array.isArray(json.tags) ? json.tags : [];
+    for (const tag of tags) {
+      const score = animePicturesTagScore(tag, query, card);
+      if (score > bestScore) { best = tag; bestScore = score; }
+    }
+    if (bestScore >= 1000) break;
+  }
+  if (!best) return null;
+
+  // Alias records point at the canonical tag ID. Resolve it once so post-detail
+  // checks can compare identity by ID instead of fragile text alone.
+  if (Number(best.alias) > 0) {
+    const json = await animePicturesJson(`${ANIME_PICTURES_API_URL}/tags/${Number(best.alias)}`, `Anime-Pictures canonical tag ${best.alias}`, 1);
+    if (json && json.tag && Number(json.tag.type) === 1) best = json.tag;
+  }
+  console.log(`[cards] ${card.name}: Anime-Pictures character tag=${best.tag} id=${best.id} posts=${best.num_pub || best.num || '?'}`);
+  return best;
+}
+
+async function searchAnimePicturesPosts(tag) {
+  if (!tag || !tag.tag) return [];
+  const u = new URL(`${ANIME_PICTURES_API_URL}/posts`);
+  u.searchParams.set('page', '0');
+  u.searchParams.set('search_tag', `${tag.tag}&&single`);
+  u.searchParams.set('posts_per_page', '80');
+  u.searchParams.set('order_by', 'rating');
+  u.searchParams.set('lang', 'en');
+  const json = await animePicturesJson(u, `Anime-Pictures posts ${tag.tag}`, 1);
+  const rows = json && Array.isArray(json.posts) ? json.posts : [];
+  return rows.filter((post) => post && Number(post.erotics || 0) === 0 && Number(post.status == null ? 1 : post.status) === 1);
+}
+
+async function fetchAnimePicturesPostDetails(id) {
+  const n = Number(id) || 0;
+  if (!n) return null;
+  return animePicturesJson(`${ANIME_PICTURES_API_URL}/posts/${n}?lang=en&type=json`, `Anime-Pictures post ${n}`, 1);
+}
+
+const AP_REJECT_TAGS = new Set([
+  '2girls', '3girls', '4girls', '5girls', '6+girls', 'multiple girls',
+  '2boys', '3boys', '4boys', '5boys', '6+boys', 'multiple boys', 'group',
+  'character sheet', 'reference sheet', 'model sheet', 'multiple views', 'collage',
+]);
+const AP_PREFERRED_TAGS = new Map([
+  ['portrait', 900], ['upper body', 800], ['face', 650], ['full body', 600],
+  ['simple background', 350], ['looking at viewer', 250], ['highres', 180], ['tall image', 120],
+]);
+
+function animePicturesCandidateFromDetails(searchPost, details, targetTag) {
+  if (!searchPost || !details || !targetTag) return null;
+  const post = details.post || searchPost;
+  if (Number(post.erotics || 0) !== 0) return null;
+  if (post.status != null && Number(post.status) !== 1) return null;
+
+  const rawTags = Array.isArray(details.tags) ? details.tags : [];
+  const tags = rawTags.map((entry) => entry && entry.tag ? entry.tag : entry).filter(Boolean);
+  const names = new Set(tags.map((t) => String(t.tag || '').toLowerCase()).filter(Boolean));
+  const characterTags = tags.filter((t) => Number(t.type) === 1);
+  const targetId = Number(targetTag.id) || 0;
+  const canonicalName = String(targetTag.tag || '').toLowerCase();
+  const targetPresent = characterTags.some((t) => (targetId && Number(t.id) === targetId) || String(t.tag || '').toLowerCase() === canonicalName);
+  if (!targetPresent) return null;
+  // The whole point of this source swap is identity reliability. Reject posts
+  // with another tagged character even if the site also happens to carry the
+  // "single" reference tag.
+  if (characterTags.some((t) => !((targetId && Number(t.id) === targetId) || String(t.tag || '').toLowerCase() === canonicalName))) return null;
+  if (!names.has('single')) return null;
+  for (const tag of AP_REJECT_TAGS) if (names.has(tag)) return null;
+
+  const imageUrl = animePicturesPreviewUrl(post) || animePicturesPreviewUrl(searchPost);
+  if (!imageUrl) return null;
+  let quality = Number(post.score_number || searchPost.score_number || 0) * 1000;
+  const width = Number(post.width || searchPost.width || 0);
+  const height = Number(post.height || searchPost.height || 0);
+  if (width && height) {
+    quality += Math.min(900, (width * height) / 12000);
+    const ratio = height / width;
+    if (ratio >= 1.05 && ratio <= 2.15) quality += 450;
+  }
+  for (const [tag, bonus] of AP_PREFERRED_TAGS) if (names.has(tag)) quality += bonus;
+
+  return {
+    provider: 'AnimePictures',
+    post_id: Number(post.id || searchPost.id) || 0,
+    file_url: imageUrl,
+    sample_url: imageUrl,
+    score: Number(post.score_number || searchPost.score_number || 0),
+    width,
+    height,
+    quality,
+    tags: [...names],
+    query_tag: targetTag.tag,
+    exact_tag: true,
+  };
+}
+
+async function buildAnimePicturesArtworkPool(card) {
+  const key = String(card && (card.character_id || card.name) || '').toLowerCase();
+  const cached = animePicturesPoolCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const tag = await resolveAnimePicturesCharacterTag(card);
+  if (!tag) {
+    animePicturesPoolCache.set(key, { value: [], expiresAt: Date.now() + ANIME_PICTURES_EMPTY_CACHE_MS });
+    console.warn(`[cards] ${card.name}: Anime-Pictures character tag not found.`);
+    return [];
+  }
+  const posts = await searchAnimePicturesPosts(tag);
+  if (!posts.length) {
+    animePicturesPoolCache.set(key, { value: [], expiresAt: Date.now() + ANIME_PICTURES_EMPTY_CACHE_MS });
+    console.warn(`[cards] ${card.name}: Anime-Pictures returned no safe single posts for ${tag.tag}.`);
+    return [];
+  }
+
+  // Rating-sorted results are inspected until six clean solo identity matches
+  // are found. A few extras are kept so a dead preview URL can be skipped.
+  const ordered = posts.slice().sort((a, b) => {
+    const score = Number(b.score_number || 0) - Number(a.score_number || 0);
+    return score || (Number(b.id || 0) - Number(a.id || 0));
+  });
+  const approved = [];
+  for (const post of ordered.slice(0, 18)) {
+    const details = await fetchAnimePicturesPostDetails(post.id);
+    const candidate = animePicturesCandidateFromDetails(post, details, tag);
+    if (!candidate) continue;
+    approved.push(candidate);
+    if (approved.length >= 8) break;
+  }
+  approved.sort((a, b) => (Number(b.quality) - Number(a.quality)) || (Number(b.post_id) - Number(a.post_id)));
+  const value = approved.slice(0, 8);
+  animePicturesPoolCache.set(key, { value, expiresAt: Date.now() + (value.length ? ANIME_PICTURES_CACHE_MS : ANIME_PICTURES_EMPTY_CACHE_MS) });
+  console.log(`[cards] ${card.name}: Anime-Pictures approved=${value.length}/${posts.length} tag=${tag.tag}`);
+  return value;
+}
+
+function animePicturesArtworkForTier(card, pool) {
+  if (!Array.isArray(pool) || !pool.length) return null;
+  const tier = Math.max(1, Math.min(6, Number(cardTierMeta(card).tier) || 1));
+  // Reserve the six strongest approved artworks and map them low→high quality:
+  // T1 gets slot 1, ... T6 gets the strongest slot. With fewer than six images,
+  // proportional mapping keeps every available image useful.
+  const six = pool.slice(0, 6).sort((a, b) => (Number(a.quality) - Number(b.quality)) || (Number(a.post_id) - Number(b.post_id)));
+  const index = six.length === 1 ? 0 : Math.round(((tier - 1) / 5) * (six.length - 1));
+  return { ...six[index], tier_slot: tier, pool_size: six.length };
+}
+
+async function selectAnimePicturesArtwork(identity, opts = {}) {
+  if (!identity) return null;
+  const merged = { ...identity };
+  const pool = await buildAnimePicturesArtworkPool(merged);
+  const candidate = animePicturesArtworkForTier(merged, pool);
+  if (!candidate) return null;
+  const displayUrl = await displayUrlForCandidate(candidate);
+  if (!displayUrl) {
+    // Try another approved image without changing the character identity.
+    for (const backup of pool) {
+      const url = await displayUrlForCandidate(backup);
+      if (!url) continue;
+      return {
+        ...merged,
+        image_url: url,
+        image_source: `AnimePictures:T${cardTierMeta(merged).tier}`,
+        image_tag: backup.query_tag,
+        image_score: backup.score,
+        anime_pictures_post_id: backup.post_id,
+        artwork_pool_size: Math.min(6, pool.length),
+      };
+    }
+    return null;
+  }
+  console.log(`[${opts.context || 'cards'}] ${merged.name}: Anime-Pictures post=${candidate.post_id} tier=T${candidate.tier_slot} pool=${candidate.pool_size}`);
+  return {
+    ...merged,
+    image_url: displayUrl,
+    image_source: `AnimePictures:T${candidate.tier_slot}`,
+    image_tag: candidate.query_tag,
+    image_score: candidate.score,
+    anime_pictures_post_id: candidate.post_id,
+    artwork_pool_size: candidate.pool_size,
+  };
+}
+
 async function selectLegacyWaifuArtwork(identity, opts = {}) {
   if (!identity) return null;
   const merged = { ...identity };
@@ -855,52 +1160,28 @@ async function selectArtworkForIdentity(identity, opts = {}) {
   if (!identity) return null;
   const context = opts.context || 'cards';
   if (context === 'waifu' || context === 'swaifu' || opts.preserveWaifu === true) return selectLegacyWaifuArtwork(identity, opts);
+
+  // v1.0.12 Cards: Anime-Pictures is the sole live artwork catalogue for Hunt.
+  // AniList remains the identity/metadata source only; Danbooru/Safebooru/
+  // Gelbooru are deliberately not consulted here. The chosen artwork is tied
+  // to the card's T1-T6 tier from a six-image solo-character pool.
+  try {
+    const card = await selectAnimePicturesArtwork(identity, opts);
+    if (card) return card;
+  } catch (e) {
+    console.warn(`[${context}] ${identity.name}: Anime-Pictures artwork lookup failed: ${e.message}`);
+  }
+
+  // Keep the game alive during a temporary Anime-Pictures outage. This is not
+  // another fan-art provider: the trusted AniList identity portrait is only a
+  // last-resort source image inside the generated JTF card and is clearly
+  // identified in logs/source metadata.
   const merged = { ...identity };
-  merged.reference_image_url = identity.reference_image_url || identity.image_url;
-
-  // v1.0.11 Cards: use the image databases as tagged artwork catalogues, not
-  // as an AI guessing game. A candidate is eligible only when the returned post
-  // itself contains the exact character tag that produced it. DanbooruSafe is
-  // preferred because its tag lookup explicitly filters to character-category
-  // tags; Safebooru and credentialed Gelbooru are fallbacks.
-  let candidates = [];
-  try { candidates = await searchArtworkSources(merged); } catch (e) { console.warn(`[${context}] artwork lookup failed: ${e.message}`); }
-  const trusted = candidates.filter(candidateHasExactCharacterTag).sort((a, b) => trustedArtworkRank(b) - trustedArtworkRank(a));
-
-  if (trusted.length) {
-    // Pick from the strongest few instead of pinning every /char lookup to one
-    // picture. Exact tag validation still applies to every candidate.
-    const top = trusted.slice(0, Math.min(6, trusted.length));
-    const order = top.slice().sort(() => Math.random() - 0.5);
-    for (const candidate of order) {
-      const displayUrl = await displayUrlForCandidate(candidate);
-      if (!displayUrl) continue;
-      console.log(`[${context}] ${merged.name}: using exact character-tag artwork from ${candidate.provider} tag=${candidate.query_tag}`);
-      return {
-        ...merged,
-        image_url: displayUrl,
-        image_source: `${candidate.provider}CharacterTag`,
-        image_tag: candidate.query_tag,
-        image_score: candidate.score,
-      };
-    }
-  }
-
-  // Cards must still spawn even if every artwork host is down. The trusted
-  // AniList portrait is now only a SOURCE IMAGE for the generated card, never
-  // sent as the finished presentation. This prevents the old "empty grounds"
-  // failure while keeping the card renderer usable during provider outages.
-  const identityUrl = merged.reference_image_url || merged.image_url;
+  const identityUrl = identity.reference_image_url || identity.image_url;
   if (identityUrl) {
-    console.warn(`[${context}] ${merged.name}: no reachable exact-tag artwork; using identity portrait inside generated card.`);
-    return {
-      ...merged,
-      image_url: identityUrl,
-      image_source: 'AniListCardFallback',
-    };
+    console.warn(`[${context}] ${identity.name}: Anime-Pictures unavailable; using identity portrait fallback inside card.`);
+    return { ...merged, image_url: identityUrl, image_source: 'AniListIdentityEmergencyFallback' };
   }
-
-  console.warn(`[${context}] ${merged.name}: no usable artwork or identity portrait.`);
   return null;
 }
 
@@ -1114,7 +1395,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.11] /hunt kept; generated T1-T6 Cards enabled; artwork=exact character-tag DanbooruSafe/Safebooru/Gelbooru with identity-card fallback; renderer=${cardRenderer.available() ? 'sharp' : 'source-fallback'}`);
+  console.log(`[cards-v1.0.12] /hunt kept; generated T1-T6 Cards enabled; artwork=Anime-Pictures solo character pool (6 tier slots) with identity emergency fallback; renderer=${cardRenderer.available() ? 'sharp' : 'source-fallback'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -1130,5 +1411,8 @@ module.exports = {
   normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork,
   searchSafebooruArtwork, searchDanbooruSafeArtwork, searchArtworkSources, selectArtworkForIdentity, verifyArtworkWithVision,
   candidateHasExactCharacterTag, trustedArtworkRank,
+  normalizeAnimePicturesUrl, animePicturesNameVariants, animePicturesTagScore, resolveAnimePicturesCharacterTag,
+  searchAnimePicturesPosts, fetchAnimePicturesPostDetails, animePicturesCandidateFromDetails, buildAnimePicturesArtworkPool,
+  animePicturesArtworkForTier, selectAnimePicturesArtwork,
   _clear: () => db.clearActiveHunt(),
 };
