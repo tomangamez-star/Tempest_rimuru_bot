@@ -122,7 +122,10 @@ function buildOverlaySvg(card) {
   const seriesRaw = clean(card.series || 'UNKNOWN SERIES', 56);
   const series = escapeXml(seriesRaw);
   const seriesSize = seriesRaw.length <= 24 ? 18 : seriesRaw.length <= 38 ? 15 : 13;
-  const id = escapeXml(card.character_id || card.id || 'unknown');
+  // Keep AniList as an internal identity source only. The collector card
+  // footer should show a clean Card ID, not advertise the metadata provider.
+  const rawId = String(card.character_id || card.id || 'unknown');
+  const id = escapeXml(rawId.replace(/^anilist-/i, ''));
   const desc = wrapLines(card.bio || card.description || '', 49, 4).map(escapeXml);
   const fontSize = nameFontSize(name);
   const t6 = tier.tier === 6;

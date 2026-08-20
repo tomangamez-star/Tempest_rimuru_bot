@@ -45,6 +45,13 @@ let pgLastWriteAt = null;
 let pgLastVerifyAt = null;
 let pgLastMirrorAt = null;
 let pgMirrorQueue = [];
+// Hunt/Card claims are durable collection records. Keep a dedicated retry
+// queue keyed by character_id so a transient Postgres write failure cannot
+// make /clb appear to succeed locally and then disappear after a Render
+// redeploy. This queue is deliberately separate from the generic upsert
+// mirror because legacy hunt_claims tables may not have character_id as a
+// declared UNIQUE/PRIMARY KEY even though it is the logical identity.
+const pgHuntClaimQueue = new Map();
 let pgMirrorRunning = false;
 let pgRecoveryTimer = null;
 let pgHeartbeatTimer = null;
@@ -1271,6 +1278,11 @@ function claimHuntCharacter(userId, char) {
   } catch (e) {
     return null; // duplicate claim (UNIQUE on character_id)
   }
+  // Queue the durable Postgres copy at the exact point the local claim becomes
+  // real. The persistence-hardening shim still provides an additional direct
+  // write, but Cards no longer depends on that wrapper for /clb survival.
+  queueHuntClaimPg(row);
+  drainHuntClaimQueue().catch((e) => console.warn('[db] immediate hunt claim persistence failed:', e.message));
   try { prep('UPDATE hunt_spawn SET claimed = 1 WHERE character_id = ?').run(characterId); } catch (e) { /* non-fatal */ }
   return row;
 }
@@ -1605,6 +1617,25 @@ async function migratePgColumns() {
     await pgPool.query(`CREATE UNIQUE INDEX IF NOT EXISTS admin_users_user_id_uq ON admin_users (user_id)`);
   } catch (e) { console.warn('[db] admin_users unique index skipped:', e.message); }
   try {
+    // Card claims changed from numeric/local AUTOINCREMENT identity to stable
+    // character IDs. Older Postgres tables can therefore have character_id
+    // declared as a numeric type. Modern Cards uses IDs such as
+    // "anilist-12345", so make the durable column TEXT non-destructively.
+    const typeRes = await pgPool.query(`
+      SELECT data_type FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = 'hunt_claims' AND column_name = 'character_id'
+      LIMIT 1`);
+    const dataType = String(typeRes.rows[0] && typeRes.rows[0].data_type || '').toLowerCase();
+    if (dataType && !['text', 'character varying', 'character'].includes(dataType)) {
+      await pgPool.query(`ALTER TABLE hunt_claims ALTER COLUMN character_id TYPE TEXT USING character_id::text`);
+      console.log('[db] hunt_claims.character_id migrated to TEXT for durable Cards IDs');
+    }
+    // A non-unique lookup index is safe even on a legacy table that somehow
+    // contains duplicate character IDs; the app-level claim rule still treats
+    // character_id as unique and the dedicated write path uses NOT EXISTS.
+    await pgPool.query(`CREATE INDEX IF NOT EXISTS hunt_claims_character_id_idx ON hunt_claims (character_id)`);
+  } catch (e) { console.warn('[db] hunt_claims durability reconciliation skipped:', e.message); }
+  try {
     // users.networth: legacy rows never wrote it → net worth = wallet + bank.
     await pgPool.query(`UPDATE users SET networth = COALESCE(networth, wallet + bank, 500000) WHERE networth IS NULL`);
   } catch (e) { console.warn('[db] networth backfill skipped:', e.message); }
@@ -1680,11 +1711,55 @@ function queuePgWrite(table, data) {
   pgMirrorQueue.push({ table, data });
 }
 
+function queueHuntClaimPg(row) {
+  if (!row || row.character_id == null || !PG_CONFIGURED) return;
+  const key = String(row.character_id);
+  pgHuntClaimQueue.set(key, {
+    user_id: Number(row.user_id) || 0,
+    character_id: key,
+    name: row.name || '',
+    series: row.series || '',
+    image_url: row.image_url || '',
+    rarity: row.rarity || 'common',
+    claimed_at: row.claimed_at == null ? Date.now() : row.claimed_at,
+  });
+}
+
+async function drainHuntClaimQueue() {
+  if (!pgReady || !pgWritable || !pgLockHeld || !syncEnabled || !pgPool || !pgHuntClaimQueue.size) return 0;
+  let written = 0;
+  for (const [key, row] of Array.from(pgHuntClaimQueue.entries())) {
+    try {
+      // NOT EXISTS intentionally avoids depending on a legacy UNIQUE/PK
+      // constraint. Existing claims are append-only and must never have their
+      // owner/image silently reassigned by a later deploy.
+      await pgPool.query(`
+        INSERT INTO hunt_claims (user_id, character_id, name, series, image_url, rarity, claimed_at)
+        SELECT $1, $2, $3, $4, $5, $6, $7
+        WHERE NOT EXISTS (SELECT 1 FROM hunt_claims WHERE character_id::text = $2::text)
+      `, [row.user_id, row.character_id, row.name, row.series, row.image_url, row.rarity, row.claimed_at]);
+      pgHuntClaimQueue.delete(key);
+      pgWritesOk++;
+      pgLastWriteAt = Date.now();
+      written++;
+    } catch (e) {
+      // Keep the row queued. The 1-second mirror drain retries it while this
+      // primary instance is alive, instead of reporting a successful local
+      // claim that vanishes on the next Render deploy.
+      pgWritesFailed++;
+      pgLastError = e;
+      console.warn(`[db] hunt_claims durable write retry pending for ${key}:`, e.message);
+    }
+  }
+  return written;
+}
+
 async function drainMirrorQueue() {
   if (!pgReady || !pgWritable || !pgLockHeld || !syncEnabled || !pgPool) return;
   if (pgMirrorRunning) return;
   pgMirrorRunning = true;
   try {
+    await drainHuntClaimQueue();
     while (pgMirrorQueue.length > 0) {
       const item = pgMirrorQueue.shift();
       const cols = TABLE_COLS[item.table];
@@ -2033,7 +2108,7 @@ module.exports = {
   // Postgres + hydration
   syncInfo, initPg, ensurePgTables, acquireInstanceLock, releaseInstanceLock,
   startMirrorLoop, startRecoveryLoop, queuePgWrite, drainMirrorQueue,
-  fullMirror, mirrorTable, hydrateFromPg, initPersistence,
+  fullMirror, mirrorTable, hydrateFromPg, initPersistence, drainHuntClaimQueue,
   setSyncEnabled, isSyncEnabled,
   // Close
   close,

@@ -968,14 +968,20 @@ const AP_REJECT_TAGS = new Set([
   '2boys', '3boys', '4boys', '5boys', '6+boys', 'multiple boys', 'group',
   'character sheet', 'reference sheet', 'model sheet', 'multiple views', 'collage',
 ]);
+// Composition is deliberately weighted more heavily than popularity for Cards.
+// A highly-rated giant-eye crop is still worse T5/T6 material than a clean
+// solo upper/full-body illustration. The final `quality` score below is what
+// maps the six strongest artworks low→high across T1→T6.
 const AP_PREFERRED_TAGS = new Map([
-  ['upper body', 1500], ['full body', 1400], ['portrait', 1050], ['cowboy shot', 900],
-  ['solo', 500], ['simple background', 350], ['looking at viewer', 250], ['highres', 180], ['tall image', 120],
+  ['upper body', 2300], ['full body', 2200], ['cowboy shot', 1900], ['portrait', 1500],
+  ['solo', 650], ['tall image', 420], ['simple background', 260],
+  ['looking at viewer', 180], ['highres', 220],
 ]);
 const AP_COMPOSITION_PENALTIES = new Map([
-  ['close-up', 1800], ['close up', 1800], ['extreme close-up', 2600], ['extreme close up', 2600],
-  ['face', 650], ['eyes', 1500], ['eye', 1500], ['cropped', 500], ['headshot', 300],
-  ['manga', 350], ['monochrome', 250],
+  ['extreme close-up', 4200], ['extreme close up', 4200],
+  ['close-up', 3000], ['close up', 3000], ['eyes', 3300], ['eye', 3300],
+  ['face', 1100], ['cropped', 1200], ['headshot', 700],
+  ['manga', 700], ['monochrome', 300],
 ]);
 
 function animePicturesCandidateFromDetails(searchPost, details, targetTag) {
@@ -1001,23 +1007,31 @@ function animePicturesCandidateFromDetails(searchPost, details, targetTag) {
 
   const imageUrl = animePicturesPreviewUrl(post) || animePicturesPreviewUrl(searchPost);
   if (!imageUrl) return null;
-  let quality = Number(post.score_number || searchPost.score_number || 0) * 1000;
+  const rating = Number(post.score_number || searchPost.score_number || 0);
   const width = Number(post.width || searchPost.width || 0);
   const height = Number(post.height || searchPost.height || 0);
+  let composition = 0;
+  let technical = Math.max(0, rating) * 320;
+
+  for (const [tag, bonus] of AP_PREFERRED_TAGS) if (names.has(tag)) composition += bonus;
+  for (const [tag, penalty] of AP_COMPOSITION_PENALTIES) if (names.has(tag)) composition -= penalty;
+
   if (width && height) {
-    quality += Math.min(900, (width * height) / 12000);
-    const ratio = height / width;
-    if (ratio >= 1.05 && ratio <= 2.15) quality += 450;
-  }
-  for (const [tag, bonus] of AP_PREFERRED_TAGS) if (names.has(tag)) quality += bonus;
-  for (const [tag, penalty] of AP_COMPOSITION_PENALTIES) if (names.has(tag)) quality -= penalty;
-  // Landscape and near-square pieces generally fit the Gen 2 artwork window
-  // more naturally; very wide strips are often banners/panels and get pushed down.
-  if (width && height) {
+    const megapixels = (width * height) / 1_000_000;
+    technical += Math.min(1400, megapixels * 240);
     const wh = width / height;
-    if (wh >= 0.72 && wh <= 1.45) quality += 500;
-    if (wh > 2.2 || wh < 0.38) quality -= 850;
+    const hw = height / width;
+    // Portrait/full-body and balanced square art are strongest for the Gen 2
+    // contain renderer. Wide banners and needle-thin strips are poor cards.
+    if (wh >= 0.52 && wh <= 1.25) composition += 900;
+    else if (wh > 1.25 && wh <= 1.65) composition += 300;
+    if (hw >= 1.15 && hw <= 2.05) composition += 700;
+    if (wh > 2.0 || wh < 0.34) composition -= 1500;
   }
+
+  // Composition dominates. Rating/resolution break ties and reward genuinely
+  // premium artwork without allowing popularity to promote a bad crop to T6.
+  const quality = composition * 2 + technical;
 
   return {
     provider: 'AnimePictures',
@@ -1028,6 +1042,8 @@ function animePicturesCandidateFromDetails(searchPost, details, targetTag) {
     width,
     height,
     quality,
+    composition_score: composition,
+    technical_score: technical,
     tags: [...names],
     query_tag: targetTag.tag,
     exact_tag: true,
@@ -1052,8 +1068,9 @@ async function buildAnimePicturesArtworkPool(card) {
     return [];
   }
 
-  // Rating-sorted results are inspected until six clean solo identity matches
-  // are found. A few extras are kept so a dead preview URL can be skipped.
+  // Inspect a bounded set of high-rated identity matches, then let the explicit
+  // composition score decide which artworks deserve the premium T4-T6 slots.
+  // A few extras are kept so a dead preview URL can be skipped.
   const ordered = posts.slice().sort((a, b) => {
     const score = Number(b.score_number || 0) - Number(a.score_number || 0);
     return score || (Number(b.id || 0) - Number(a.id || 0));
@@ -1108,7 +1125,7 @@ async function selectAnimePicturesArtwork(identity, opts = {}) {
     }
     return null;
   }
-  console.log(`[${opts.context || 'cards'}] ${merged.name}: Anime-Pictures post=${candidate.post_id} tier=T${candidate.tier_slot} pool=${candidate.pool_size}`);
+  console.log(`[${opts.context || 'cards'}] ${merged.name}: Anime-Pictures post=${candidate.post_id} tier=T${candidate.tier_slot} pool=${candidate.pool_size} composition=${Math.round(candidate.composition_score || 0)} quality=${Math.round(candidate.quality || 0)}`);
   return {
     ...merged,
     image_url: displayUrl,
