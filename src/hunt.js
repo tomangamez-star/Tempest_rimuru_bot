@@ -23,6 +23,62 @@ const RARITY_TIERS = [
   { key: 'common', emoji: '⚪', label: 'COMMON', min: 0 },
 ];
 
+// Spawn rarity is intentionally rolled first, then Rimuru selects a character
+// whose AniList favourites fit that tier. This avoids the old behaviour where
+// a uniformly-random popularity page made T2 dominate almost every /hunt.
+const HUNT_TIER_TARGETS = [
+  { tier: 6, label: 'GODLIKE',  weight: 3,  min: 80000, max: Infinity, pageMin: 1,  pageMax: 1 },
+  { tier: 5, label: 'ULTIMATE', weight: 7,  min: 50000, max: 79999,    pageMin: 1,  pageMax: 2 },
+  { tier: 4, label: 'LEGACY',   weight: 12, min: 20000, max: 49999,    pageMin: 1,  pageMax: 5 },
+  { tier: 3, label: 'MYTHICAL', weight: 22, min: 5000,  max: 19999,    pageMin: 2,  pageMax: 18 },
+  { tier: 2, label: 'RARE',     weight: 30, min: 500,   max: 4999,     pageMin: 6,  pageMax: 55 },
+  { tier: 1, label: 'COMMON',   weight: 26, min: 0,     max: 499,      pageMin: 35, pageMax: 60 },
+];
+
+function huntTierFromFavorites(favorites) {
+  const f = Math.max(0, Number(favorites) || 0);
+  return HUNT_TIER_TARGETS.find((t) => f >= t.min && f <= t.max) || HUNT_TIER_TARGETS[HUNT_TIER_TARGETS.length - 1];
+}
+
+function rollHuntSpawnTier(rng = Math.random) {
+  const total = HUNT_TIER_TARGETS.reduce((sum, t) => sum + t.weight, 0);
+  let roll = Math.max(0, Math.min(0.999999999, Number(rng()) || 0)) * total;
+  for (const target of HUNT_TIER_TARGETS) {
+    if (roll < target.weight) return target;
+    roll -= target.weight;
+  }
+  return HUNT_TIER_TARGETS[HUNT_TIER_TARGETS.length - 1];
+}
+
+function randomIntInclusive(min, max) {
+  const lo = Math.ceil(Number(min) || 0);
+  const hi = Math.floor(Number(max) || lo);
+  return lo + Math.floor(Math.random() * Math.max(1, hi - lo + 1));
+}
+
+// /shunt uses a smaller premium catalogue. Zerochan still has to prove at
+// runtime that the chosen real character has at least six strict portraits.
+const SPECIAL_CHARACTER_CATALOG = [
+  'Satoru Gojo', 'Makima', 'Power', 'Denji', 'Aki Hayakawa',
+  'Rimuru Tempest', 'Sung Jin-Woo', 'Tanjiro Kamado', 'Nezuko Kamado', 'Kyojuro Rengoku',
+  'Giyu Tomioka', 'Mitsuri Kanroji', 'Shinobu Kocho', 'Muichiro Tokito', 'Tengen Uzui',
+  'Naruto Uzumaki', 'Sasuke Uchiha', 'Kakashi Hatake', 'Itachi Uchiha', 'Hinata Hyuga',
+  'Monkey D. Luffy', 'Roronoa Zoro', 'Nami', 'Nico Robin', 'Boa Hancock',
+  'Levi Ackerman', 'Mikasa Ackerman', 'Eren Yeager', 'Historia Reiss',
+  'Ichigo Kurosaki', 'Rukia Kuchiki', 'Sosuke Aizen',
+  'Kirito', 'Asuna Yuuki', 'Sinon',
+  'Rem', 'Ram', 'Emilia',
+  'Zero Two', 'Marin Kitagawa', 'Ai Hoshino', 'Aqua Hoshino',
+  'Megumin', 'Frieren', 'Fern', 'Violet Evergarden',
+  'Yor Forger', 'Loid Forger', 'Anya Forger',
+  'Momo Ayase', 'Ken Takakura',
+  'Ryomen Sukuna', 'Yuji Itadori', 'Megumi Fushiguro', 'Nobara Kugisaki',
+  'Toji Fushiguro', 'Yuta Okkotsu',
+  'Shoto Todoroki', 'Katsuki Bakugo', 'Izuku Midoriya',
+  'Kurisu Makise', 'Holo', 'Mai Sakurajima', 'Miku Nakano',
+];
+const SPECIAL_MIN_ARTWORKS = 6;
+
 const BOLD_UPPER = Array.from('𝐀𝐁𝐂𝐃𝐄𝐅𝐆𝐇𝐈𝐉𝐊𝐋𝐌𝐍𝐎𝐏𝐐𝐑𝐒𝐓𝐔𝐕𝐖𝐗𝐘𝐙');
 const BOLD_LOWER = Array.from('𝐚𝐛𝐜𝐝𝐞𝐟𝐠𝐡𝐢𝐣𝐤𝐥𝐦𝐧𝐨𝐩𝐪𝐫𝐬𝐭𝐮𝐯𝐰𝐱𝐲𝐳');
 const BOLD_NUM = Array.from('𝟎𝟏𝟐𝟑𝟒𝟓𝟔𝟕𝟖𝟗');
@@ -346,20 +402,37 @@ async function fetchAniListById(id) {
   });
   return json && json.data && json.data.Character ? normalizeAniList(json.data.Character) : null;
 }
-async function fetchRandomFromAniList() {
-  const page = 1 + Math.floor(Math.random() * 120);
-  const gql = `query ($page: Int) { Page(page: $page, perPage: 25) { characters(sort: FAVOURITES_DESC) { id gender name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } } }`;
-  const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ query: gql, variables: { page } }), label: 'AniList random',
-  });
-  const rows = json && json.data && json.data.Page && Array.isArray(json.data.Page.characters) ? json.data.Page.characters : [];
-  if (!rows.length) return null;
-  const shuffled = rows.slice().sort(() => Math.random() - 0.5);
-  for (const raw of shuffled) {
-    const card = normalizeAniList(raw);
-    if (card && !db.isHuntCharacterClaimed(card.character_id)) return card;
+async function fetchRandomFromAniList(targetTier = null) {
+  const target = targetTier && Number(targetTier.tier)
+    ? targetTier
+    : HUNT_TIER_TARGETS.find((x) => x.tier === Number(targetTier)) || rollHuntSpawnTier();
+
+  const gql = `query ($page: Int) { Page(page: $page, perPage: 50) { characters(sort: FAVOURITES_DESC) { id gender name { full userPreferred native alternative } image { large medium } description(asHtml: false) favourites media(perPage: 8, sort: POPULARITY_DESC) { nodes { title { romaji english native } } } } } }`;
+
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const page = randomIntInclusive(target.pageMin, target.pageMax);
+    const json = await fetchJson(ANILIST_URL, config.hunt.fetchTimeoutMs || 10000, 2, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ query: gql, variables: { page } }), label: `AniList T${target.tier} spawn`,
+    });
+    const rows = json && json.data && json.data.Page && Array.isArray(json.data.Page.characters) ? json.data.Page.characters : [];
+    if (!rows.length) continue;
+
+    const candidates = rows
+      .map(normalizeAniList)
+      .filter(Boolean)
+      .filter((card) => !db.isHuntCharacterClaimed(card.character_id))
+      .filter((card) => huntTierFromFavorites(card.favorites).tier === target.tier)
+      .sort(() => Math.random() - 0.5);
+
+    if (candidates.length) {
+      const picked = candidates[0];
+      console.log(`[cards] rolled T${target.tier} ${target.label}; selected ${picked.name} (${Number(picked.favorites) || 0} AniList favourites)`);
+      return picked;
+    }
   }
+
+  console.warn(`[cards] no unclaimed AniList character found inside rolled T${target.tier} band this attempt.`);
   return null;
 }
 
@@ -1341,6 +1414,11 @@ async function selectZerochanSpecialArtwork(identity, opts = {}) {
   if (!identity) return null;
   const merged = { ...identity };
   const pool = await buildZerochanArtworkPool(merged);
+  const minPool = Math.max(1, Number(opts.minPool) || 1);
+  if (pool.length < minPool) {
+    console.warn(`[${opts.context || 'special-cards'}] ${merged.name}: premium pool rejected (${pool.length}/${minPool} required).`);
+    return null;
+  }
   const candidate = zerochanArtworkForTier(merged, pool);
   if (!candidate) return null;
   const imageUrl = candidate.file_url || candidate.sample_url;
@@ -1364,28 +1442,42 @@ async function chooseSpecialCharacter(seed) {
   if (!identity || db.isHuntCharacterClaimed(identity.character_id)) return null;
   const merged = mergeMetadata(identity, [seed]);
   merged.reference_image_url = identity.reference_image_url || identity.image_url;
-  try { return await selectZerochanSpecialArtwork(merged, { context: 'special-cards' }); }
-  catch (e) {
+  try {
+    return await selectZerochanSpecialArtwork(merged, {
+      context: 'special-cards',
+      minPool: SPECIAL_MIN_ARTWORKS,
+    });
+  } catch (e) {
     console.warn(`[special-cards] ${merged.name}: Zerochan artwork lookup failed: ${e.message}`);
     return null;
   }
 }
 
 async function fetchSpecialSpawnCharacter() {
-  // Special Hunt is allowed to skip identities with weak Zerochan coverage.
-  // This keeps the premium command premium instead of silently falling back to
-  // normal /hunt artwork.
-  for (let attempt = 0; attempt < 8; attempt++) {
-    const seed = await fetchRandomFromAniList();
-    if (!seed) continue;
-    const card = await chooseSpecialCharacter(seed);
+  // v1.0.16: start from characters that are intentionally suitable for a
+  // premium collection, then let Zerochan prove six-image coverage. This is the
+  // inverse of the old random-AniList-first flow that frequently produced none.
+  const names = SPECIAL_CHARACTER_CATALOG.slice().sort(() => Math.random() - 0.5);
+  for (const name of names.slice(0, 14)) {
+    const card = await chooseSpecialCharacter({ name, source: 'SpecialCatalog' });
+    if (card) {
+      console.log(`[special-cards] premium catalog hit: ${card.name} pool=${Number(card.artwork_pool_size) || 0}`);
+      return card;
+    }
+  }
+
+  // Secondary path: previously cached modern identities are allowed only when
+  // they pass the same six-image Zerochan gate.
+  const cached = db.getHuntPool(120)
+    .filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id))
+    .sort(() => Math.random() - 0.5)
+    .slice(0, 10);
+  for (const row of cached) {
+    const card = await chooseSpecialCharacter({ ...row, source: 'AniList', reference_image_url: row.image_url });
     if (card) return card;
   }
-  const pool = db.getHuntPool(60).filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id));
-  for (const cached of pool.sort(() => Math.random() - 0.5).slice(0, 12)) {
-    const card = await chooseSpecialCharacter({ ...cached, source: 'AniList', reference_image_url: cached.image_url });
-    if (card) return card;
-  }
+
+  console.warn('[special-cards] no premium six-image Zerochan character available after catalog + cache attempts.');
   return null;
 }
 
@@ -1477,23 +1569,26 @@ async function chooseBestCharacter(seed) {
 }
 
 async function fetchSpawnCharacter() {
+  const target = rollHuntSpawnTier();
+
   for (let attempt = 0; attempt < 5; attempt++) {
-    const seed = await fetchRandomFromAniList();
+    const seed = await fetchRandomFromAniList(target);
     if (!seed) continue;
     const card = await chooseBestCharacter(seed);
     if (card) { db.cacheHuntCharacter(card); return card; }
   }
 
-  // Only re-use modern AniList identities from cache; do not resurrect old
-  // Jikan/Kitsu cache entries from previous builds.
-  const pool = db.getHuntPool(50).filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id));
-  for (const cached of pool.sort(() => Math.random() - 0.5).slice(0, 8)) {
+  // Preserve the rolled tier if live lookup has to use cache.
+  const pool = db.getHuntPool(220)
+    .filter((c) => String(c.character_id || '').startsWith('anilist-'))
+    .filter((c) => !db.isHuntCharacterClaimed(c.character_id))
+    .filter((c) => huntTierFromFavorites(c.favorites).tier === target.tier);
+  for (const cached of pool.sort(() => Math.random() - 0.5).slice(0, 10)) {
     const card = await chooseBestCharacter({ ...cached, source: 'AniList', reference_image_url: cached.image_url });
     if (card) { db.cacheHuntCharacter(card); return card; }
   }
 
-  // Last-resort emergency pool keeps /hunt alive when every live identity source
-  // is unavailable. These portraits are still wrapped by the generated card.
+  console.warn(`[cards] rolled T${target.tier} could not be fulfilled; using emergency fallback.`);
   const fallback = pickFallbackCharacter();
   if (fallback) { db.cacheHuntCharacter(fallback); return fallback; }
   console.warn('[cards] no unclaimed character source is currently available.');
@@ -1768,13 +1863,13 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.15] /hunt=Gen2 Anime-Pictures; /shunt=OldGen Zerochan strict portrait; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
+  console.log(`[cards-v1.0.16] /hunt=Gen2 Anime-Pictures; /shunt=OldGen Zerochan strict portrait; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
 
 module.exports = {
-  RARITY_TIERS, rarityFor, rarityMeta, cardTierMeta, isSpawnClaimable, secondsRemaining, seriesNameOf,
+  RARITY_TIERS, HUNT_TIER_TARGETS, SPECIAL_CHARACTER_CATALOG, SPECIAL_MIN_ARTWORKS, rarityFor, rarityMeta, cardTierMeta, huntTierFromFavorites, rollHuntSpawnTier, isSpawnClaimable, secondsRemaining, seriesNameOf,
   animeListOf, truncateBio, announceCaption, claimedCaption, detailCaption, collectionCaption,
   leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
   fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
