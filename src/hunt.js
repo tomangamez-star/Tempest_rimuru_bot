@@ -3,9 +3,11 @@
 const config = require('./config');
 const db = require('./db');
 const cardRenderer = require('./hunt-card');
+const specialCardRenderer = require('./special-hunt-card');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const ANIME_PICTURES_API_URL = 'https://api.anime-pictures.net/api/v3';
+const ZEROCHAN_BASE_URL = 'https://www.zerochan.net';
 const GELBOORU_API_URL = 'https://gelbooru.com/index.php';
 const SAFEBOORU_API_URL = 'https://safebooru.org/index.php';
 const DANBOORU_SAFE_URL = 'https://safebooru.donmai.us';
@@ -106,7 +108,15 @@ function animeListOf(char) {
   return anime.slice(0, 5).map((a) => stripUrls(a.anime && (a.anime.title || a.anime.name) || '')).filter(Boolean).join(', ');
 }
 
-function cardTierMeta(card) { return cardRenderer.tierFor(card); }
+function storedSpecialTier(card) {
+  const m = String(card && card.image_url || '').match(/#jtf-oldgen-t([1-6])$/i);
+  return m ? Number(m[1]) : 0;
+}
+function withStoredSpecialTier(card) {
+  const tier = storedSpecialTier(card);
+  return tier && card && !Number(card.forced_tier) ? { ...card, forced_tier: tier } : card;
+}
+function cardTierMeta(card) { return cardRenderer.tierFor(withStoredSpecialTier(card)); }
 
 function announceCaption(card, spawn) {
   const tier = cardTierMeta(card);
@@ -129,6 +139,24 @@ function announceCaption(card, spawn) {
     `        ⏱️ ${fancy(String(secs))}𝐬 𝐑𝐄𝐌𝐀𝐈𝐍𝐈𝐍𝐆`,
     '           ⚡ 𝐅𝐢𝐫𝐬𝐭 𝐜𝐥𝐚𝐢𝐦 𝐰𝐢𝐧𝐬!',
   );
+  return lines.join('\n').slice(0, 1024);
+}
+
+function specialAnnounceCaption(card, spawn) {
+  const tier = cardTierMeta(card);
+  const secs = secondsRemaining(spawn);
+  const series = seriesNameOf(card);
+  const lines = [
+    '╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮',
+    '        ✦  𝐒𝐏𝐄𝐂𝐈𝐀𝐋 𝐇𝐔𝐍𝐓  ✦',
+    '╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯',
+    '',
+    '       🔥 𝐀𝐍 𝐎𝐋𝐃 𝐆𝐄𝐍 𝐂𝐀𝐑𝐃 𝐇𝐀𝐒 𝐀𝐏𝐏𝐄𝐀𝐑𝐄𝐃!',
+    '',
+    `              👤 ${fancy(stripUrls(card.name || 'Unknown'))}`,
+  ];
+  if (series) lines.push(`              🎬 ${fancy(series)}`);
+  lines.push('', `          ✦ 『 ${fancy(`T${tier.tier} ${tier.label}`)} 』`, '', `        ⏱️ ${fancy(String(secs))}𝐬 𝐑𝐄𝐌𝐀𝐈𝐍𝐈𝐍𝐆`, '           ⚡ 𝐅𝐢𝐫𝐬𝐭 𝐜𝐥𝐚𝐢𝐦 𝐰𝐢𝐧𝐬!');
   return lines.join('\n').slice(0, 1024);
 }
 function claimedCaption(char, claimerName) {
@@ -1137,6 +1165,230 @@ async function selectAnimePicturesArtwork(identity, opts = {}) {
   };
 }
 
+
+// ===================== ZEROCHAN SPECIAL-HUNT ARTWORK =====================
+// /shunt is deliberately separate from normal /hunt. Normal Cards keep the
+// proven Anime-Pictures + Gen 2 pipeline; Special Hunt uses Zerochan strict
+// primary-character portrait results and the Old Gen renderer.
+const zerochanPoolCache = new Map();
+let zerochanRequestChain = Promise.resolve();
+let zerochanLastRequestAt = 0;
+let zerochanAnonymousWarned = false;
+const ZEROCHAN_MIN_GAP_MS = 1150; // comfortably below the documented 60/min.
+const ZEROCHAN_CACHE_MS = 6 * 60 * 60 * 1000;
+const ZEROCHAN_EMPTY_CACHE_MS = 10 * 60 * 1000;
+
+function zerochanUserAgent() {
+  const username = String(process.env.ZEROCHAN_USERNAME || '').trim();
+  if (username) return `RimuruTempestCasino/1.0 - ${username}`;
+  if (!zerochanAnonymousWarned) {
+    zerochanAnonymousWarned = true;
+    console.warn('[special-cards] ZEROCHAN_USERNAME is not set. Zerochan documents a project+username User-Agent; anonymous requests may be rejected.');
+  }
+  return `${config.hunt.userAgent || 'RimuruTempestCasino/1.0'} - anonymous`;
+}
+
+async function zerochanJson(url, label, retries = 1) {
+  const task = async () => {
+    const wait = Math.max(0, ZEROCHAN_MIN_GAP_MS - (Date.now() - zerochanLastRequestAt));
+    if (wait) await sleep(wait);
+    zerochanLastRequestAt = Date.now();
+    return fetchJson(url, Math.max(12000, config.hunt.fetchTimeoutMs || 10000), retries, {
+      label: label || 'Zerochan',
+      headers: { 'User-Agent': zerochanUserAgent() },
+    });
+  };
+  const run = zerochanRequestChain.then(task, task);
+  zerochanRequestChain = run.catch(() => null);
+  return run;
+}
+
+function zerochanNameVariants(card) {
+  const out = [];
+  const push = (v) => {
+    const x = stripUrls(v || '').replace(/\s+/g, ' ').trim();
+    if (!x || x.length > 80) return;
+    if (!out.some((y) => y.toLowerCase() === x.toLowerCase())) out.push(x);
+    const parts = x.split(' ');
+    if (parts.length >= 2 && parts.length <= 3) {
+      const swapped = `${parts.slice(1).join(' ')} ${parts[0]}`.trim();
+      if (!out.some((y) => y.toLowerCase() === swapped.toLowerCase())) out.push(swapped);
+    }
+  };
+  push(card && card.name);
+  for (const alias of Array.isArray(card && card.aliases) ? card.aliases : []) push(alias);
+  return out.slice(0, 6);
+}
+
+function normalizeZerochanItems(json) {
+  if (Array.isArray(json)) return json;
+  if (json && Array.isArray(json.items)) return json.items;
+  return [];
+}
+
+function zerochanArtworkQuality(item) {
+  const width = Number(item && item.width) || 0;
+  const height = Number(item && item.height) || 0;
+  const fav = Number(item && item.fav) || 0;
+  const tags = new Set((Array.isArray(item && item.tags) ? item.tags : []).map((x) => String(x || '').toLowerCase()));
+  let score = Math.min(7000, Math.max(0, fav) * 32);
+  if (width && height) {
+    const mp = (width * height) / 1_000_000;
+    score += Math.min(5000, mp * 750);
+    const ratio = width / height;
+    const cardRatio = 604 / 810;
+    const distance = Math.abs(ratio - cardRatio);
+    score += Math.max(0, 4200 - distance * 9000);
+    if (height > width) score += 1800;
+    if (width >= 1200 && height >= 1600) score += 1200;
+    if (ratio < 0.42 || ratio > 1.05) score -= 4500;
+  }
+  const bonuses = new Map([
+    ['official art', 4800], ['key visual', 3600], ['official wallpaper', 2800],
+    ['full body', 2600], ['long image', 1400], ['solo', 900], ['high resolution', 900],
+  ]);
+  const penalties = new Map([
+    ['manga', 2600], ['comic', 2600], ['monochrome', 1900], ['sketch', 1700],
+    ['scan', 1200], ['screenshot', 3400], ['character sheet', 4200], ['reference sheet', 4200],
+    ['multiple characters', 5000], ['group', 5000], ['couple', 4200],
+  ]);
+  for (const [tag, n] of bonuses) if (tags.has(tag)) score += n;
+  for (const [tag, n] of penalties) if (tags.has(tag)) score -= n;
+  return score;
+}
+
+function zerochanCandidate(item, searchedName) {
+  if (!item || typeof item !== 'object') return null;
+  const id = Number(item.id) || 0;
+  const width = Number(item.width) || 0;
+  const height = Number(item.height) || 0;
+  const primary = String(item.primary || '').trim();
+  const tags = Array.isArray(item.tags) ? item.tags.map((x) => String(x || '').trim()).filter(Boolean) : [];
+  const target = String(searchedName || '').trim().toLowerCase();
+  // Strict mode should already guarantee this, but re-check the API payload so
+  // a tag/redirect oddity cannot turn a Special card into the wrong character.
+  if (primary && target && primary.toLowerCase() !== target) return null;
+  if (!id || !width || !height || height <= width) return null;
+  if (width < 600 || height < 800) return null;
+  const lowered = new Set(tags.map((t) => t.toLowerCase()));
+  for (const bad of ['group', 'couple', 'multiple characters', 'character sheet', 'reference sheet']) if (lowered.has(bad)) return null;
+  const imageUrl = String(item.full || item.medium || '').trim();
+  if (!/^https:\/\//i.test(imageUrl)) return null;
+  return {
+    provider: 'Zerochan',
+    post_id: id,
+    file_url: imageUrl,
+    sample_url: String(item.medium || item.full || '').trim(),
+    width,
+    height,
+    score: Number(item.fav) || 0,
+    quality: zerochanArtworkQuality(item),
+    tags,
+    primary,
+    searched_name: searchedName,
+    source_url: String(item.source || '').trim(),
+  };
+}
+
+async function searchZerochanStrictPortrait(name) {
+  const path = encodeURIComponent(String(name || '').trim()).replace(/%20/g, '+');
+  if (!path) return [];
+  const u = new URL(`${ZEROCHAN_BASE_URL}/${path}`);
+  u.searchParams.set('json', '1');
+  u.searchParams.set('strict', '1');
+  u.searchParams.set('p', '1');
+  u.searchParams.set('l', '42');
+  u.searchParams.set('s', 'fav');
+  u.searchParams.set('t', '0');
+  u.searchParams.set('d', 'portrait');
+  const json = await zerochanJson(u.toString(), `Zerochan ${name}`, 1);
+  return normalizeZerochanItems(json);
+}
+
+async function buildZerochanArtworkPool(card) {
+  const key = String(card && (card.character_id || card.name) || '').toLowerCase();
+  const cached = zerochanPoolCache.get(key);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const variants = zerochanNameVariants(card);
+  let approved = [];
+  let matchedVariant = '';
+  for (const name of variants) {
+    const rows = await searchZerochanStrictPortrait(name);
+    if (!rows.length) continue;
+    const candidates = rows.map((x) => zerochanCandidate(x, name)).filter(Boolean);
+    if (!candidates.length) continue;
+    approved = candidates;
+    matchedVariant = name;
+    break;
+  }
+  approved.sort((a, b) => (Number(b.quality) - Number(a.quality)) || (Number(b.score) - Number(a.score)) || (Number(b.post_id) - Number(a.post_id)));
+  const value = approved.slice(0, 18);
+  zerochanPoolCache.set(key, { value, matchedVariant, expiresAt: Date.now() + (value.length ? ZEROCHAN_CACHE_MS : ZEROCHAN_EMPTY_CACHE_MS) });
+  console.log(`[special-cards] ${card && card.name}: Zerochan approved=${value.length} strict=${matchedVariant || 'none'}`);
+  return value;
+}
+
+function zerochanArtworkForTier(card, pool) {
+  if (!Array.isArray(pool) || !pool.length) return null;
+  const tier = Math.max(1, Math.min(6, Number(cardTierMeta(card).tier) || 1));
+  const six = pool.slice(0, 6).sort((a, b) => (Number(a.quality) - Number(b.quality)) || (Number(a.post_id) - Number(b.post_id)));
+  const index = six.length === 1 ? 0 : Math.round(((tier - 1) / 5) * (six.length - 1));
+  return { ...six[index], tier_slot: tier, pool_size: six.length };
+}
+
+async function selectZerochanSpecialArtwork(identity, opts = {}) {
+  if (!identity) return null;
+  const merged = { ...identity };
+  const pool = await buildZerochanArtworkPool(merged);
+  const candidate = zerochanArtworkForTier(merged, pool);
+  if (!candidate) return null;
+  const imageUrl = candidate.file_url || candidate.sample_url;
+  if (!imageUrl) return null;
+  console.log(`[${opts.context || 'special-cards'}] ${merged.name}: Zerochan post=${candidate.post_id} tier=T${candidate.tier_slot} pool=${candidate.pool_size} quality=${Math.round(candidate.quality || 0)}`);
+  return {
+    ...merged,
+    image_url: `${imageUrl}#jtf-oldgen-t${candidate.tier_slot}`,
+    image_source: `Zerochan:T${candidate.tier_slot}`,
+    zerochan_post_id: candidate.post_id,
+    zerochan_primary: candidate.primary,
+    zerochan_source_url: candidate.source_url,
+    artwork_pool_size: candidate.pool_size,
+    special_card_style: 'old-gen',
+  };
+}
+
+async function chooseSpecialCharacter(seed) {
+  if (!seed) return null;
+  const identity = seed.source === 'AniList' ? seed : await searchAniListCharacter(seed.name || '');
+  if (!identity || db.isHuntCharacterClaimed(identity.character_id)) return null;
+  const merged = mergeMetadata(identity, [seed]);
+  merged.reference_image_url = identity.reference_image_url || identity.image_url;
+  try { return await selectZerochanSpecialArtwork(merged, { context: 'special-cards' }); }
+  catch (e) {
+    console.warn(`[special-cards] ${merged.name}: Zerochan artwork lookup failed: ${e.message}`);
+    return null;
+  }
+}
+
+async function fetchSpecialSpawnCharacter() {
+  // Special Hunt is allowed to skip identities with weak Zerochan coverage.
+  // This keeps the premium command premium instead of silently falling back to
+  // normal /hunt artwork.
+  for (let attempt = 0; attempt < 8; attempt++) {
+    const seed = await fetchRandomFromAniList();
+    if (!seed) continue;
+    const card = await chooseSpecialCharacter(seed);
+    if (card) return card;
+  }
+  const pool = db.getHuntPool(60).filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id));
+  for (const cached of pool.sort(() => Math.random() - 0.5).slice(0, 12)) {
+    const card = await chooseSpecialCharacter({ ...cached, source: 'AniList', reference_image_url: cached.image_url });
+    if (card) return card;
+  }
+  return null;
+}
+
 async function selectLegacyWaifuArtwork(identity, opts = {}) {
   if (!identity) return null;
   const merged = { ...identity };
@@ -1315,6 +1567,7 @@ async function renderCardBuffer(card, sourceBuffer) {
 }
 async function sendCardPhoto(chatId, card, caption, markup) {
   if (!deps || typeof deps.sendPhoto !== 'function' || !card) return null;
+  if (storedSpecialTier(card)) return sendSpecialCardPhoto(chatId, withStoredSpecialTier(card), caption, markup);
   const url = card.image_url;
   let downloaded = null;
   try {
@@ -1342,6 +1595,85 @@ async function sendCardPhoto(chatId, card, caption, markup) {
   return reply(chatId, caption, { title: '🃏 CARDS', reply_markup: markup, alwaysShowMarkup: true });
 }
 async function answerCb(text) { if (deps && typeof deps.answerCb === 'function') try { await deps.answerCb(text); } catch (_) {} }
+
+
+const renderedSpecialCardCache = new Map();
+function specialRenderedCardKey(card) {
+  const tier = cardTierMeta(card);
+  return `oldgen|${card && (card.character_id || card.id) || 'unknown'}|${card && card.image_url || ''}|T${tier.tier}`;
+}
+function cacheSpecialRenderedCard(key, buffer) {
+  if (!key || !Buffer.isBuffer(buffer)) return;
+  renderedSpecialCardCache.set(key, buffer);
+  while (renderedSpecialCardCache.size > 6) renderedSpecialCardCache.delete(renderedSpecialCardCache.keys().next().value);
+}
+async function fetchSpecialImageBuffer(url) {
+  url = String(url || '').replace(/#jtf-oldgen-t[1-6]$/i, '');
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), Math.max(12000, config.hunt.fetchTimeoutMs || 10000));
+  timer.unref && timer.unref();
+  try {
+    const res = await fetch(url, { headers: { Accept: 'image/*', 'User-Agent': zerochanUserAgent() }, signal: ac.signal });
+    if (!res.ok) throw new Error(`image HTTP ${res.status}`);
+    const type = String(res.headers.get('content-type') || 'image/jpeg').split(';')[0];
+    if (!type.startsWith('image/')) throw new Error(`not an image (${type})`);
+    const arr = await res.arrayBuffer();
+    if (arr.byteLength > 24_000_000) throw new Error('premium source image too large');
+    return { buffer: Buffer.from(arr), contentType: type };
+  } finally { clearTimeout(timer); }
+}
+async function renderSpecialCardBuffer(card, sourceBuffer) {
+  if (!card || !Buffer.isBuffer(sourceBuffer)) return null;
+  const key = specialRenderedCardKey(card);
+  if (renderedSpecialCardCache.has(key)) return renderedSpecialCardCache.get(key);
+  try {
+    const rendered = await specialCardRenderer.render(withStoredSpecialTier(card), sourceBuffer);
+    if (rendered && Buffer.isBuffer(rendered.buffer)) {
+      cacheSpecialRenderedCard(key, rendered.buffer);
+      return rendered.buffer;
+    }
+  } catch (e) { console.warn(`[special-cards] render failed for ${card.name || card.character_id}: ${e.message}`); }
+  return null;
+}
+async function sendSpecialCardPhoto(chatId, card, caption, markup) {
+  if (!deps || typeof deps.sendPhoto !== 'function' || !card) return null;
+  let downloaded = null;
+  try {
+    downloaded = await fetchSpecialImageBuffer(card.image_url);
+    const rendered = await renderSpecialCardBuffer(card, downloaded.buffer);
+    if (rendered) {
+      return await deps.sendPhoto(chatId, rendered, { caption, reply_markup: markup }, {
+        filename: `jtf-oldgen-${String(card.character_id || 'character').replace(/[^A-Za-z0-9_-]/g, '_')}.png`,
+        contentType: 'image/png',
+      });
+    }
+  } catch (e) { console.warn('[special-cards] generated photo:', e.message); }
+  // Presentation fallback only: if Sharp fails, still show the verified strict
+  // Zerochan source rather than substituting normal Hunt artwork.
+  if (downloaded && downloaded.buffer) {
+    try { return await deps.sendPhoto(chatId, downloaded.buffer, { caption, reply_markup: markup }, { filename: 'special-card-source.jpg', contentType: downloaded.contentType || 'image/jpeg' }); }
+    catch (e) { console.warn('[special-cards] source buffer photo:', e.message); }
+  }
+  return { ok: false };
+}
+
+async function spawnSpecial(opts = {}) {
+  if (!config.hunt.enabled) return { ok: false, message: 'Cards are disabled.' };
+  expireIfNeeded();
+  const existing = db.getActiveHunt();
+  if (isSpawnClaimable(existing)) return { ok: false, message: `✦ A card is already up for grabs (${secondsRemaining(existing)}s left).` };
+  if (existing) db.clearActiveHunt();
+  const card = await fetchSpecialSpawnCharacter();
+  if (!card) {
+    const hint = String(process.env.ZEROCHAN_USERNAME || '').trim() ? '' : ' Set ZEROCHAN_USERNAME in Render if Zerochan rejected anonymous access.';
+    return { ok: false, message: `✦ Rimuru could not prepare a premium Old Gen card right now.${hint}` };
+  }
+  const expiresAt = Date.now() + config.hunt.claimWindowMs;
+  db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
+  const row = db.getActiveHunt();
+  await sendSpecialCardPhoto(opts.chatId, card, specialAnnounceCaption(card, row), claimMarkup());
+  return { ok: true, character: card, expiresAt, style: 'old-gen' };
+}
 
 async function spawn(opts = {}) {
   if (!config.hunt.enabled) return { ok: false, message: 'Cards are disabled.' };
@@ -1436,7 +1768,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.13] /hunt kept; generated T1-T6 Cards enabled; artwork=Anime-Pictures solo character pool (6 tier slots) with identity emergency fallback; renderer=${cardRenderer.available() ? 'sharp' : 'source-fallback'}`);
+  console.log(`[cards-v1.0.15] /hunt=Gen2 Anime-Pictures; /shunt=OldGen Zerochan strict portrait; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -1447,7 +1779,7 @@ module.exports = {
   leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
   fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
   fetchJikanPictures, fetchRandomFromAniList, fetchAniListById, fetchSpawnCharacter, resolveCharacter,
-  attach, spawn, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state, sendCardPhoto, renderCardBuffer,
+  attach, spawn, spawnSpecial, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state, sendCardPhoto, sendSpecialCardPhoto, renderCardBuffer, renderSpecialCardBuffer,
   FALLBACK_POOL, fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
   normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork,
   searchSafebooruArtwork, searchDanbooruSafeArtwork, searchArtworkSources, selectArtworkForIdentity, verifyArtworkWithVision,
@@ -1455,5 +1787,6 @@ module.exports = {
   normalizeAnimePicturesUrl, animePicturesNameVariants, animePicturesTagScore, resolveAnimePicturesCharacterTag,
   searchAnimePicturesPosts, fetchAnimePicturesPostDetails, animePicturesCandidateFromDetails, buildAnimePicturesArtworkPool,
   animePicturesArtworkForTier, selectAnimePicturesArtwork, parseCharTierQuery,
+  zerochanNameVariants, normalizeZerochanItems, zerochanArtworkQuality, zerochanCandidate, searchZerochanStrictPortrait, buildZerochanArtworkPool, zerochanArtworkForTier, selectZerochanSpecialArtwork, chooseSpecialCharacter, fetchSpecialSpawnCharacter, specialAnnounceCaption,
   _clear: () => db.clearActiveHunt(),
 };
