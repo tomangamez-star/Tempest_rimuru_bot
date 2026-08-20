@@ -56,6 +56,8 @@ function escapeXml(value) {
 
 function tierFor(input) {
   const card = typeof input === 'object' && input ? input : { favorites: input };
+  const forcedTier = Math.max(0, Math.min(6, Number(card.forced_tier || card.preview_tier) || 0));
+  if (forcedTier) return CARD_TIERS.find((t) => t.tier === forcedTier) || CARD_TIERS[CARD_TIERS.length - 1];
   const favorites = Number(card.favorites) || 0;
   if (favorites > 0) return CARD_TIERS.find((t) => favorites >= t.min) || CARD_TIERS[CARD_TIERS.length - 1];
 
@@ -182,8 +184,9 @@ function buildOverlaySvg(card) {
     <!-- footer -->
     <path d="M82 823 H618 L600 846 H100 Z" fill="url(#accent)" opacity="0.92"/>
     <text x="350" y="842" text-anchor="middle" font-size="${seriesSize}" font-family="DejaVu Sans,Arial,sans-serif" font-weight="900" fill="#FFFFFF" stroke="#111" stroke-width="1" paint-order="stroke">${series}</text>
-    <text x="76" y="865" font-size="12" font-family="DejaVu Sans,Arial,sans-serif" font-weight="700" fill="#FFFFFF" opacity="0.78">#${id}</text>
-    <text x="624" y="865" text-anchor="end" font-size="12" font-family="DejaVu Sans,Arial,sans-serif" font-weight="900" fill="${tier.accent}">JTF CARDS</text>
+    <text x="76" y="869" font-size="12" font-family="DejaVu Sans,Arial,sans-serif" font-weight="700" fill="#FFFFFF" opacity="0.78">#${id}</text>
+    <rect x="505" y="850" width="127" height="27" rx="8" fill="#070A12" fill-opacity="0.86" stroke="${tier.accent}" stroke-width="1.8"/>
+    <text x="568" y="870" text-anchor="middle" font-size="17" font-family="DejaVu Sans,Arial,sans-serif" font-weight="900" letter-spacing="0.8" fill="#FFFFFF" stroke="${tier.accent2}" stroke-width="0.7" paint-order="stroke">JTF CARDS</text>
 
   </svg>`);
 }
@@ -207,10 +210,30 @@ async function render(card, imageBuffer) {
     .png()
     .toBuffer();
 
-  const hero = await sharp(imageBuffer)
+  // Preserve the actual character composition instead of forcing every source
+  // into a landscape cover crop (which used to turn portraits into giant eyes).
+  // A soft blurred copy fills any spare space while the real artwork is fitted
+  // intact on top.
+  const heroBackdrop = await sharp(imageBuffer)
     .rotate()
-    .resize(604, 490, { fit: 'cover', position: 'north' })
-    .composite([{ input: artMaskSvg(), blend: 'dest-in' }])
+    .resize(604, 490, { fit: 'cover', position: 'attention' })
+    .blur(16)
+    .modulate({ brightness: 0.62, saturation: 1.05 })
+    .png()
+    .toBuffer();
+
+  const heroForeground = await sharp(imageBuffer)
+    .rotate()
+    .resize(604, 490, { fit: 'contain', position: 'centre', background: { r: 0, g: 0, b: 0, alpha: 0 } })
+    .png()
+    .toBuffer();
+
+  const hero = await sharp({ create: { width: 604, height: 490, channels: 4, background: { r: 5, g: 7, b: 17, alpha: 1 } } })
+    .composite([
+      { input: heroBackdrop, left: 0, top: 0 },
+      { input: heroForeground, left: 0, top: 0 },
+      { input: artMaskSvg(), blend: 'dest-in' },
+    ])
     .png()
     .toBuffer();
 

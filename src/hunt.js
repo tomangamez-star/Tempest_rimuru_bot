@@ -969,8 +969,13 @@ const AP_REJECT_TAGS = new Set([
   'character sheet', 'reference sheet', 'model sheet', 'multiple views', 'collage',
 ]);
 const AP_PREFERRED_TAGS = new Map([
-  ['portrait', 900], ['upper body', 800], ['face', 650], ['full body', 600],
-  ['simple background', 350], ['looking at viewer', 250], ['highres', 180], ['tall image', 120],
+  ['upper body', 1500], ['full body', 1400], ['portrait', 1050], ['cowboy shot', 900],
+  ['solo', 500], ['simple background', 350], ['looking at viewer', 250], ['highres', 180], ['tall image', 120],
+]);
+const AP_COMPOSITION_PENALTIES = new Map([
+  ['close-up', 1800], ['close up', 1800], ['extreme close-up', 2600], ['extreme close up', 2600],
+  ['face', 650], ['eyes', 1500], ['eye', 1500], ['cropped', 500], ['headshot', 300],
+  ['manga', 350], ['monochrome', 250],
 ]);
 
 function animePicturesCandidateFromDetails(searchPost, details, targetTag) {
@@ -1005,6 +1010,14 @@ function animePicturesCandidateFromDetails(searchPost, details, targetTag) {
     if (ratio >= 1.05 && ratio <= 2.15) quality += 450;
   }
   for (const [tag, bonus] of AP_PREFERRED_TAGS) if (names.has(tag)) quality += bonus;
+  for (const [tag, penalty] of AP_COMPOSITION_PENALTIES) if (names.has(tag)) quality -= penalty;
+  // Landscape and near-square pieces generally fit the Gen 2 artwork window
+  // more naturally; very wide strips are often banners/panels and get pushed down.
+  if (width && height) {
+    const wh = width / height;
+    if (wh >= 0.72 && wh <= 1.45) quality += 500;
+    if (wh > 2.2 || wh < 0.38) quality -= 850;
+  }
 
   return {
     provider: 'AnimePictures',
@@ -1051,10 +1064,10 @@ async function buildAnimePicturesArtworkPool(card) {
     const candidate = animePicturesCandidateFromDetails(post, details, tag);
     if (!candidate) continue;
     approved.push(candidate);
-    if (approved.length >= 8) break;
+    if (approved.length >= 18) break;
   }
   approved.sort((a, b) => (Number(b.quality) - Number(a.quality)) || (Number(b.post_id) - Number(a.post_id)));
-  const value = approved.slice(0, 8);
+  const value = approved.slice(0, 12);
   animePicturesPoolCache.set(key, { value, expiresAt: Date.now() + (value.length ? ANIME_PICTURES_CACHE_MS : ANIME_PICTURES_EMPTY_CACHE_MS) });
   console.log(`[cards] ${card.name}: Anime-Pictures approved=${value.length}/${posts.length} tag=${tag.tag}`);
   return value;
@@ -1348,18 +1361,29 @@ function expireIfNeeded(now = Date.now()) {
   return 1;
 }
 
+function parseCharTierQuery(query) {
+  const raw = String(query || '').replace(/\s+/g, ' ').trim();
+  const match = raw.match(/(?:^|\s)t([1-6])$/i);
+  if (!match) return { name: raw, tier: 0 };
+  return { name: raw.slice(0, match.index).trim(), tier: Number(match[1]) };
+}
+
 async function searchAndShow(query, opts = {}) {
-  const q = String(query || '').trim();
-  if (!q) return { ok: false, message: 'Usage: /char <name>' };
+  const parsed = parseCharTierQuery(query);
+  const q = parsed.name;
+  if (!q) return { ok: false, message: 'Usage: /char <name> [t1-t6]' };
   const seed = await searchAniListCharacter(q);
   if (!seed) return { ok: false, message: `No character found for ${stripUrls(q)}.` };
   const merged = mergeMetadata(seed, []);
   merged.reference_image_url = seed.reference_image_url || seed.image_url;
-  const card = await selectArtworkForIdentity(merged, { context: 'cards-search' });
+  if (parsed.tier) merged.forced_tier = parsed.tier;
+  const card = await selectArtworkForIdentity(merged, { context: parsed.tier ? `cards-search-t${parsed.tier}` : 'cards-search' });
   if (!card) return { ok: false, message: `Found ${stripUrls(seed.name)}, but no usable image could be prepared.` };
-  db.cacheHuntCharacter(card);
+  // A tier preview is presentation-only. Do not overwrite the normal metadata
+  // cache with a forced T1-T6 artwork choice.
+  if (!parsed.tier) db.cacheHuntCharacter(card);
   await sendCardPhoto(opts.chatId, card, detailCaption(card), null);
-  return { ok: true, character: card };
+  return { ok: true, character: card, previewTier: parsed.tier || null };
 }
 
 async function autoSpawnTick(env = {}) {
@@ -1395,7 +1419,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.12] /hunt kept; generated T1-T6 Cards enabled; artwork=Anime-Pictures solo character pool (6 tier slots) with identity emergency fallback; renderer=${cardRenderer.available() ? 'sharp' : 'source-fallback'}`);
+  console.log(`[cards-v1.0.13] /hunt kept; generated T1-T6 Cards enabled; artwork=Anime-Pictures solo character pool (6 tier slots) with identity emergency fallback; renderer=${cardRenderer.available() ? 'sharp' : 'source-fallback'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -1413,6 +1437,6 @@ module.exports = {
   candidateHasExactCharacterTag, trustedArtworkRank,
   normalizeAnimePicturesUrl, animePicturesNameVariants, animePicturesTagScore, resolveAnimePicturesCharacterTag,
   searchAnimePicturesPosts, fetchAnimePicturesPostDetails, animePicturesCandidateFromDetails, buildAnimePicturesArtworkPool,
-  animePicturesArtworkForTier, selectAnimePicturesArtwork,
+  animePicturesArtworkForTier, selectAnimePicturesArtwork, parseCharTierQuery,
   _clear: () => db.clearActiveHunt(),
 };
