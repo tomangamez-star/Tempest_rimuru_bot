@@ -153,7 +153,7 @@ Tap a button below to explore — or just type a command. 👇`,{title:"🐉 RIM
 
 <b>🃏 Cards</b>
 • /hunt — spawn a Gen 2 collectible card (owner only)
-• /shunt — SPECIAL HUNT: Zerochan premium art + Old Gen card (owner only)
+• /shunt — SPECIAL HUNT: Danbooru premium art + Old Gen card (owner only)
 • /char [name] (alias /whois) — search a character and see their info (anyone)
 • /characters — your claimed cards (numbered)
 • /viewchar [number] (alias /vc) — view one claimed card by number

@@ -47,7 +47,7 @@ function epoch(value, fallback = 0) {
   if (value == null || value === '') return fallback;
   if (typeof value === 'number' && Number.isFinite(value)) return Math.trunc(value);
   const s = String(value).trim();
-  if (/^\d{10,16}$/.test(s)) return Number(s);
+  if (/^[+-]?\d{10,16}(?:\.0+)?$/.test(s)) return Math.trunc(Number(s));
   const parsed = Date.parse(s);
   return Number.isFinite(parsed) ? parsed : fallback;
 }
@@ -196,7 +196,12 @@ function restoreClaimSnapshots(snapshot) {
 
 async function syncClaimRow(table, row) {
   if (!row || !persistenceWritable() || !db.pgRun || !CLAIM_TABLES[table]) return false;
-  const values = CLAIM_COLS.map((c) => row[c] == null ? null : row[c]);
+  const values = CLAIM_COLS.map((c) => {
+    if (c === 'user_id') return Number(row[c]) || 0;
+    if (c === 'character_id') return String(row[c] == null ? '' : row[c]);
+    if (c === 'claimed_at') return epoch(row[c], Date.now()) || Date.now();
+    return row[c] == null ? null : row[c];
+  });
   const placeholders = CLAIM_COLS.map((_, i) => `$${i + 1}`).join(', ');
   // character_id is the durable identity. Postgres installs that never had a
   // local SQLite-style `id` column must work exactly the same as newer ones.
@@ -257,7 +262,7 @@ if (originalInitPersistence) {
     const claimsRestored = restoreClaimSnapshots(claimBefore);
     normalizeAllLocalUsers();
     if (restored) console.warn(`[persist-v1.0.3] preserved ${restored} newer local user row(s) after hydration`);
-    if (claimsRestored) console.warn(`[persist-collections-v1.0.9] preserved ${claimsRestored} local claim(s) after hydration`);
+    if (claimsRestored) console.warn(`[persist-collections-v1.0.10] preserved ${claimsRestored} local claim(s) after hydration`);
     return result;
   };
 }
@@ -272,7 +277,7 @@ if (originalHydrate) {
     const claimsRestored = restoreClaimSnapshots(claimBefore);
     normalizeAllLocalUsers();
     if (restored) console.warn(`[persist-v1.0.3] preserved ${restored} newer local user row(s) after re-hydration`);
-    if (claimsRestored) console.warn(`[persist-collections-v1.0.9] preserved ${claimsRestored} local claim(s) after re-hydration`);
+    if (claimsRestored) console.warn(`[persist-collections-v1.0.10] preserved ${claimsRestored} local claim(s) after re-hydration`);
     return result;
   };
 }
@@ -306,7 +311,12 @@ function wrapClaimMutation(name, table) {
     const row = original.apply(db, args);
     if (row) {
       // Immediate direct write: claims should not wait for the 30-second mirror.
-      syncClaimRow(table, row).catch((e) => console.warn(`[persist-collections-v1.0.9] immediate ${table} sync failed:`, e.message));
+      syncClaimRow(table, row)
+        .then((ok) => {
+          if (ok) console.log(`[persist-collections-v1.0.10] ${table} durable write ok for ${row.character_id}`);
+          else console.warn(`[persist-collections-v1.0.10] immediate ${table} sync deferred for ${row.character_id}; periodic reconcile will retry`);
+        })
+        .catch((e) => console.warn(`[persist-collections-v1.0.10] immediate ${table} sync failed:`, e.message));
     }
     return row;
   };
@@ -367,7 +377,7 @@ db.startMirrorLoop = async function hardenedStartMirrorLoop() {
 };
 
 console.log('[persist-v1.0.3] persistence hardening loaded');
-console.log('[persist-collections-v1.0.9] waifu/hunt claim durability + id-less PG hydration loaded');
+console.log('[persist-collections-v1.0.10] waifu/hunt claim durability + integer claim timestamps loaded');
 
 module.exports = {
   epoch, syncUserRow, syncUserId, syncAllUsers, restoreNewerLocal,

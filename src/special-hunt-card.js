@@ -165,7 +165,7 @@ async function render(card, imageBuffer) {
   if (!sharp || !Buffer.isBuffer(imageBuffer) || !imageBuffer.length) return null;
   const tier = oldTier(card);
 
-  // Special Hunt intentionally uses portrait Zerochan art and a full-bleed
+  // Special Hunt intentionally uses portrait premium art and a full-bleed
   // cover crop. Unlike normal /hunt, there are no blurred sidebars: Old Gen is
   // supposed to feel composed around the character rather than framed around a
   // contained source picture.

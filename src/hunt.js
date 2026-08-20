@@ -7,7 +7,7 @@ const specialCardRenderer = require('./special-hunt-card');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const ANIME_PICTURES_API_URL = 'https://api.anime-pictures.net/api/v3';
-const ZEROCHAN_BASE_URL = 'https://www.zerochan.net';
+const DANBOORU_PUBLIC_URL = 'https://danbooru.donmai.us';
 const GELBOORU_API_URL = 'https://gelbooru.com/index.php';
 const SAFEBOORU_API_URL = 'https://safebooru.org/index.php';
 const DANBOORU_SAFE_URL = 'https://safebooru.donmai.us';
@@ -56,8 +56,8 @@ function randomIntInclusive(min, max) {
   return lo + Math.floor(Math.random() * Math.max(1, hi - lo + 1));
 }
 
-// /shunt uses a smaller premium catalogue. Zerochan still has to prove at
-// runtime that the chosen real character has at least six strict portraits.
+// /shunt uses a smaller premium catalogue. Danbooru must prove at runtime
+// that the chosen real character has at least six safe solo portrait artworks.
 const SPECIAL_CHARACTER_CATALOG = [
   'Satoru Gojo', 'Makima', 'Power', 'Denji', 'Aki Hayakawa',
   'Rimuru Tempest', 'Sung Jin-Woo', 'Tanjiro Kamado', 'Nezuko Kamado', 'Kyojuro Rengoku',
@@ -1239,198 +1239,313 @@ async function selectAnimePicturesArtwork(identity, opts = {}) {
 }
 
 
-// ===================== ZEROCHAN SPECIAL-HUNT ARTWORK =====================
-// /shunt is deliberately separate from normal /hunt. Normal Cards keep the
-// proven Anime-Pictures + Gen 2 pipeline; Special Hunt uses Zerochan strict
-// primary-character portrait results and the Old Gen renderer.
-const zerochanPoolCache = new Map();
-let zerochanRequestChain = Promise.resolve();
-let zerochanLastRequestAt = 0;
-let zerochanAnonymousWarned = false;
-const ZEROCHAN_MIN_GAP_MS = 1150; // comfortably below the documented 60/min.
-const ZEROCHAN_CACHE_MS = 6 * 60 * 60 * 1000;
-const ZEROCHAN_EMPTY_CACHE_MS = 10 * 60 * 1000;
+// ===================== DANBOORU SPECIAL-HUNT ARTWORK =====================
+// /shunt stays completely separate from normal /hunt. Normal Cards keep the
+// Anime-Pictures + Gen 2 pipeline; Special Hunt uses Danbooru's public JSON
+// read API, exact character tags, general-rating posts, solo-only filtering,
+// and the Old Gen renderer. No token/API key is required for this path.
+const specialDanbooruPoolCache = new Map();
+const SPECIAL_DANBOORU_CACHE_MS = 6 * 60 * 60 * 1000;
+const SPECIAL_DANBOORU_EMPTY_CACHE_MS = 10 * 60 * 1000;
 
-function zerochanUserAgent() {
-  const username = String(process.env.ZEROCHAN_USERNAME || '').trim();
-  if (username) return `RimuruTempestCasino/1.0 - ${username}`;
-  if (!zerochanAnonymousWarned) {
-    zerochanAnonymousWarned = true;
-    console.warn('[special-cards] ZEROCHAN_USERNAME is not set. Zerochan documents a project+username User-Agent; anonymous requests may be rejected.');
-  }
-  return `${config.hunt.userAgent || 'RimuruTempestCasino/1.0'} - anonymous`;
+// Canonical Danbooru character tags for the curated Special Hunt catalogue.
+// Dynamic tag discovery remains as a fallback, but these mappings avoid the
+// name-order/romanisation failures that hurt the old Zerochan implementation.
+const SPECIAL_DANBOORU_TAGS = Object.freeze({
+  'Satoru Gojo': 'gojou_satoru',
+  'Makima': 'makima_(chainsaw_man)',
+  'Power': 'power_(chainsaw_man)',
+  'Denji': 'denji_(chainsaw_man)',
+  'Aki Hayakawa': 'hayakawa_aki',
+  'Rimuru Tempest': 'rimuru_tempest',
+  'Sung Jin-Woo': 'sung_jin-woo',
+  'Tanjiro Kamado': 'kamado_tanjirou',
+  'Nezuko Kamado': 'kamado_nezuko',
+  'Kyojuro Rengoku': 'rengoku_kyoujurou',
+  'Giyu Tomioka': 'tomioka_giyuu',
+  'Mitsuri Kanroji': 'kanroji_mitsuri',
+  'Shinobu Kocho': 'kochou_shinobu',
+  'Muichiro Tokito': 'tokitou_muichirou',
+  'Tengen Uzui': 'uzui_tengen',
+  'Naruto Uzumaki': 'uzumaki_naruto',
+  'Sasuke Uchiha': 'uchiha_sasuke',
+  'Kakashi Hatake': 'hatake_kakashi',
+  'Itachi Uchiha': 'uchiha_itachi',
+  'Hinata Hyuga': 'hyuuga_hinata',
+  'Monkey D. Luffy': 'monkey_d._luffy',
+  'Roronoa Zoro': 'roronoa_zoro',
+  'Nami': 'nami_(one_piece)',
+  'Nico Robin': 'nico_robin',
+  'Boa Hancock': 'boa_hancock',
+  'Levi Ackerman': 'levi_(shingeki_no_kyojin)',
+  'Mikasa Ackerman': 'mikasa_ackerman',
+  'Eren Yeager': 'eren_yeager',
+  'Historia Reiss': 'historia_reiss',
+  'Ichigo Kurosaki': 'kurosaki_ichigo',
+  'Rukia Kuchiki': 'kuchiki_rukia',
+  'Sosuke Aizen': 'aizen_sousuke',
+  'Kirito': 'kirito_(sao)',
+  'Asuna Yuuki': 'yuuki_asuna',
+  'Sinon': 'sinon_(sao)',
+  'Rem': 'rem_(re:zero)',
+  'Ram': 'ram_(re:zero)',
+  'Emilia': 'emilia_(re:zero)',
+  'Zero Two': 'zero_two_(darling_in_the_franxx)',
+  'Marin Kitagawa': 'kitagawa_marin',
+  'Ai Hoshino': 'hoshino_ai',
+  'Aqua Hoshino': 'hoshino_aqua',
+  'Megumin': 'megumin',
+  'Frieren': 'frieren',
+  'Fern': 'fern_(sousou_no_frieren)',
+  'Violet Evergarden': 'violet_evergarden',
+  'Yor Forger': 'yor_forger',
+  'Loid Forger': 'loid_forger',
+  'Anya Forger': 'anya_forger',
+  'Momo Ayase': 'ayase_momo',
+  'Ken Takakura': 'takakura_ken',
+  'Ryomen Sukuna': 'ryomen_sukuna',
+  'Yuji Itadori': 'itadori_yuuji',
+  'Megumi Fushiguro': 'fushiguro_megumi',
+  'Nobara Kugisaki': 'kugisaki_nobara',
+  'Toji Fushiguro': 'fushiguro_toji',
+  'Yuta Okkotsu': 'okkotsu_yuuta',
+  'Shoto Todoroki': 'todoroki_shouto',
+  'Katsuki Bakugo': 'bakugou_katsuki',
+  'Izuku Midoriya': 'midoriya_izuku',
+  'Kurisu Makise': 'makise_kurisu',
+  'Holo': 'holo_(spice_and_wolf)',
+  'Mai Sakurajima': 'sakurajima_mai',
+  'Miku Nakano': 'nakano_miku',
+});
+
+function specialDanbooruUserAgent() {
+  return config.hunt.userAgent || 'RimuruTempestCasino/1.0';
 }
 
-async function zerochanJson(url, label, retries = 1) {
-  const task = async () => {
-    const wait = Math.max(0, ZEROCHAN_MIN_GAP_MS - (Date.now() - zerochanLastRequestAt));
-    if (wait) await sleep(wait);
-    zerochanLastRequestAt = Date.now();
-    return fetchJson(url, Math.max(12000, config.hunt.fetchTimeoutMs || 10000), retries, {
-      label: label || 'Zerochan',
-      headers: { 'User-Agent': zerochanUserAgent() },
-    });
-  };
-  const run = zerochanRequestChain.then(task, task);
-  zerochanRequestChain = run.catch(() => null);
-  return run;
+function specialDanbooruPostsUrl(tag, page = 1) {
+  const u = new URL('/posts.json', DANBOORU_PUBLIC_URL);
+  u.searchParams.set('limit', '100');
+  u.searchParams.set('page', String(Math.max(1, Number(page) || 1)));
+  // Keep the anonymous/basic query to two terms. We filter `solo` and every
+  // other composition rule locally after receiving the JSON.
+  u.searchParams.set('tags', `${tag} rating:g`);
+  return u.toString();
 }
 
-function zerochanNameVariants(card) {
+function specialDanbooruTagsUrl(pattern) {
+  const u = new URL('/tags.json', DANBOORU_PUBLIC_URL);
+  u.searchParams.set('limit', '25');
+  u.searchParams.set('search[fuzzy_name_matches]', pattern);
+  u.searchParams.set('search[category]', '4'); // character tags only
+  u.searchParams.set('search[order]', 'similarity');
+  return u.toString();
+}
+
+function specialDanbooruNamePatterns(card) {
   const out = [];
-  const push = (v) => {
-    const x = stripUrls(v || '').replace(/\s+/g, ' ').trim();
-    if (!x || x.length > 80) return;
-    if (!out.some((y) => y.toLowerCase() === x.toLowerCase())) out.push(x);
-    const parts = x.split(' ');
-    if (parts.length >= 2 && parts.length <= 3) {
-      const swapped = `${parts.slice(1).join(' ')} ${parts[0]}`.trim();
-      if (!out.some((y) => y.toLowerCase() === swapped.toLowerCase())) out.push(swapped);
-    }
+  const push = (value) => {
+    const tag = normalizeGelbooruTag(value || '');
+    if (tag && !out.includes(tag)) out.push(tag);
   };
   push(card && card.name);
-  for (const alias of Array.isArray(card && card.aliases) ? card.aliases : []) push(alias);
-  return out.slice(0, 6);
+  const aliases = Array.isArray(card && card.aliases) ? card.aliases : [];
+  for (const alias of aliases.slice(0, 4)) push(alias);
+  for (const token of distinctiveNameTokens(card).slice(0, 3)) push(token);
+  return out.slice(0, 8);
 }
 
-function normalizeZerochanItems(json) {
-  if (Array.isArray(json)) return json;
-  if (json && Array.isArray(json.items)) return json.items;
-  return [];
-}
+async function discoverSpecialDanbooruTags(card) {
+  const out = [];
+  const seen = new Set();
+  const push = (name, count = 0, score = 0) => {
+    name = String(name || '').trim();
+    if (!name || seen.has(name)) return;
+    seen.add(name);
+    out.push({ name, count: Number(count) || 0, score: Number(score) || 0 });
+  };
 
-function zerochanArtworkQuality(item) {
-  const width = Number(item && item.width) || 0;
-  const height = Number(item && item.height) || 0;
-  const fav = Number(item && item.fav) || 0;
-  const tags = new Set((Array.isArray(item && item.tags) ? item.tags : []).map((x) => String(x || '').toLowerCase()));
-  let score = Math.min(7000, Math.max(0, fav) * 32);
-  if (width && height) {
-    const mp = (width * height) / 1_000_000;
-    score += Math.min(5000, mp * 750);
-    const ratio = width / height;
-    const cardRatio = 604 / 810;
-    const distance = Math.abs(ratio - cardRatio);
-    score += Math.max(0, 4200 - distance * 9000);
-    if (height > width) score += 1800;
-    if (width >= 1200 && height >= 1600) score += 1200;
-    if (ratio < 0.42 || ratio > 1.05) score -= 4500;
+  const mapped = SPECIAL_DANBOORU_TAGS[String(card && card.name || '').trim()];
+  // The curated /shunt catalogue already has canonical tags. Avoid wasting
+  // requests on fuzzy tag search when we know the exact identity up front.
+  if (mapped) return [mapped];
+
+  const direct = gelbooruTagVariants(card);
+  for (const tag of direct.slice(0, 5)) push(tag, 0, 20);
+
+  const tokens = distinctiveNameTokens(card);
+  for (const pattern of specialDanbooruNamePatterns(card).slice(0, 4)) {
+    const json = await fetchJson(
+      specialDanbooruTagsUrl(pattern),
+      Math.min(9000, config.hunt.fetchTimeoutMs || 10000),
+      1,
+      { label: `Danbooru special tag ${pattern}`, headers: { 'User-Agent': specialDanbooruUserAgent() } },
+    );
+    for (const raw of Array.isArray(json) ? json : []) {
+      if (Number(raw.category) !== 4 || raw.is_deprecated) continue;
+      const name = String(raw.name || '').trim();
+      const normalized = normalizeGelbooruTag(name);
+      const hits = tokens.filter((t) => normalized.includes(t)).length;
+      if (!hits && !mapped) continue;
+      push(name, raw.post_count, hits * 100 + Math.min(99, Number(raw.post_count || 0) / 1000));
+    }
   }
+  out.sort((a, b) => (b.score - a.score) || (b.count - a.count));
+  return out.map((x) => x.name).slice(0, 10);
+}
+
+function specialDanbooruQuality(raw, generalTags) {
+  const width = Number(raw && raw.image_width) || 0;
+  const height = Number(raw && raw.image_height) || 0;
+  const megapixels = Math.min(18, (width * height) / 1_000_000);
+  let score = megapixels * 1300;
+  score += Math.max(0, Number(raw && raw.score) || 0) * 24;
+  score += Math.max(0, Number(raw && raw.fav_count) || 0) * 14;
+  const tags = new Set(generalTags || []);
   const bonuses = new Map([
-    ['official art', 4800], ['key visual', 3600], ['official wallpaper', 2800],
-    ['full body', 2600], ['long image', 1400], ['solo', 900], ['high resolution', 900],
+    ['full_body', 7000], ['cowboy_shot', 6200], ['upper_body', 5200],
+    ['portrait', 3900], ['standing', 2600], ['dynamic_pose', 2600],
+    ['looking_at_viewer', 1000], ['official_art', 3400], ['key_visual', 3000],
+    ['highres', 2200], ['absurdres', 2600], ['solo', 4000],
   ]);
   const penalties = new Map([
-    ['manga', 2600], ['comic', 2600], ['monochrome', 1900], ['sketch', 1700],
-    ['scan', 1200], ['screenshot', 3400], ['character sheet', 4200], ['reference sheet', 4200],
-    ['multiple characters', 5000], ['group', 5000], ['couple', 4200],
+    ['close-up', 6500], ['close_up', 6500], ['extreme_close-up', 9000],
+    ['face', 2600], ['cropped', 4800], ['head_out_of_frame', 6500],
+    ['out_of_frame', 5200], ['multiple_views', 12000], ['character_sheet', 14000],
+    ['reference_sheet', 14000], ['comic', 10000], ['4koma', 10000],
+    ['manga', 6500], ['monochrome', 3600], ['screenshot', 9000],
   ]);
   for (const [tag, n] of bonuses) if (tags.has(tag)) score += n;
   for (const [tag, n] of penalties) if (tags.has(tag)) score -= n;
+  // Old Gen is full-bleed: reward portrait ratios near the 700x900 canvas.
+  if (width > 0 && height > width) {
+    const ratio = width / height;
+    score += Math.max(0, 4000 - Math.abs(ratio - (700 / 900)) * 9000);
+  }
   return score;
 }
 
-function zerochanCandidate(item, searchedName) {
-  if (!item || typeof item !== 'object') return null;
-  const id = Number(item.id) || 0;
-  const width = Number(item.width) || 0;
-  const height = Number(item.height) || 0;
-  const primary = String(item.primary || '').trim();
-  const tags = Array.isArray(item.tags) ? item.tags.map((x) => String(x || '').trim()).filter(Boolean) : [];
-  const target = String(searchedName || '').trim().toLowerCase();
-  // Strict mode should already guarantee this, but re-check the API payload so
-  // a tag/redirect oddity cannot turn a Special card into the wrong character.
-  if (primary && target && primary.toLowerCase() !== target) return null;
-  if (!id || !width || !height || height <= width) return null;
-  if (width < 600 || height < 800) return null;
-  const lowered = new Set(tags.map((t) => t.toLowerCase()));
-  for (const bad of ['group', 'couple', 'multiple characters', 'character sheet', 'reference sheet']) if (lowered.has(bad)) return null;
-  const imageUrl = String(item.full || item.medium || '').trim();
+function specialDanbooruCandidate(raw, exactTag) {
+  if (!raw || typeof raw !== 'object') return null;
+  if (String(raw.rating || '').toLowerCase() !== 'g') return null;
+  const width = Number(raw.image_width) || 0;
+  const height = Number(raw.image_height) || 0;
+  if (!width || !height || height <= width || width < 650 || height < 850) return null;
+
+  const characterTags = String(raw.tag_string_character || '').split(/\s+/).filter(Boolean);
+  const generalTags = String(raw.tag_string_general || '').split(/\s+/).filter(Boolean);
+  // This is the identity guarantee for Special Hunt: the exact Danbooru
+  // character tag must be present, and it must be the only character depicted.
+  if (!characterTags.includes(exactTag) || characterTags.length !== 1) return null;
+  if (!generalTags.includes('solo')) return null;
+
+  const generalSet = new Set(generalTags);
+  for (const bad of ['multiple_views', 'character_sheet', 'reference_sheet', 'comic', '4koma']) {
+    if (generalSet.has(bad)) return null;
+  }
+
+  const ext = String(raw.file_ext || '').toLowerCase();
+  if (ext && !['jpg', 'jpeg', 'png', 'webp'].includes(ext)) return null;
+  const imageUrl = String(raw.large_file_url || raw.file_url || '').trim();
   if (!/^https:\/\//i.test(imageUrl)) return null;
+
   return {
-    provider: 'Zerochan',
-    post_id: id,
+    provider: 'Danbooru',
+    post_id: Number(raw.id) || 0,
     file_url: imageUrl,
-    sample_url: String(item.medium || item.full || '').trim(),
+    sample_url: String(raw.large_file_url || raw.file_url || '').trim(),
     width,
     height,
-    score: Number(item.fav) || 0,
-    quality: zerochanArtworkQuality(item),
-    tags,
-    primary,
-    searched_name: searchedName,
-    source_url: String(item.source || '').trim(),
+    score: Number(raw.score) || 0,
+    fav_count: Number(raw.fav_count) || 0,
+    quality: specialDanbooruQuality(raw, generalTags),
+    tags: generalTags,
+    character_tags: characterTags,
+    query_tag: exactTag,
+    source_url: String(raw.source || '').trim(),
   };
 }
 
-async function searchZerochanStrictPortrait(name) {
-  const path = encodeURIComponent(String(name || '').trim()).replace(/%20/g, '+');
-  if (!path) return [];
-  const u = new URL(`${ZEROCHAN_BASE_URL}/${path}`);
-  u.searchParams.set('json', '1');
-  u.searchParams.set('strict', '1');
-  u.searchParams.set('p', '1');
-  u.searchParams.set('l', '42');
-  u.searchParams.set('s', 'fav');
-  u.searchParams.set('t', '0');
-  u.searchParams.set('d', 'portrait');
-  const json = await zerochanJson(u.toString(), `Zerochan ${name}`, 1);
-  return normalizeZerochanItems(json);
+async function searchSpecialDanbooruTag(tag) {
+  const seen = new Set();
+  const out = [];
+  for (const page of [1, 2]) {
+    const json = await fetchJson(
+      specialDanbooruPostsUrl(tag, page),
+      Math.min(10000, config.hunt.fetchTimeoutMs || 10000),
+      1,
+      { label: `Danbooru special posts ${tag} p${page}`, headers: { 'User-Agent': specialDanbooruUserAgent() } },
+    );
+    for (const raw of Array.isArray(json) ? json : []) {
+      const candidate = specialDanbooruCandidate(raw, tag);
+      if (!candidate) continue;
+      const key = candidate.file_url;
+      if (!key || seen.has(key)) continue;
+      seen.add(key);
+      out.push(candidate);
+    }
+    if (out.length >= 12) break;
+  }
+  out.sort((a, b) => (Number(b.quality) - Number(a.quality)) || (Number(b.score) - Number(a.score)) || (Number(b.post_id) - Number(a.post_id)));
+  return out;
 }
 
-async function buildZerochanArtworkPool(card) {
+async function buildSpecialDanbooruArtworkPool(card) {
   const key = String(card && (card.character_id || card.name) || '').toLowerCase();
-  const cached = zerochanPoolCache.get(key);
+  const cached = specialDanbooruPoolCache.get(key);
   if (cached && cached.expiresAt > Date.now()) return cached.value;
 
-  const variants = zerochanNameVariants(card);
+  const tags = await discoverSpecialDanbooruTags(card);
   let approved = [];
-  let matchedVariant = '';
-  for (const name of variants) {
-    const rows = await searchZerochanStrictPortrait(name);
-    if (!rows.length) continue;
-    const candidates = rows.map((x) => zerochanCandidate(x, name)).filter(Boolean);
-    if (!candidates.length) continue;
-    approved = candidates;
-    matchedVariant = name;
-    break;
+  let matchedTag = '';
+  for (const tag of tags.slice(0, 6)) {
+    const rows = await searchSpecialDanbooruTag(tag);
+    if (rows.length > approved.length) {
+      approved = rows;
+      matchedTag = tag;
+    }
+    if (approved.length >= SPECIAL_MIN_ARTWORKS) break;
   }
   approved.sort((a, b) => (Number(b.quality) - Number(a.quality)) || (Number(b.score) - Number(a.score)) || (Number(b.post_id) - Number(a.post_id)));
-  const value = approved.slice(0, 18);
-  zerochanPoolCache.set(key, { value, matchedVariant, expiresAt: Date.now() + (value.length ? ZEROCHAN_CACHE_MS : ZEROCHAN_EMPTY_CACHE_MS) });
-  console.log(`[special-cards] ${card && card.name}: Zerochan approved=${value.length} strict=${matchedVariant || 'none'}`);
+  const value = approved.slice(0, 24);
+  specialDanbooruPoolCache.set(key, {
+    value,
+    matchedTag,
+    expiresAt: Date.now() + (value.length ? SPECIAL_DANBOORU_CACHE_MS : SPECIAL_DANBOORU_EMPTY_CACHE_MS),
+  });
+  console.log(`[special-cards] ${card && card.name}: Danbooru approved=${value.length} tag=${matchedTag || 'none'}`);
   return value;
 }
 
-function zerochanArtworkForTier(card, pool) {
+function specialDanbooruArtworkForTier(card, pool) {
   if (!Array.isArray(pool) || !pool.length) return null;
   const tier = Math.max(1, Math.min(6, Number(cardTierMeta(card).tier) || 1));
+  // Select the best six, then weakest->strongest maps T1->T6.
   const six = pool.slice(0, 6).sort((a, b) => (Number(a.quality) - Number(b.quality)) || (Number(a.post_id) - Number(b.post_id)));
   const index = six.length === 1 ? 0 : Math.round(((tier - 1) / 5) * (six.length - 1));
   return { ...six[index], tier_slot: tier, pool_size: six.length };
 }
 
-async function selectZerochanSpecialArtwork(identity, opts = {}) {
+async function selectDanbooruSpecialArtwork(identity, opts = {}) {
   if (!identity) return null;
   const merged = { ...identity };
-  const pool = await buildZerochanArtworkPool(merged);
+  const pool = await buildSpecialDanbooruArtworkPool(merged);
   const minPool = Math.max(1, Number(opts.minPool) || 1);
   if (pool.length < minPool) {
-    console.warn(`[${opts.context || 'special-cards'}] ${merged.name}: premium pool rejected (${pool.length}/${minPool} required).`);
+    console.warn(`[${opts.context || 'special-cards'}] ${merged.name}: Danbooru premium pool rejected (${pool.length}/${minPool} required).`);
     return null;
   }
-  const candidate = zerochanArtworkForTier(merged, pool);
+  const candidate = specialDanbooruArtworkForTier(merged, pool);
   if (!candidate) return null;
   const imageUrl = candidate.file_url || candidate.sample_url;
   if (!imageUrl) return null;
-  console.log(`[${opts.context || 'special-cards'}] ${merged.name}: Zerochan post=${candidate.post_id} tier=T${candidate.tier_slot} pool=${candidate.pool_size} quality=${Math.round(candidate.quality || 0)}`);
+  console.log(`[${opts.context || 'special-cards'}] ${merged.name}: Danbooru post=${candidate.post_id} tier=T${candidate.tier_slot} pool=${candidate.pool_size} quality=${Math.round(candidate.quality || 0)}`);
   return {
     ...merged,
     image_url: `${imageUrl}#jtf-oldgen-t${candidate.tier_slot}`,
-    image_source: `Zerochan:T${candidate.tier_slot}`,
-    zerochan_post_id: candidate.post_id,
-    zerochan_primary: candidate.primary,
-    zerochan_source_url: candidate.source_url,
+    image_source: `Danbooru:T${candidate.tier_slot}`,
+    danbooru_post_id: candidate.post_id,
+    danbooru_tag: candidate.query_tag,
+    danbooru_source_url: candidate.source_url,
     artwork_pool_size: candidate.pool_size,
     special_card_style: 'old-gen',
   };
@@ -1443,41 +1558,38 @@ async function chooseSpecialCharacter(seed) {
   const merged = mergeMetadata(identity, [seed]);
   merged.reference_image_url = identity.reference_image_url || identity.image_url;
   try {
-    return await selectZerochanSpecialArtwork(merged, {
+    return await selectDanbooruSpecialArtwork(merged, {
       context: 'special-cards',
       minPool: SPECIAL_MIN_ARTWORKS,
     });
   } catch (e) {
-    console.warn(`[special-cards] ${merged.name}: Zerochan artwork lookup failed: ${e.message}`);
+    console.warn(`[special-cards] ${merged.name}: Danbooru artwork lookup failed: ${e.message}`);
     return null;
   }
 }
 
 async function fetchSpecialSpawnCharacter() {
-  // v1.0.16: start from characters that are intentionally suitable for a
-  // premium collection, then let Zerochan prove six-image coverage. This is the
-  // inverse of the old random-AniList-first flow that frequently produced none.
+  // Start from the curated premium catalogue, then require six safe, exact,
+  // solo Danbooru artworks before the character is allowed to spawn.
   const names = SPECIAL_CHARACTER_CATALOG.slice().sort(() => Math.random() - 0.5);
-  for (const name of names.slice(0, 14)) {
+  for (const name of names.slice(0, 12)) {
     const card = await chooseSpecialCharacter({ name, source: 'SpecialCatalog' });
     if (card) {
-      console.log(`[special-cards] premium catalog hit: ${card.name} pool=${Number(card.artwork_pool_size) || 0}`);
+      console.log(`[special-cards] premium Danbooru catalog hit: ${card.name} pool=${Number(card.artwork_pool_size) || 0}`);
       return card;
     }
   }
 
-  // Secondary path: previously cached modern identities are allowed only when
-  // they pass the same six-image Zerochan gate.
   const cached = db.getHuntPool(120)
     .filter((c) => String(c.character_id || '').startsWith('anilist-') && !db.isHuntCharacterClaimed(c.character_id))
     .sort(() => Math.random() - 0.5)
-    .slice(0, 10);
+    .slice(0, 8);
   for (const row of cached) {
     const card = await chooseSpecialCharacter({ ...row, source: 'AniList', reference_image_url: row.image_url });
     if (card) return card;
   }
 
-  console.warn('[special-cards] no premium six-image Zerochan character available after catalog + cache attempts.');
+  console.warn('[special-cards] no six-image Danbooru character available after catalog + cache attempts.');
   return null;
 }
 
@@ -1708,7 +1820,7 @@ async function fetchSpecialImageBuffer(url) {
   const timer = setTimeout(() => ac.abort(), Math.max(12000, config.hunt.fetchTimeoutMs || 10000));
   timer.unref && timer.unref();
   try {
-    const res = await fetch(url, { headers: { Accept: 'image/*', 'User-Agent': zerochanUserAgent() }, signal: ac.signal });
+    const res = await fetch(url, { headers: { Accept: 'image/*', 'User-Agent': specialDanbooruUserAgent() }, signal: ac.signal });
     if (!res.ok) throw new Error(`image HTTP ${res.status}`);
     const type = String(res.headers.get('content-type') || 'image/jpeg').split(';')[0];
     if (!type.startsWith('image/')) throw new Error(`not an image (${type})`);
@@ -1743,8 +1855,8 @@ async function sendSpecialCardPhoto(chatId, card, caption, markup) {
       });
     }
   } catch (e) { console.warn('[special-cards] generated photo:', e.message); }
-  // Presentation fallback only: if Sharp fails, still show the verified strict
-  // Zerochan source rather than substituting normal Hunt artwork.
+  // Presentation fallback only: if Sharp fails, still show the verified safe
+  // Danbooru source rather than substituting normal Hunt artwork.
   if (downloaded && downloaded.buffer) {
     try { return await deps.sendPhoto(chatId, downloaded.buffer, { caption, reply_markup: markup }, { filename: 'special-card-source.jpg', contentType: downloaded.contentType || 'image/jpeg' }); }
     catch (e) { console.warn('[special-cards] source buffer photo:', e.message); }
@@ -1759,10 +1871,7 @@ async function spawnSpecial(opts = {}) {
   if (isSpawnClaimable(existing)) return { ok: false, message: `✦ A card is already up for grabs (${secondsRemaining(existing)}s left).` };
   if (existing) db.clearActiveHunt();
   const card = await fetchSpecialSpawnCharacter();
-  if (!card) {
-    const hint = String(process.env.ZEROCHAN_USERNAME || '').trim() ? '' : ' Set ZEROCHAN_USERNAME in Render if Zerochan rejected anonymous access.';
-    return { ok: false, message: `✦ Rimuru could not prepare a premium Old Gen card right now.${hint}` };
-  }
+  if (!card) return { ok: false, message: '✦ Rimuru could not prepare a premium Old Gen card right now.' };
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveHunt();
@@ -1863,7 +1972,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.16] /hunt=Gen2 Anime-Pictures; /shunt=OldGen Zerochan strict portrait; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
+  console.log(`[cards-v1.0.17] /hunt=Gen2 Anime-Pictures; /shunt=OldGen Danbooru safe solo; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -1882,6 +1991,6 @@ module.exports = {
   normalizeAnimePicturesUrl, animePicturesNameVariants, animePicturesTagScore, resolveAnimePicturesCharacterTag,
   searchAnimePicturesPosts, fetchAnimePicturesPostDetails, animePicturesCandidateFromDetails, buildAnimePicturesArtworkPool,
   animePicturesArtworkForTier, selectAnimePicturesArtwork, parseCharTierQuery,
-  zerochanNameVariants, normalizeZerochanItems, zerochanArtworkQuality, zerochanCandidate, searchZerochanStrictPortrait, buildZerochanArtworkPool, zerochanArtworkForTier, selectZerochanSpecialArtwork, chooseSpecialCharacter, fetchSpecialSpawnCharacter, specialAnnounceCaption,
+  SPECIAL_DANBOORU_TAGS, specialDanbooruNamePatterns, discoverSpecialDanbooruTags, specialDanbooruQuality, specialDanbooruCandidate, searchSpecialDanbooruTag, buildSpecialDanbooruArtworkPool, specialDanbooruArtworkForTier, selectDanbooruSpecialArtwork, chooseSpecialCharacter, fetchSpecialSpawnCharacter, specialAnnounceCaption,
   _clear: () => db.clearActiveHunt(),
 };
