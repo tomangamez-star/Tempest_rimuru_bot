@@ -1,0 +1,15 @@
+RIMURU v1.0.11 — CARDS / HUNT REDESIGN
+
+Replace only:
+- package.json
+- src/bot.js
+- src/hunt.js
+- src/hunt-card.js
+
+IMPORTANT:
+- /hunt remains /hunt. No /card command was added.
+- Visible Anime Hunt branding is now Cards.
+- T1-T6 card rendering is generated at runtime.
+- Waifu code was not modified; its legacy artwork-selection behavior is preserved in hunt.js.
+- No database schema or persistence file was changed.
+- package.json adds sharp for server-side card rendering.
