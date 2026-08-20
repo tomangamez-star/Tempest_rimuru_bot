@@ -1930,13 +1930,40 @@ async function searchAndShow(query, opts = {}) {
   const merged = mergeMetadata(seed, []);
   merged.reference_image_url = seed.reference_image_url || seed.image_url;
   if (parsed.tier) merged.forced_tier = parsed.tier;
-  const card = await selectArtworkForIdentity(merged, { context: parsed.tier ? `cards-search-t${parsed.tier}` : 'cards-search' });
+
+  // v1.0.18: /char is now the premium showcase. Try the Old Gen + Danbooru
+  // pipeline first so /char makima and /char gojo t5 render like /shunt.
+  // Keep a Gen 2 fallback for obscure characters that do not have six safe,
+  // exact, solo Danbooru artworks; a lookup should never become unusable just
+  // because the premium catalogue is narrower than AniList.
+  let card = null;
+  try {
+    card = await selectDanbooruSpecialArtwork(merged, {
+      context: parsed.tier ? `char-oldgen-t${parsed.tier}` : 'char-oldgen',
+      minPool: SPECIAL_MIN_ARTWORKS,
+    });
+  } catch (e) {
+    console.warn(`[char] ${merged.name}: Old Gen Danbooru preview failed: ${e.message}`);
+  }
+
+  let style = 'old-gen';
+  if (!card) {
+    style = 'gen2-fallback';
+    card = await selectArtworkForIdentity(merged, {
+      context: parsed.tier ? `char-gen2-fallback-t${parsed.tier}` : 'char-gen2-fallback',
+    });
+  }
   if (!card) return { ok: false, message: `Found ${stripUrls(seed.name)}, but no usable image could be prepared.` };
-  // A tier preview is presentation-only. Do not overwrite the normal metadata
-  // cache with a forced T1-T6 artwork choice.
-  if (!parsed.tier) db.cacheHuntCharacter(card);
+
+  // /char is a presentation lookup. Do not let a premium preview overwrite
+  // the normal spawn/cache metadata or change how an already-claimed card is
+  // stored. The Old Gen marker on this in-memory card is enough for rendering.
   await sendCardPhoto(opts.chatId, card, detailCaption(card), null);
-  return { ok: true, character: card, previewTier: parsed.tier || null };
+  return { ok: true, character: card, previewTier: parsed.tier || null, style };
+}
+
+function rollAutoSpawnStyle(random = Math.random) {
+  return Number(random()) < 0.70 ? 'old-gen' : 'gen2';
 }
 
 async function autoSpawnTick(env = {}) {
@@ -1944,12 +1971,36 @@ async function autoSpawnTick(env = {}) {
   if (isSpawnClaimable(db.getActiveHunt())) return;
   const groups = (typeof env.getChatIds === 'function' ? env.getChatIds() : []).filter((id) => Number(id) < 0);
   if (!groups.length) return;
-  const card = await fetchSpawnCharacter();
-  if (!card) return;
+
+  // Each hourly drop independently rolls its generation: 70% Special Old Gen
+  // (Danbooru), 30% normal Gen 2 (Anime-Pictures). Manual /hunt and /shunt
+  // remain deterministic and are not affected by this roll.
+  const rolledStyle = rollAutoSpawnStyle();
+  let style = rolledStyle;
+  let card = rolledStyle === 'old-gen' ? await fetchSpecialSpawnCharacter() : await fetchSpawnCharacter();
+
+  // Keep the hourly event alive if the chosen source has a temporary outage or
+  // cannot satisfy its pool rules. This is only a reliability fallback; the
+  // original 70/30 roll is still logged so production behaviour is observable.
+  if (!card) {
+    const fallbackStyle = rolledStyle === 'old-gen' ? 'gen2' : 'old-gen';
+    console.warn(`[cards-auto] rolled ${rolledStyle} but no card was available; trying ${fallbackStyle} fallback.`);
+    style = fallbackStyle;
+    card = fallbackStyle === 'old-gen' ? await fetchSpecialSpawnCharacter() : await fetchSpawnCharacter();
+  }
+  if (!card) {
+    console.warn(`[cards-auto] hourly spawn failed after ${rolledStyle} roll and alternate-source fallback.`);
+    return;
+  }
+
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, groups[0]);
   const row = db.getActiveHunt();
-  for (const gid of groups) await sendCardPhoto(gid, card, announceCaption(card, row), claimMarkup());
+  console.log(`[cards-auto] rolled=${rolledStyle} delivered=${style} character=${card.name || card.character_id}`);
+  for (const gid of groups) {
+    if (style === 'old-gen') await sendSpecialCardPhoto(gid, card, specialAnnounceCaption(card, row), claimMarkup());
+    else await sendCardPhoto(gid, card, announceCaption(card, row), claimMarkup());
+  }
 }
 
 let autoSpawnTimer = null;
@@ -1972,7 +2023,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.17] /hunt=Gen2 Anime-Pictures; /shunt=OldGen Danbooru safe solo; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
+  console.log(`[cards-v1.0.18] /char=OldGen-first; hourly=70% OldGen/30% Gen2; /hunt=Gen2; /shunt=OldGen; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -1983,7 +2034,7 @@ module.exports = {
   leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
   fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
   fetchJikanPictures, fetchRandomFromAniList, fetchAniListById, fetchSpawnCharacter, resolveCharacter,
-  attach, spawn, spawnSpecial, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state, sendCardPhoto, sendSpecialCardPhoto, renderCardBuffer, renderSpecialCardBuffer,
+  attach, spawn, spawnSpecial, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, rollAutoSpawnStyle, state, sendCardPhoto, sendSpecialCardPhoto, renderCardBuffer, renderSpecialCardBuffer,
   FALLBACK_POOL, fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
   normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork,
   searchSafebooruArtwork, searchDanbooruSafeArtwork, searchArtworkSources, selectArtworkForIdentity, verifyArtworkWithVision,
