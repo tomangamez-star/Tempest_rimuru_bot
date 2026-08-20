@@ -2,6 +2,7 @@
 
 const config = require('./config');
 const db = require('./db');
+const cardRenderer = require('./hunt-card');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const GELBOORU_API_URL = 'https://gelbooru.com/index.php';
@@ -104,31 +105,25 @@ function animeListOf(char) {
   return anime.slice(0, 5).map((a) => stripUrls(a.anime && (a.anime.title || a.anime.name) || '')).filter(Boolean).join(', ');
 }
 
+function cardTierMeta(card) { return cardRenderer.tierFor(card); }
+
 function announceCaption(card, spawn) {
-  const meta = rarityMeta(card.rarity);
+  const tier = cardTierMeta(card);
   const secs = secondsRemaining(spawn);
-  const bioLines = wrapText(card.bio || 'A mysterious fighter has crossed into the JTF hunting grounds.', 34, 6);
   const series = seriesNameOf(card);
   const lines = [
     '╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮',
-    '          ⚔️  𝐀𝐍𝐈𝐌𝐄 𝐇𝐔𝐍𝐓  ⚔️',
+    '             🃏  𝐂𝐀𝐑𝐃𝐒  🃏',
     '╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯',
     '',
-    '      ✨ 𝐀 𝐏𝐎𝐖𝐄𝐑𝐅𝐔𝐋 𝐏𝐑𝐄𝐒𝐄𝐍𝐂𝐄 𝐉𝐔𝐒𝐓 𝐄𝐍𝐓𝐄𝐑𝐄𝐃 𝐓𝐇𝐄 𝐉𝐓𝐅 𝐇𝐔𝐍𝐓𝐈𝐍𝐆 𝐆𝐑𝐎𝐔𝐍𝐃𝐒! ✨',
+    '          ✨ 𝐀 𝐍𝐄𝐖 𝐂𝐀𝐑𝐃 𝐇𝐀𝐒 𝐀𝐏𝐏𝐄𝐀𝐑𝐄𝐃! ✨',
     '',
     `              👤 ${fancy(stripUrls(card.name || 'Unknown'))}`,
-    `                 #${stripUrls(card.character_id || '')}`,
-    '',
   ];
-  if (series) lines.push(`      🎬 ${fancy(series)}`, '');
+  if (series) lines.push(`              🎬 ${fancy(series)}`);
   lines.push(
-    `          ${meta.emoji} 『 ${fancy(meta.label)} 』`,
     '',
-    '╭──────────────────────────────╮',
-    '📖 𝐂𝐇𝐀𝐑𝐀𝐂𝐓𝐄𝐑 𝐈𝐍𝐅𝐎',
-    '',
-    ...bioLines,
-    '╰──────────────────────────────╯',
+    `          🃏 『 ${fancy(`T${tier.tier} ${tier.label}`)} 』`,
     '',
     `        ⏱️ ${fancy(String(secs))}𝐬 𝐑𝐄𝐌𝐀𝐈𝐍𝐈𝐍𝐆`,
     '           ⚡ 𝐅𝐢𝐫𝐬𝐭 𝐜𝐥𝐚𝐢𝐦 𝐰𝐢𝐧𝐬!',
@@ -136,36 +131,39 @@ function announceCaption(card, spawn) {
   return lines.join('\n').slice(0, 1024);
 }
 function claimedCaption(char, claimerName) {
-  const meta = rarityMeta(char.rarity);
-  return `⚔️ ${fancy('CHARACTER CLAIMED!')}\n👤 ${fancy(stripUrls(char.name))}\n${seriesNameOf(char) ? `🎬 ${fancy(seriesNameOf(char))}\n` : ''}${meta.emoji} ${fancy(meta.label)}\n🎯 ${fancy('Claimed by')} ${safeUserName(claimerName)}`;
+  const tier = cardTierMeta(char);
+  return `🃏 ${fancy('CARD CLAIMED!')}\n👤 ${fancy(stripUrls(char.name))}\n${seriesNameOf(char) ? `🎬 ${fancy(seriesNameOf(char))}\n` : ''}⭐ ${fancy(`T${tier.tier} ${tier.label}`)}\n🎯 ${fancy('Claimed by')} ${safeUserName(claimerName)}`;
 }
 function detailCaption(char, opts = {}) {
-  const meta = rarityMeta(char.rarity);
-  const lines = [`👤 ${fancy(stripUrls(char.name))}`, `🆔 Character ID: ${stripUrls(char.character_id)}`];
+  const tier = cardTierMeta(char);
+  const lines = [`🃏 ${fancy(stripUrls(char.name))}`, `🆔 Card ID: ${stripUrls(char.character_id)}`];
   if (seriesNameOf(char)) lines.push(`🎬 ${fancy(seriesNameOf(char))}`);
   const bio = truncateBio(char.bio);
   if (bio) lines.push(`📖 About: ${bio}`);
   const anime = animeListOf(char);
   if (anime) lines.push(`📚 Appears in: ${anime}`);
-  lines.push(`${meta.emoji} Rarity: ${fancy(meta.label)}`);
+  lines.push(`⭐ Card Tier: ${fancy(`T${tier.tier} ${tier.label}`)}`);
   if (opts.claimedAt) lines.push(`📅 Claimed: ${new Date(Number(opts.claimedAt) || opts.claimedAt).toLocaleDateString()}`);
   return lines.join('\n');
 }
 function collectionCaption(rows) {
-  if (!rows || !rows.length) return 'Your character collection is empty. Go hunt some! ⚔️';
-  return `⚔️ ${fancy('YOUR COLLECTION')} (${rows.length})\n\n${rows.map((r, i) => `${i + 1}. ${rarityMeta(r.rarity).emoji} ${fancy(stripUrls(r.name))} — ${fancy(stripUrls(r.series || '?'))}`).join('\n')}`;
-}
-function leaderboardCaption(rows) {
-  if (!rows || !rows.length) return 'No hunters yet. Start the hunt! ⚔️';
-  const medals = ['🥇', '🥈', '🥉'];
-  return `⚔️ ${fancy('CHARACTER LEADERBOARD')}\n\n${rows.map((r, i) => {
-    const user = r.username ? `@${r.username}` : (r.first_name || `User ${r.user_id}`);
-    return `${medals[i] || `${i + 1}.`} ${safeUserName(user)} — ${Number(r.count) || 0}`;
+  if (!rows || !rows.length) return 'Your card collection is empty. Use /hunt to find one! 🃏';
+  return `🃏 ${fancy('YOUR CARDS')} (${rows.length})\n\n${rows.map((r, i) => {
+    const tier = cardTierMeta(r);
+    return `${i + 1}. T${tier.tier} ${fancy(stripUrls(r.name))} — ${fancy(stripUrls(r.series || '?'))}`;
   }).join('\n')}`;
 }
-function claimMarkup() { return { inline_keyboard: [[{ text: '⚔️ CLAIM CHARACTER', callback_data: 'hunt:claim' }]] }; }
+function leaderboardCaption(rows) {
+  if (!rows || !rows.length) return 'No card collectors yet. Start with /hunt! 🃏';
+  const medals = ['🥇', '🥈', '🥉'];
+  return `🃏 ${fancy('CARD LEADERBOARD')}\n\n${rows.map((r, i) => {
+    const user = r.username ? `@${r.username}` : (r.first_name || `User ${r.user_id}`);
+    return `${medals[i] || `${i + 1}.`} ${safeUserName(user)} — ${Number(r.count) || 0} cards`;
+  }).join('\n')}`;
+}
+function claimMarkup() { return { inline_keyboard: [[{ text: '🃏 CLAIM CARD', callback_data: 'hunt:claim' }]] }; }
 
-// Offline-only emergency pool. Runtime sourcing is AniList identity + Gelbooru artwork.
+// Emergency identity pool. Live Cards prefer exact character-tag artwork and render it into the T1-T6 frame.
 const FALLBACK_POOL = [
   { character_id: 'fb-1001', name: 'Gojo Satoru', series: 'Jujutsu Kaisen', favorites: 75000, bio: 'The strongest jujutsu sorcerer and a teacher at Tokyo Jujutsu High.', image_url: 'https://cdn.myanimelist.net/images/characters/15/422168.jpg' },
   { character_id: 'fb-1002', name: 'Rem', series: 'Re:Zero', favorites: 65000, bio: 'A maid of the Roswaal mansion known for her loyalty and strength.', image_url: 'https://cdn.myanimelist.net/images/characters/9/311327.jpg' },
@@ -790,13 +788,27 @@ function mergeMetadata(identity, others = []) {
   return best;
 }
 
-async function selectArtworkForIdentity(identity, opts = {}) {
+function candidateHasExactCharacterTag(candidate) {
+  if (!candidate || !candidate.exact_tag || !candidate.query_tag) return false;
+  const wanted = normalizeGelbooruTag(candidate.query_tag);
+  if (!wanted) return false;
+  const tags = new Set((candidate.tags || []).map((t) => normalizeGelbooruTag(t)).filter(Boolean));
+  return tags.has(wanted);
+}
+
+function trustedArtworkRank(candidate) {
+  const provider = String(candidate && candidate.provider || '');
+  const providerBoost = provider === 'DanbooruSafe' ? 3e15 : provider === 'Safebooru' ? 2e15 : provider === 'Gelbooru' ? 1e15 : 0;
+  return providerBoost + artworkRank(candidate || {});
+}
+
+async function selectLegacyWaifuArtwork(identity, opts = {}) {
   if (!identity) return null;
   const merged = { ...identity };
   merged.reference_image_url = identity.reference_image_url || identity.image_url;
   const candidates = await searchArtworkSources(merged);
   if (!candidates.length) {
-    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: no booru artwork candidates; AniList display fallback disabled.`);
+    console.warn(`[${opts.context || 'waifu'}] ${merged.name}: no booru artwork candidates; AniList display fallback disabled.`);
     return null;
   }
 
@@ -804,7 +816,7 @@ async function selectArtworkForIdentity(identity, opts = {}) {
   if (hasVision) {
     for (const candidate of candidates.slice(0, 6)) {
       const verdict = await verifyArtworkWithVision(merged, candidate);
-      console.log(`[${opts.context || 'hunt'}] ${merged.name}: ${candidate.provider} vision tag=${candidate.query_tag} match=${!!verdict.match} safe=${verdict.safe !== false} confidence=${Number(verdict.confidence || 0).toFixed(2)}`);
+      console.log(`[${opts.context || 'waifu'}] ${merged.name}: ${candidate.provider} vision tag=${candidate.query_tag} match=${!!verdict.match} safe=${verdict.safe !== false} confidence=${Number(verdict.confidence || 0).toFixed(2)}`);
       if (!verdict.ok) continue;
       const displayUrl = await displayUrlForCandidate(candidate);
       if (!displayUrl) continue;
@@ -818,32 +830,77 @@ async function selectArtworkForIdentity(identity, opts = {}) {
       };
     }
   } else {
-    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: GROQ_API_KEY missing; only exact-tag safe artwork can be used.`);
+    console.warn(`[${opts.context || 'waifu'}] ${merged.name}: GROQ_API_KEY missing; only exact-tag safe artwork can be used.`);
   }
 
-  // Hunt must never accept a merely tagged image as proof of identity. That
-  // fallback is what allowed searches such as Gojo to display unrelated anime
-  // artwork whenever vision was unavailable or rejected every candidate.
-  // Waifu keeps the legacy exact-tag fallback because its separate female
-  // identity gate already runs before artwork selection and the owner approved
-  // that current image style.
-  if (opts.requireVerified !== true) {
-    for (const candidate of candidates.filter((x) => x.exact_tag).slice(0, 6)) {
+  // Preserve the already-approved Waifu path exactly: if vision does not
+  // approve a candidate, Waifu may still use its existing exact-tag fallback.
+  for (const candidate of candidates.filter((x) => x.exact_tag).slice(0, 6)) {
+    const displayUrl = await displayUrlForCandidate(candidate);
+    if (!displayUrl) continue;
+    console.warn(`[${opts.context || 'waifu'}] ${merged.name}: using unverified exact-tag ${candidate.provider} artwork (tag=${candidate.query_tag}).`);
+    return {
+      ...merged,
+      image_url: displayUrl,
+      image_source: `${candidate.provider}ExactTag`,
+      image_tag: candidate.query_tag,
+      image_score: candidate.score,
+    };
+  }
+  console.warn(`[${opts.context || 'waifu'}] ${merged.name}: artwork candidates existed but none were usable; AniList display fallback disabled.`);
+  return null;
+}
+
+async function selectArtworkForIdentity(identity, opts = {}) {
+  if (!identity) return null;
+  const context = opts.context || 'cards';
+  if (context === 'waifu' || context === 'swaifu' || opts.preserveWaifu === true) return selectLegacyWaifuArtwork(identity, opts);
+  const merged = { ...identity };
+  merged.reference_image_url = identity.reference_image_url || identity.image_url;
+
+  // v1.0.11 Cards: use the image databases as tagged artwork catalogues, not
+  // as an AI guessing game. A candidate is eligible only when the returned post
+  // itself contains the exact character tag that produced it. DanbooruSafe is
+  // preferred because its tag lookup explicitly filters to character-category
+  // tags; Safebooru and credentialed Gelbooru are fallbacks.
+  let candidates = [];
+  try { candidates = await searchArtworkSources(merged); } catch (e) { console.warn(`[${context}] artwork lookup failed: ${e.message}`); }
+  const trusted = candidates.filter(candidateHasExactCharacterTag).sort((a, b) => trustedArtworkRank(b) - trustedArtworkRank(a));
+
+  if (trusted.length) {
+    // Pick from the strongest few instead of pinning every /char lookup to one
+    // picture. Exact tag validation still applies to every candidate.
+    const top = trusted.slice(0, Math.min(6, trusted.length));
+    const order = top.slice().sort(() => Math.random() - 0.5);
+    for (const candidate of order) {
       const displayUrl = await displayUrlForCandidate(candidate);
       if (!displayUrl) continue;
-      console.warn(`[${opts.context || 'hunt'}] ${merged.name}: using unverified exact-tag ${candidate.provider} artwork (tag=${candidate.query_tag}).`);
+      console.log(`[${context}] ${merged.name}: using exact character-tag artwork from ${candidate.provider} tag=${candidate.query_tag}`);
       return {
         ...merged,
         image_url: displayUrl,
-        image_source: `${candidate.provider}ExactTag`,
+        image_source: `${candidate.provider}CharacterTag`,
         image_tag: candidate.query_tag,
         image_score: candidate.score,
       };
     }
-  } else {
-    console.warn(`[${opts.context || 'hunt'}] ${merged.name}: no vision-verified artwork matched; rejecting character instead of showing random art.`);
   }
-  console.warn(`[${opts.context || 'hunt'}] ${merged.name}: artwork candidates existed but none were usable; AniList display fallback disabled.`);
+
+  // Cards must still spawn even if every artwork host is down. The trusted
+  // AniList portrait is now only a SOURCE IMAGE for the generated card, never
+  // sent as the finished presentation. This prevents the old "empty grounds"
+  // failure while keeping the card renderer usable during provider outages.
+  const identityUrl = merged.reference_image_url || merged.image_url;
+  if (identityUrl) {
+    console.warn(`[${context}] ${merged.name}: no reachable exact-tag artwork; using identity portrait inside generated card.`);
+    return {
+      ...merged,
+      image_url: identityUrl,
+      image_source: 'AniListCardFallback',
+    };
+  }
+
+  console.warn(`[${context}] ${merged.name}: no usable artwork or identity portrait.`);
   return null;
 }
 
@@ -853,7 +910,7 @@ async function chooseBestCharacter(seed) {
   if (!identity || db.isHuntCharacterClaimed(identity.character_id)) return null;
   const merged = mergeMetadata(identity, [seed]);
   merged.reference_image_url = identity.reference_image_url || identity.image_url;
-  return selectArtworkForIdentity(merged, { context: 'hunt', requireVerified: true });
+  return selectArtworkForIdentity(merged, { context: 'cards' });
 }
 
 async function fetchSpawnCharacter() {
@@ -872,10 +929,11 @@ async function fetchSpawnCharacter() {
     if (card) { db.cacheHuntCharacter(card); return card; }
   }
 
-  // Keep the historical fallback pool for offline regression tests only. In
-  // production, do not regress to old MAL/Jikan-era portrait artwork.
-  if (process.env.NODE_ENV === 'test') return pickFallbackCharacter();
-  console.warn('[hunt] no AniList identity/cache available; skipping spawn instead of using legacy artwork.');
+  // Last-resort emergency pool keeps /hunt alive when every live identity source
+  // is unavailable. These portraits are still wrapped by the generated card.
+  const fallback = pickFallbackCharacter();
+  if (fallback) { db.cacheHuntCharacter(fallback); return fallback; }
+  console.warn('[cards] no unclaimed character source is currently available.');
   return null;
 }
 
@@ -919,43 +977,87 @@ async function fetchImageBuffer(url) {
     return { buffer: Buffer.from(arr), contentType: type };
   } finally { clearTimeout(timer); }
 }
-async function sendPhoto(chatId, url, caption, markup) {
-  if (!deps || typeof deps.sendPhoto !== 'function') return null;
+const renderedCardCache = new Map();
+function renderedCardKey(card) {
+  const tier = cardTierMeta(card);
+  return `${card && (card.character_id || card.id) || 'unknown'}|${card && card.image_url || ''}|T${tier.tier}`;
+}
+function cacheRenderedCard(key, buffer) {
+  if (!key || !Buffer.isBuffer(buffer)) return;
+  renderedCardCache.set(key, buffer);
+  while (renderedCardCache.size > 8) renderedCardCache.delete(renderedCardCache.keys().next().value);
+}
+async function renderCardBuffer(card, sourceBuffer) {
+  if (!card || !Buffer.isBuffer(sourceBuffer)) return null;
+  const key = renderedCardKey(card);
+  if (renderedCardCache.has(key)) return renderedCardCache.get(key);
   try {
-    const img = await fetchImageBuffer(url);
-    return await deps.sendPhoto(chatId, img.buffer, { caption, reply_markup: markup }, { filename: `hunt.${img.contentType.includes('png') ? 'png' : 'jpg'}`, contentType: img.contentType });
-  } catch (e) { console.warn('[hunt] buffered photo:', e.message); }
-  try { return await deps.sendPhoto(chatId, url, { caption, reply_markup: markup }); } catch (e) { console.warn('[hunt] URL photo:', e.message); }
-  return reply(chatId, caption, { title: '⚔️ ANIME HUNT', reply_markup: markup, alwaysShowMarkup: true });
+    const rendered = await cardRenderer.render(card, sourceBuffer);
+    if (rendered && Buffer.isBuffer(rendered.buffer)) {
+      cacheRenderedCard(key, rendered.buffer);
+      return rendered.buffer;
+    }
+  } catch (e) {
+    console.warn(`[cards] render failed for ${card.name || card.character_id}: ${e.message}`);
+  }
+  return null;
+}
+async function sendCardPhoto(chatId, card, caption, markup) {
+  if (!deps || typeof deps.sendPhoto !== 'function' || !card) return null;
+  const url = card.image_url;
+  let downloaded = null;
+  try {
+    downloaded = await fetchImageBuffer(url);
+    const rendered = await renderCardBuffer(card, downloaded.buffer);
+    if (rendered) {
+      return await deps.sendPhoto(
+        chatId,
+        rendered,
+        { caption, reply_markup: markup },
+        { filename: `rimuru-card-${String(card.character_id || 'character').replace(/[^A-Za-z0-9_-]/g, '_')}.png`, contentType: 'image/png' },
+      );
+    }
+  } catch (e) { console.warn('[cards] generated photo:', e.message); }
+
+  // Rendering is presentation only. If sharp cannot load on a platform, keep
+  // the game functional by sending the validated source art instead of making
+  // /hunt appear empty again.
+  if (downloaded && downloaded.buffer) {
+    try {
+      return await deps.sendPhoto(chatId, downloaded.buffer, { caption, reply_markup: markup }, { filename: 'card-source.jpg', contentType: downloaded.contentType || 'image/jpeg' });
+    } catch (e) { console.warn('[cards] source buffer photo:', e.message); }
+  }
+  try { return await deps.sendPhoto(chatId, url, { caption, reply_markup: markup }); } catch (e) { console.warn('[cards] source URL photo:', e.message); }
+  return reply(chatId, caption, { title: '🃏 CARDS', reply_markup: markup, alwaysShowMarkup: true });
 }
 async function answerCb(text) { if (deps && typeof deps.answerCb === 'function') try { await deps.answerCb(text); } catch (_) {} }
 
 async function spawn(opts = {}) {
-  if (!config.hunt.enabled) return { ok: false, message: 'The Anime Hunt is disabled.' };
+  if (!config.hunt.enabled) return { ok: false, message: 'Cards are disabled.' };
   expireIfNeeded();
   const existing = db.getActiveHunt();
-  if (isSpawnClaimable(existing)) return { ok: false, message: `⚔️ A character is already up for grabs (${secondsRemaining(existing)}s left).` };
+  if (isSpawnClaimable(existing)) return { ok: false, message: `🃏 A card is already up for grabs (${secondsRemaining(existing)}s left).` };
   if (existing) db.clearActiveHunt();
   const card = await fetchSpawnCharacter();
-  if (!card) return { ok: false, message: '⚔️ The hunting grounds are quiet right now. Try again shortly.' };
+  if (!card) return { ok: false, message: '🃏 Rimuru could not prepare a card right now. Try again shortly.' };
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveHunt();
-  await sendPhoto(opts.chatId, card.image_url, announceCaption(card, row), claimMarkup());
+  await sendCardPhoto(opts.chatId, card, announceCaption(card, row), claimMarkup());
   return { ok: true, character: card, expiresAt };
 }
 
 async function claim(userId, opts = {}) {
   const answer = typeof opts.answerCb === 'function' ? opts.answerCb : answerCb;
   const row = db.getActiveHunt();
-  if (!row) return await answer('No character is up for grabs right now.'), { ok: false, reason: 'no-active-hunt' };
-  if (!isSpawnClaimable(row)) return await answer('This character already expired or was claimed.'), { ok: false, reason: 'not-claimable' };
+  if (!row) return await answer('No card is up for grabs right now.'), { ok: false, reason: 'no-active-hunt' };
+  if (!isSpawnClaimable(row)) return await answer('This card already expired or was claimed.'), { ok: false, reason: 'not-claimable' };
   const char = { character_id: row.character_id, name: row.name, series: row.series, image_url: row.image_url, bio: row.bio, favorites: row.favorites, rarity: row.rarity };
-  if (!db.claimHuntCharacter(userId, char)) return await answer('Someone else already claimed this character!'), { ok: false, reason: 'already-claimed' };
+  if (!db.claimHuntCharacter(userId, char)) return await answer('Someone else already claimed this card!'), { ok: false, reason: 'already-claimed' };
   db.clearActiveHunt();
   const user = db.getUser(userId) || {};
   const claimer = user.username ? `@${user.username}` : user.first_name || `user ${userId}`;
-  await reply(opts.chatId || row.chat_id, claimedCaption(char, claimer), { title: '⚔️ CLAIMED' });
+  await reply(opts.chatId || row.chat_id, claimedCaption(char, claimer), { title: '🃏 CARD CLAIMED' });
   return { ok: true, character: char, userId };
 }
 function expireIfNeeded(now = Date.now()) {
@@ -970,10 +1072,12 @@ async function searchAndShow(query, opts = {}) {
   if (!q) return { ok: false, message: 'Usage: /char <name>' };
   const seed = await searchAniListCharacter(q);
   if (!seed) return { ok: false, message: `No character found for ${stripUrls(q)}.` };
-  const card = await chooseBestCharacter(seed);
-  if (!card) return { ok: false, message: `Found ${stripUrls(seed.name)}, but no usable non-AniList artwork source responded.` };
+  const merged = mergeMetadata(seed, []);
+  merged.reference_image_url = seed.reference_image_url || seed.image_url;
+  const card = await selectArtworkForIdentity(merged, { context: 'cards-search' });
+  if (!card) return { ok: false, message: `Found ${stripUrls(seed.name)}, but no usable image could be prepared.` };
   db.cacheHuntCharacter(card);
-  await sendPhoto(opts.chatId, card.image_url, detailCaption(card), null);
+  await sendCardPhoto(opts.chatId, card, detailCaption(card), null);
   return { ok: true, character: card };
 }
 
@@ -987,7 +1091,7 @@ async function autoSpawnTick(env = {}) {
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, groups[0]);
   const row = db.getActiveHunt();
-  for (const gid of groups) await sendPhoto(gid, card.image_url, announceCaption(card, row), claimMarkup());
+  for (const gid of groups) await sendCardPhoto(gid, card, announceCaption(card, row), claimMarkup());
 }
 
 let autoSpawnTimer = null;
@@ -1010,20 +1114,21 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[hunt-v1.0.10] AniList metadata + STRICT vision-verified DanbooruSafe/Safebooru/Gelbooru artwork; unverified Hunt fallback DISABLED; vision=${process.env.HUNT_VISION_MODEL || DEFAULT_VISION_MODEL}`);
+  console.log(`[cards-v1.0.11] /hunt kept; generated T1-T6 Cards enabled; artwork=exact character-tag DanbooruSafe/Safebooru/Gelbooru with identity-card fallback; renderer=${cardRenderer.available() ? 'sharp' : 'source-fallback'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
 
 module.exports = {
-  RARITY_TIERS, rarityFor, rarityMeta, isSpawnClaimable, secondsRemaining, seriesNameOf,
+  RARITY_TIERS, rarityFor, rarityMeta, cardTierMeta, isSpawnClaimable, secondsRemaining, seriesNameOf,
   animeListOf, truncateBio, announceCaption, claimedCaption, detailCaption, collectionCaption,
   leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
   fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
   fetchJikanPictures, fetchRandomFromAniList, fetchAniListById, fetchSpawnCharacter, resolveCharacter,
-  attach, spawn, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state,
+  attach, spawn, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, state, sendCardPhoto, renderCardBuffer,
   FALLBACK_POOL, fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
   normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork,
   searchSafebooruArtwork, searchDanbooruSafeArtwork, searchArtworkSources, selectArtworkForIdentity, verifyArtworkWithVision,
+  candidateHasExactCharacterTag, trustedArtworkRank,
   _clear: () => db.clearActiveHunt(),
 };
