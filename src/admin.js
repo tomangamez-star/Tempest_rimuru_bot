@@ -142,6 +142,7 @@ function gateAllowed() {
 /* ===================== owner purge lock ===================== */
 
 let purgeState = null;
+let pendingPurgeApproval = null;
 
 function sleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
@@ -150,6 +151,43 @@ function isPurgeLocked() { return !!purgeState; }
 function purgeAmount(raw) {
   const amt = Math.floor(Number(String(raw == null ? '' : raw).replace(/,/g, '')));
   return Number.isFinite(amt) && amt >= 0 ? amt : null;
+}
+
+
+function clearPendingPurgeApproval() {
+  if (pendingPurgeApproval && pendingPurgeApproval.timeout) clearTimeout(pendingPurgeApproval.timeout);
+  pendingPurgeApproval = null;
+}
+
+async function requestModPurge(ctx, rawAmount) {
+  if (!isStaff(ctx.userId) || isOwner(ctx.userId)) return beginPurge(ctx, rawAmount);
+  const amount = purgeAmount(rawAmount);
+  if (amount === null) return ctx.reply('Usage: <code>/purge [amount]</code>. Amount must be zero or greater.', { title: '💀 PURGE', color: '#F44336', html: true });
+  if (purgeState || pendingPurgeApproval) return ctx.reply('A purge or purge approval is already active.', { title: '💀 PURGE', color: '#F44336' });
+  const actor = metaOf(ctx.msg);
+  pendingPurgeApproval = { requesterId:Number(ctx.userId), requesterChatId:Number(ctx.chatId), requesterName:actor.username||actor.first_name||String(ctx.userId), amount, timeout:null };
+  const req = pendingPurgeApproval;
+  try {
+    await ctx.bot.sendMessage(Number(config.ownerId), `💀 <b>MOD PURGE REQUEST</b>\n\nModerator: <b>${req.requesterName}</b> <code>${req.requesterId}</code>\nRequested wallet: <b>${fmt(amount)}</b>\nBank: <b>0</b>\n\nReply <code>YES</code> to approve or <code>NO</code> to reject.`, { parse_mode:'HTML' });
+  } catch (e) { clearPendingPurgeApproval(); return ctx.reply('Could not reach the owner for purge approval.', { title:'💀 PURGE', color:'#F44336' }); }
+  await ctx.reply('⏳ Purge request sent to the owner. Nothing will happen unless the owner approves it.', { title:'💀 PURGE APPROVAL', color:'#FFD700' });
+  req.timeout=setTimeout(()=>{ if(pendingPurgeApproval===req){ clearPendingPurgeApproval(); Promise.resolve(ctx.bot.sendMessage(req.requesterChatId,'🕯️ Purge request expired. No balances were changed.')).catch(()=>{}); } },90000);
+  req.timeout.unref && req.timeout.unref();
+}
+
+async function handlePurgeApprovalMessage(ctx, text) {
+  if (!pendingPurgeApproval || !isOwner(ctx.userId) || Number(ctx.chatId)!==Number(config.ownerId)) return false;
+  const clean=String(text||'').trim().toLowerCase();
+  if (!['yes','no'].includes(clean)) return false;
+  const req=pendingPurgeApproval; clearPendingPurgeApproval();
+  if (clean==='no') {
+    await ctx.reply('❌ Mod purge request rejected. No balances were changed.', { title:'💀 PURGE REJECTED', color:'#F44336' });
+    try{await ctx.bot.sendMessage(req.requesterChatId,'❌ The owner rejected your purge request.');}catch(e){}
+    return true;
+  }
+  try{await ctx.bot.sendMessage(req.requesterChatId,'✅ The owner approved your purge request. Final confirmation is now with the owner.');}catch(e){}
+  await beginPurge(ctx, req.amount);
+  return true;
 }
 
 function clearPurgeState() {
@@ -284,8 +322,10 @@ No local purge was committed.`, { title: '💀 PURGE FAILED', color: '#F44336', 
 }
 
 async function purge(ctx) {
-  return beginPurge(ctx, (ctx.args || [])[0]);
+  if (isOwner(ctx.userId)) return beginPurge(ctx, (ctx.args || [])[0]);
+  return requestModPurge(ctx, (ctx.args || [])[0]);
 }
+
 
 async function mod(ctx) {
   if (!isOwner(ctx.userId)) return ctx.reply('Only the King can appoint moderators. 👑', { title: '🔒 OWNER ONLY', color: '#F44336' });
@@ -620,4 +660,5 @@ module.exports = {
   purge,
   isPurgeLocked,
   handlePurgeMessage,
+  handlePurgeApprovalMessage,
 };
