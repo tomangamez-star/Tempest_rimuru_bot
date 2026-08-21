@@ -15,9 +15,10 @@ async function download(path){ if(!ready())throw new Error('Supabase card storag
 function count(userId){return db.getCustomRenderCount(userId,dayKey());}
 function mark(userId){return db.incrementCustomRenderCount(userId,dayKey());}
 function save(meta,path){return db.saveCustomCard({...meta,storage_path:path,created_at:Date.now()});}
+function findLatestByNameTier(name,tier){return db.getLatestCustomCardByNameTier(name,tier);}
 function list(userId){return db.getUserCustomCards(userId,50);}
 function get(id){return db.getCustomCard(String(id||'').replace(/^#/,'').toUpperCase());}
 function setOverride(cardId,ownerId){const c=get(cardId);if(!c)return null; return db.setCardOverride({override_key:overrideKey(c.name,c.tier),card_id:c.card_id,name:c.name,tier:c.tier,renderer:c.renderer,set_by:ownerId,created_at:Date.now()});}
 function resetOverride(name,tier){const k=overrideKey(name,tier);db.deleteCardOverride(k);return k;}
 function findOverride(name,tier){const o=db.getCardOverride(overrideKey(name,tier)); if(!o)return null; const c=get(o.card_id); return c?{...o,card:c}:null;}
-module.exports={ready,BUCKET,newId,upload,download,count,mark,save,list,get,setOverride,resetOverride,findOverride,overrideKey};
+module.exports={ready,BUCKET,newId,upload,download,count,mark,save,list,get,setOverride,resetOverride,findOverride,overrideKey,findLatestByNameTier};

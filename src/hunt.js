@@ -2050,8 +2050,6 @@ async function searchAndShow(query, opts = {}) {
   const merged = mergeMetadata(seed, []);
   merged.reference_image_url = seed.reference_image_url || seed.image_url;
   if (parsed.tier) merged.forced_tier = parsed.tier;
-
-  // Owner-approved custom cards become canonical for the matching name+tier.
   const requestedTier = parsed.tier || Number(cardTierMeta(merged).tier) || 0;
   if (requestedTier) {
     const override = customCards.findOverride(merged.name, requestedTier);
@@ -2063,36 +2061,24 @@ async function searchAndShow(query, opts = {}) {
       } catch (e) { console.warn(`[char] official custom override ${override.card.card_id} failed: ${e.message}`); }
     }
   }
-
-  // v1.0.18: /char is now the premium showcase. Try the Old Gen + Danbooru
-  // pipeline first so /char makima and /char gojo t5 render like /shunt.
-  // Keep a Gen 2 fallback for obscure characters that do not have six safe,
-  // exact, solo Danbooru artworks; a lookup should never become unusable just
-  // because the premium catalogue is narrower than AniList.
-  let card = null;
-  try {
-    card = await selectDanbooruSpecialArtwork(merged, {
-      context: parsed.tier ? `char-oldgen-t${parsed.tier}` : 'char-oldgen',
-      minPool: SPECIAL_MIN_ARTWORKS,
-    });
-  } catch (e) {
-    console.warn(`[char] ${merged.name}: Old Gen Danbooru preview failed: ${e.message}`);
+  const wanted = ['gen2','oldgen','signature'].includes(String(opts.style||'')) ? String(opts.style) : 'oldgen';
+  let card=null, style=wanted;
+  if (wanted==='oldgen') {
+    try { card=await selectDanbooruSpecialArtwork(merged,{context:parsed.tier?`char-oldgen-t${parsed.tier}`:'char-oldgen',minPool:SPECIAL_MIN_ARTWORKS}); } catch(e){console.warn(`[char] ${merged.name}: Old Gen failed: ${e.message}`);}
+    if(card){ await sendSpecialCardPhoto(opts.chatId,card,detailCaption(card),null); return {ok:true,character:card,previewTier:parsed.tier||null,style}; }
+  } else {
+    try { card=await selectArtworkForIdentity(merged,{context:parsed.tier?`char-${wanted}-t${parsed.tier}`:`char-${wanted}`}); } catch(e){console.warn(`[char] ${merged.name}: ${wanted} artwork failed: ${e.message}`);}
+    if(card){
+      if(wanted==='signature') await sendSignatureCardPhoto(opts.chatId,asSignatureCard(card),detailCaption(card),null);
+      else await sendCardPhoto(opts.chatId,card,detailCaption(card),null);
+      return {ok:true,character:card,previewTier:parsed.tier||null,style};
+    }
   }
-
-  let style = 'old-gen';
-  if (!card) {
-    style = 'gen2-fallback';
-    card = await selectArtworkForIdentity(merged, {
-      context: parsed.tier ? `char-gen2-fallback-t${parsed.tier}` : 'char-gen2-fallback',
-    });
-  }
-  if (!card) return { ok: false, message: `Found ${stripUrls(seed.name)}, but no usable image could be prepared.` };
-
-  // /char is a presentation lookup. Do not let a premium preview overwrite
-  // the normal spawn/cache metadata or change how an already-claimed card is
-  // stored. The Old Gen marker on this in-memory card is enough for rendering.
-  await sendCardPhoto(opts.chatId, card, detailCaption(card), null);
-  return { ok: true, character: card, previewTier: parsed.tier || null, style };
+  // Cross-style fallback keeps obscure lookups functional.
+  card=await selectArtworkForIdentity(merged,{context:'char-fallback'});
+  if(!card) return {ok:false,message:`Found ${stripUrls(seed.name)}, but no usable image could be prepared.`};
+  await sendCardPhoto(opts.chatId,card,detailCaption(card),null);
+  return {ok:true,character:card,previewTier:parsed.tier||null,style:'gen2-fallback'};
 }
 
 function rollAutoSpawnStyle(random = Math.random) {

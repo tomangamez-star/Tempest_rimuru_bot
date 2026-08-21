@@ -112,7 +112,7 @@ async function analyzeArtwork(imageBuffer, tier) {
   const p1=picked[0]?rgbToHex(picked[0]):base1;
   const p2=picked[1]?rgbToHex(picked[1]):(picked[0]?mixHex(p1,base2,.45):base2);
   // Tier establishes identity; art pushes the hue/personality.
-  const accent1=mixHex(base1,p1,.68), accent2=mixHex(base2,p2,.72);
+  const accent1=mixHex(p1,base1,tier.tier<=3?.28:tier.tier===4?.18:.10), accent2=mixHex(p2,base2,tier.tier<=3?.30:tier.tier===4?.18:.10);
 
   const bg = border.length ? border.reduce((a,p)=>[a[0]+p[0],a[1]+p[1],a[2]+p[2]],[0,0,0]).map(v=>v/border.length) : [128,128,128];
   const spread = border.length ? border.reduce((s,p)=>s+colorDistance(p,bg),0)/border.length : 99;
@@ -121,7 +121,8 @@ async function analyzeArtwork(imageBuffer, tier) {
   const flatColored = spread<28 && bgSat>.14 && bgVal>.24;
   const flatNeutral = spread<19 && !whiteLike && bgVal>.18 && bgVal<.86;
   const mean=lumSum/Math.max(1,pxCount), std=Math.sqrt(Math.max(0,lumSq/Math.max(1,pxCount)-mean*mean));
-  const mode = (flatColored || flatNeutral) ? 'isolated' : (spread<48 || std<48 ? 'hybrid' : 'scene');
+  const colorChaos = bgSat>.42 && spread>52;
+  const mode = (flatColored || flatNeutral) ? 'isolated' : (colorChaos || spread<48 || std<48 ? 'hybrid' : 'scene');
   return { accent1, accent2, palette:[p1,p2,...picked.slice(2).map(rgbToHex)], bg: bg.map(Math.round), borderSpread:spread, mode, whiteLike };
 }
 
@@ -141,8 +142,12 @@ function seriesSize(series){const n=clean(series,100).length;return n<=24?20:n<=
 
 function starsSvg(tier, a1, a2) {
   const n=Math.max(1,Math.min(6,Number(tier)||1));
-  const spacing=n>=6?56:62,total=(n-1)*spacing,start=350-total/2;
-  return Array.from({length:n},(_,i)=>`<g filter="url(#starGlow)"><polygon points="0,-25 7,-8 25,-8 11,3 16,21 0,11 -16,21 -11,3 -25,-8 -7,-8" transform="translate(${start+i*spacing} 570)" fill="url(#sigAccent)" stroke="#FFF" stroke-opacity=".9" stroke-width="1.5"/></g>`).join('');
+  const premium=n>=4, spacing=n>=6?57:64,total=(n-1)*spacing,start=350-total/2,mid=(n-1)/2;
+  return Array.from({length:n},(_,i)=>{
+    const d=Math.abs(i-mid), scale=premium?(d<.6?1.34:d<1.6?1.12:.94):1;
+    const rot=premium?(i-mid)*-4:0;
+    return `<g transform="translate(${start+i*spacing} 570) scale(${scale}) rotate(${rot})" filter="url(#starGlow)"><polygon points="0,-25 7,-8 25,-8 11,3 16,21 0,11 -16,21 -11,3 -25,-8 -7,-8" fill="url(#starPremium)" stroke="#FFF" stroke-opacity=".94" stroke-width="1.5"/><polygon points="0,-17 5,-5 17,-5 8,2 11,14 0,8 -11,14 -8,2 -17,-5 -5,-5" fill="none" stroke="#FFF" stroke-opacity="${premium?'.55':'.18'}" stroke-width="1"/></g>`;
+  }).join('');
 }
 
 function generatedBackdropSvg(a1,a2,tier,mode) {
@@ -195,10 +200,10 @@ function overlaySvg(card, analysis) {
   const lines=wrap(card.bio||card.description||'',52,4).map(esc);
   const desc=lines.map((l,i)=>`<text x="350" y="${673+i*29}" text-anchor="middle" font-size="19" font-family="DejaVu Sans,Arial,sans-serif" font-weight="700" fill="#FFF">${l}</text>`).join('');
   const ns=nameSize(nameRaw),ss=seriesSize(seriesRaw),t=tier.tier;
-  const tierDetail=t>=5?`<path d="M83 152 C120 122 152 140 188 104" fill="none" stroke="url(#sigAccent)" stroke-width="3" opacity=".35"/><path d="M535 136 C565 100 596 118 624 88" fill="none" stroke="url(#sigAccent)" stroke-width="3" opacity=".35"/>`:'';
+  const tierDetail=t>=4?`<path d="M83 152 C120 122 152 140 188 104" fill="none" stroke="url(#sigAccent)" stroke-width="${t>=6?7:t>=5?5:3}" opacity="${t>=5?'.60':'.35'}"/><path d="M535 136 C565 100 596 118 624 88" fill="none" stroke="url(#sigAccent)" stroke-width="${t>=6?7:t>=5?5:3}" opacity="${t>=5?'.60':'.35'}"/>${t>=5?'<circle cx="350" cy="450" r="270" fill="none" stroke="url(#sigAccent)" stroke-opacity=".16" stroke-width="18"/>':''}`:'';
   return Buffer.from(`<svg width="700" height="900" xmlns="http://www.w3.org/2000/svg"><defs>
     <linearGradient id="sigAccent" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${a1}"/><stop offset=".55" stop-color="${a2}"/><stop offset="1" stop-color="${tier.base2}"/></linearGradient>
-    <linearGradient id="infoBg" x1="0" y1="0" x2="0" y2="1"><stop stop-color="${a1}" stop-opacity=".24"/><stop offset="1" stop-color="${a2}" stop-opacity=".78"/></linearGradient>
+    <linearGradient id="infoBg" x1="0" y1="0" x2="0" y2="1"><stop stop-color="${a1}" stop-opacity="${t>=5?'.10':t===4?'.17':'.24'}"/><stop offset="1" stop-color="${a2}" stop-opacity="${t>=5?'.50':t===4?'.64':'.78'}"/></linearGradient><radialGradient id="starPremium"><stop stop-color="#FFFFFF"/><stop offset=".20" stop-color="${a2}"/><stop offset=".58" stop-color="${a1}"/><stop offset="1" stop-color="${tier.base2}"/></radialGradient>
     <filter id="shadow" x="-40%" y="-40%" width="180%" height="180%"><feGaussianBlur in="SourceAlpha" stdDeviation="5" result="b"/><feOffset dy="5" result="o"/><feComponentTransfer in="o"><feFuncA type="linear" slope=".45"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
     <filter id="starGlow" x="-80%" y="-80%" width="260%" height="260%"><feGaussianBlur stdDeviation="5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
   </defs>
@@ -246,7 +251,11 @@ async function render(card, imageBuffer) {
 
   let art;
   if(analysis.mode==='isolated') {
-    let subject=await flatBackgroundSubject(imageBuffer,analysis);
+    // Premium cards prefer the stronger segmentation service when configured.
+    // Local matte is deliberately a fallback because anime hair/skin can share
+    // flat-background colors and the old implementation amputated subjects.
+    let subject=(tier.tier>=4 && String(process.env.REMOVEBG_API_KEY||'').trim()) ? await externalBackgroundSubject(imageBuffer) : null;
+    if(!subject) subject=await flatBackgroundSubject(imageBuffer,analysis);
     if(!subject && String(process.env.REMOVEBG_API_KEY||'').trim()) subject=await externalBackgroundSubject(imageBuffer);
     if(subject) {
       const subjectFit=await sharp(subject).resize(ART.width,ART.height,{fit:'contain',position:'bottom',background:{r:0,g:0,b:0,alpha:0}}).png().toBuffer();
@@ -265,12 +274,15 @@ async function render(card, imageBuffer) {
   // beneath the description rather than a generic black box.
   const lower=Buffer.from(`<svg width="700" height="900" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="l" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${analysis.accent1}" stop-opacity=".22"/><stop offset=".55" stop-color="#F7F7F7"/><stop offset="1" stop-color="${analysis.accent2}" stop-opacity=".55"/></linearGradient></defs><rect width="700" height="900" fill="#F4F4F4"/><path d="M62 51 H608 L650 93 V750 L590 835 H144 L61 754 Z" fill="url(#l)"/><g fill="${analysis.accent1}" opacity=".13"><polygon points="90,690 145,660 200,690 200,750 145,780 90,750"/><polygon points="430,620 490,588 550,620 550,684 490,716 430,684"/></g></svg>`);
 
+  let premiumBleed=null;
+  if(tier.tier>=4){
+    premiumBleed=await sharp(imageBuffer).rotate().resize(578,748,{fit:'cover',position:'attention'}).modulate({saturation:1.06,brightness:.92}).png().toBuffer();
+  }
+  const layers=[{input:lower,left:0,top:0}];
+  if(premiumBleed) layers.push({input:premiumBleed,left:62,top:84,blend:'over'});
+  layers.push({input:masked,left:ART.left,top:ART.top},{input:overlaySvg(card,analysis),left:0,top:0});
   const buffer=await sharp({create:{width:WIDTH,height:HEIGHT,channels:4,background:'#F5F5F5'}})
-    .composite([
-      {input:lower,left:0,top:0},
-      {input:masked,left:ART.left,top:ART.top},
-      {input:overlaySvg(card,analysis),left:0,top:0},
-    ])
+    .composite(layers)
     .png({compressionLevel:9,adaptiveFiltering:true})
     .toBuffer();
 

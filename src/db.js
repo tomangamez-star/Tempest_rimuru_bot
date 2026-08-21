@@ -2087,6 +2087,7 @@ function saveCustomCard(row) {
 }
 function getCustomCard(cardId){ return prep('SELECT * FROM custom_cards WHERE card_id=?').get(cardId); }
 function getUserCustomCards(userId, limit=50){ return prep('SELECT * FROM custom_cards WHERE user_id=? ORDER BY created_at DESC LIMIT ?').all(userId,limit); }
+function getLatestCustomCardByNameTier(name,tier){ return prep('SELECT * FROM custom_cards WHERE lower(name)=lower(?) AND tier=? ORDER BY created_at DESC LIMIT 1').get(String(name||''),Number(tier)||0); }
 function setCardOverride(row){
   prep('INSERT OR REPLACE INTO card_overrides (override_key,card_id,name,tier,renderer,set_by,created_at) VALUES (?,?,?,?,?,?,?)')
     .run(row.override_key,row.card_id,row.name,row.tier,row.renderer,row.set_by,row.created_at||Date.now());
@@ -2166,7 +2167,7 @@ module.exports = {
   getHuntLeaderboard, isHuntCharacterClaimed, cacheHuntCharacter,
   getCachedHuntCharacter, getHuntPool,
   // Custom cards
-  getCustomRenderCount, incrementCustomRenderCount, saveCustomCard, getCustomCard, getUserCustomCards, setCardOverride, getCardOverride, deleteCardOverride,
+  getCustomRenderCount, incrementCustomRenderCount, saveCustomCard, getCustomCard, getUserCustomCards, getLatestCustomCardByNameTier, setCardOverride, getCardOverride, deleteCardOverride,
   // Attack
   getAttackEligibleUsers,
   // Memory
