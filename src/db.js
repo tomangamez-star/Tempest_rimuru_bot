@@ -120,6 +120,9 @@ const TABLE_COLS = {
   hunt_cache: 'character_id, name, series, image_url, bio, favorites, rarity, cached_at',
   hunt_claims: 'user_id, character_id, name, series, image_url, rarity, claimed_at',
   hunt_spawn: 'character_id, name, series, image_url, bio, favorites, rarity, expires_at, chat_id, claimed',
+  custom_cards: 'card_id, user_id, renderer, tier, name, series, info, quote, storage_path, created_at',
+  custom_render_usage: 'user_id, day_key, render_count, updated_at',
+  card_overrides: 'override_key, card_id, name, tier, renderer, set_by, created_at',
   bot_memory: 'key, value, category, updated_at',
   settings: 'key, value, updated_at',
 };
@@ -151,6 +154,9 @@ const TABLE_PKS = {
   hunt_cache: 'character_id',
   hunt_claims: 'character_id',
   hunt_spawn: 'character_id',
+  custom_cards: 'card_id',
+  custom_render_usage: 'user_id, day_key',
+  card_overrides: 'override_key',
   bot_memory: 'key',
   settings: 'key',
 };
@@ -384,6 +390,15 @@ function createTables() {
       image_url TEXT DEFAULT '',
       rarity TEXT DEFAULT 'common',
       claimed_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS custom_cards (
+      card_id TEXT PRIMARY KEY, user_id INTEGER, renderer TEXT, tier INTEGER, name TEXT, series TEXT, info TEXT, quote TEXT, storage_path TEXT, created_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS custom_render_usage (
+      user_id INTEGER, day_key TEXT, render_count INTEGER DEFAULT 0, updated_at INTEGER, PRIMARY KEY (user_id, day_key)
+    );
+    CREATE TABLE IF NOT EXISTS card_overrides (
+      override_key TEXT PRIMARY KEY, card_id TEXT, name TEXT, tier INTEGER, renderer TEXT, set_by INTEGER, created_at INTEGER
     );
     CREATE TABLE IF NOT EXISTS hunt_spawn (
       character_id TEXT PRIMARY KEY,
@@ -2051,6 +2066,36 @@ async function pgRun(table, sql, params = []) {
   }
 }
 
+/* ===================== CUSTOM CARDS ===================== */
+function getCustomRenderCount(userId, dayKey) {
+  const r = prep('SELECT render_count FROM custom_render_usage WHERE user_id = ? AND day_key = ?').get(userId, dayKey);
+  return r ? Number(r.render_count) || 0 : 0;
+}
+function incrementCustomRenderCount(userId, dayKey) {
+  const now = Date.now();
+  prep('INSERT INTO custom_render_usage (user_id, day_key, render_count, updated_at) VALUES (?, ?, 1, ?) ON CONFLICT(user_id, day_key) DO UPDATE SET render_count = render_count + 1, updated_at = excluded.updated_at').run(userId, dayKey, now);
+  const row = prep('SELECT * FROM custom_render_usage WHERE user_id = ? AND day_key = ?').get(userId, dayKey);
+  queuePgWrite('custom_render_usage', [row.user_id,row.day_key,row.render_count,row.updated_at]);
+  return Number(row.render_count)||0;
+}
+function saveCustomCard(row) {
+  prep('INSERT OR REPLACE INTO custom_cards (card_id,user_id,renderer,tier,name,series,info,quote,storage_path,created_at) VALUES (?,?,?,?,?,?,?,?,?,?)')
+    .run(row.card_id,row.user_id,row.renderer,row.tier,row.name,row.series,row.info||'',row.quote||'',row.storage_path||'',row.created_at||Date.now());
+  const r=prep('SELECT * FROM custom_cards WHERE card_id=?').get(row.card_id);
+  queuePgWrite('custom_cards',[r.card_id,r.user_id,r.renderer,r.tier,r.name,r.series,r.info,r.quote,r.storage_path,r.created_at]);
+  return r;
+}
+function getCustomCard(cardId){ return prep('SELECT * FROM custom_cards WHERE card_id=?').get(cardId); }
+function getUserCustomCards(userId, limit=50){ return prep('SELECT * FROM custom_cards WHERE user_id=? ORDER BY created_at DESC LIMIT ?').all(userId,limit); }
+function setCardOverride(row){
+  prep('INSERT OR REPLACE INTO card_overrides (override_key,card_id,name,tier,renderer,set_by,created_at) VALUES (?,?,?,?,?,?,?)')
+    .run(row.override_key,row.card_id,row.name,row.tier,row.renderer,row.set_by,row.created_at||Date.now());
+  const r=prep('SELECT * FROM card_overrides WHERE override_key=?').get(row.override_key);
+  queuePgWrite('card_overrides',[r.override_key,r.card_id,r.name,r.tier,r.renderer,r.set_by,r.created_at]); return r;
+}
+function getCardOverride(key){ return prep('SELECT * FROM card_overrides WHERE override_key=?').get(key); }
+function deleteCardOverride(key){ prep('DELETE FROM card_overrides WHERE override_key=?').run(key); if(pgPool&&pgReady) pgPool.query('DELETE FROM card_overrides WHERE override_key=$1',[key]).catch(()=>{}); }
+
 /* ===================== CLOSE ===================== */
 
 function close() {
@@ -2120,6 +2165,8 @@ module.exports = {
   getHuntCollection, getUserHuntCharacters, getHuntCharacterByIndex,
   getHuntLeaderboard, isHuntCharacterClaimed, cacheHuntCharacter,
   getCachedHuntCharacter, getHuntPool,
+  // Custom cards
+  getCustomRenderCount, incrementCustomRenderCount, saveCustomCard, getCustomCard, getUserCustomCards, setCardOverride, getCardOverride, deleteCardOverride,
   // Attack
   getAttackEligibleUsers,
   // Memory

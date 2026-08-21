@@ -1,4 +1,5 @@
 'use strict';
+const customCards = require('./custom-cards');
 
 const config = require('./config');
 const db = require('./db');
@@ -1864,6 +1865,18 @@ async function sendSpecialCardPhoto(chatId, card, caption, markup) {
   return { ok: false };
 }
 
+async function sendOfficialOverrideIfAny(chatId, card, caption, markup) {
+  try {
+    const tier = Number(card && card.forced_tier) || Number(cardTierMeta(card).tier) || 0;
+    const o = tier ? customCards.findOverride(card.name, tier) : null;
+    if (!o) return false;
+    const buffer = await customCards.download(o.card.storage_path);
+    await deps.sendPhoto(chatId, buffer, { caption, reply_markup: markup }, { filename: `${o.card.card_id}.png`, contentType: 'image/png' });
+    console.log(`[cards] official custom override used: ${card.name} T${tier} -> ${o.card.card_id}`);
+    return true;
+  } catch (e) { console.warn('[cards] official override failed:', e.message); return false; }
+}
+
 async function spawnSpecial(opts = {}) {
   if (!config.hunt.enabled) return { ok: false, message: 'Cards are disabled.' };
   expireIfNeeded();
@@ -1875,7 +1888,8 @@ async function spawnSpecial(opts = {}) {
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveHunt();
-  await sendSpecialCardPhoto(opts.chatId, card, specialAnnounceCaption(card, row), claimMarkup());
+  const specialCaption = specialAnnounceCaption(card, row), specialMarkup = claimMarkup();
+  if (!(await sendOfficialOverrideIfAny(opts.chatId, card, specialCaption, specialMarkup))) await sendSpecialCardPhoto(opts.chatId, card, specialCaption, specialMarkup);
   return { ok: true, character: card, expiresAt, style: 'old-gen' };
 }
 
@@ -1890,7 +1904,8 @@ async function spawn(opts = {}) {
   const expiresAt = Date.now() + config.hunt.claimWindowMs;
   db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
   const row = db.getActiveHunt();
-  await sendCardPhoto(opts.chatId, card, announceCaption(card, row), claimMarkup());
+  const normalCaption = announceCaption(card, row), normalMarkup = claimMarkup();
+  if (!(await sendOfficialOverrideIfAny(opts.chatId, card, normalCaption, normalMarkup))) await sendCardPhoto(opts.chatId, card, normalCaption, normalMarkup);
   return { ok: true, character: card, expiresAt };
 }
 
@@ -1930,6 +1945,19 @@ async function searchAndShow(query, opts = {}) {
   const merged = mergeMetadata(seed, []);
   merged.reference_image_url = seed.reference_image_url || seed.image_url;
   if (parsed.tier) merged.forced_tier = parsed.tier;
+
+  // Owner-approved custom cards become canonical for the matching name+tier.
+  const requestedTier = parsed.tier || Number(cardTierMeta(merged).tier) || 0;
+  if (requestedTier) {
+    const override = customCards.findOverride(merged.name, requestedTier);
+    if (override) {
+      try {
+        const buffer = await customCards.download(override.card.storage_path);
+        await deps.sendPhoto(opts.chatId, buffer, { caption: detailCaption({ ...merged, forced_tier: requestedTier }) }, { filename: `${override.card.card_id}.png`, contentType: 'image/png' });
+        return { ok: true, character: merged, previewTier: requestedTier, style: 'custom-official', customCardId: override.card.card_id };
+      } catch (e) { console.warn(`[char] official custom override ${override.card.card_id} failed: ${e.message}`); }
+    }
+  }
 
   // v1.0.18: /char is now the premium showcase. Try the Old Gen + Danbooru
   // pipeline first so /char makima and /char gojo t5 render like /shunt.

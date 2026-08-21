@@ -1,122 +1,19 @@
 'use strict';
-
-const gen2 = require('./hunt-card');
-const oldgen = require('./special-hunt-card');
-
-const sessions = new Map();
-const TTL_MS = 10 * 60 * 1000;
-
-function key(chatId, userId) { return `${chatId}:${userId}`; }
-function clean(v, max = 500) { return String(v || '').replace(/\s+/g, ' ').trim().slice(0, max); }
-function isCancel(v) { return /^\/?cancel$/i.test(clean(v)); }
-function tierOf(v) { const m = clean(v).match(/^t?([1-6])$/i); return m ? Number(m[1]) : 0; }
-function rendererOf(v) {
-  const s = clean(v).toLowerCase();
-  if (['1','gen2','gen 2','g2'].includes(s)) return 'gen2';
-  if (['2','oldgen','old gen','old','special'].includes(s)) return 'oldgen';
-  return '';
-}
-function expire() {
-  const now = Date.now();
-  for (const [k, s] of sessions) if (now - s.updatedAt > TTL_MS) sessions.delete(k);
-}
-function has(chatId, userId) { expire(); return sessions.has(key(chatId, userId)); }
-function cancel(chatId, userId) { return sessions.delete(key(chatId, userId)); }
-
-async function start(ctx) {
-  expire();
-  const k = key(ctx.chatId, ctx.userId);
-  sessions.set(k, { step: 'renderer', chatId: ctx.chatId, userId: ctx.userId, updatedAt: Date.now() });
-  await ctx.reply('♦️ <b>CARD RENDERER 🛠️</b>\n\nChoose a renderer:\n\n<b>1️⃣ Gen 2</b>\n<b>2️⃣ Old Gen</b>\n\nReply with <code>1</code> or <code>2</code>.\nUse <code>/cancel</code> anytime.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-}
-
-async function downloadTelegramImage(bot, msg) {
-  let fileId = '';
-  if (Array.isArray(msg.photo) && msg.photo.length) fileId = msg.photo[msg.photo.length - 1].file_id;
-  else if (msg.document && /^image\//i.test(String(msg.document.mime_type || ''))) fileId = msg.document.file_id;
-  if (!fileId) return null;
-  const url = await bot.getFileLink(fileId);
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`Telegram image download HTTP ${res.status}`);
-  const arr = await res.arrayBuffer();
-  const buf = Buffer.from(arr);
-  if (buf.length > 20 * 1024 * 1024) throw new Error('Artwork is larger than 20 MB');
-  return buf;
-}
-
-async function handleMessage(msg, deps) {
-  expire();
-  const chatId = msg.chat && msg.chat.id;
-  const userId = msg.from && msg.from.id;
-  const k = key(chatId, userId);
-  const s = sessions.get(k);
-  if (!s) return false;
-  const text = clean(msg.text || msg.caption || '');
-  if (isCancel(text)) {
-    sessions.delete(k);
-    await deps.reply(chatId, '❌ Card render cancelled.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E' });
-    return true;
-  }
-  s.updatedAt = Date.now();
-
-  if (s.step === 'renderer') {
-    const r = rendererOf(text);
-    if (!r) { await deps.reply(chatId, 'Choose <b>1</b> for Gen 2 or <b>2</b> for Old Gen.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true }); return true; }
-    s.renderer = r; s.step = 'tier';
-    await deps.reply(chatId, `🎴 <b>Choose card tier</b>\n\nSend <code>T1</code>, <code>T2</code>, <code>T3</code>, <code>T4</code>, <code>T5</code>, or <code>T6</code>.`, { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    return true;
-  }
-  if (s.step === 'tier') {
-    const t = tierOf(text);
-    if (!t) { await deps.reply(chatId, 'Tier must be <code>T1</code> through <code>T6</code>.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true }); return true; }
-    s.tier = t; s.step = 'name';
-    await deps.reply(chatId, '✍️ <b>Card name</b>\n\nSend the character/card name.\nExample: <code>Makima</code>', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    return true;
-  }
-  if (s.step === 'name') {
-    if (!text) return true;
-    s.name = clean(text, 80); s.step = 'series';
-    await deps.reply(chatId, '🎬 <b>Series / Source</b>\n\nSend the anime, game, manga, or source name.\nExample: <code>Chainsaw Man</code>', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    return true;
-  }
-  if (s.step === 'series') {
-    if (!text) return true;
-    s.series = clean(text, 80); s.step = 'info';
-    await deps.reply(chatId, '📖 <b>Card info</b>\n\nSend a short description for the card, or send <code>skip</code>.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    return true;
-  }
-  if (s.step === 'info') {
-    s.info = /^skip$/i.test(text) ? '' : clean(text, 360); s.step = 'quote';
-    await deps.reply(chatId, '💬 <b>Quote</b>\n\nSend an optional quote, or send <code>skip</code>.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    return true;
-  }
-  if (s.step === 'quote') {
-    s.quote = /^skip$/i.test(text) ? '' : clean(text, 180); s.step = 'image';
-    await deps.reply(chatId, `🖼️ <b>Send the artwork</b>\n\nSend the image you want Rimuru to render.\n\nRenderer: <b>${s.renderer === 'oldgen' ? 'Old Gen' : 'Gen 2'}</b>\nTier: <b>T${s.tier}</b>\nName: <b>${s.name}</b>`, { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    return true;
-  }
-  if (s.step === 'image') {
-    let image;
-    try { image = await downloadTelegramImage(deps.bot, msg); }
-    catch (e) { await deps.reply(chatId, `⚠️ I couldn't read that artwork: ${e.message}`, { title: '♦️ CARD RENDERER 🛠️', color: '#FF5252' }); return true; }
-    if (!image) { await deps.reply(chatId, 'Please send a photo or an image file. Use <code>/cancel</code> to stop.', { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true }); return true; }
-    await deps.reply(chatId, `⚙️ <b>Rendering your JTF Card...</b>\n\nRenderer: <b>${s.renderer === 'oldgen' ? 'Old Gen' : 'Gen 2'}</b>\nTier: <b>T${s.tier}</b>\nName: <b>${s.name}</b>`, { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true });
-    try {
-      const renderer = s.renderer === 'oldgen' ? oldgen : gen2;
-      const description = [s.info, s.quote ? `“${s.quote}”` : ''].filter(Boolean).join(' — ') || 'A custom JTF collectible.';
-      const card = { name: s.name, series: s.series, bio: description, description, forced_tier: s.tier, preview_tier: s.tier, character_id: `custom-${Date.now()}` };
-      const out = await renderer.render(card, image);
-      if (!out || !out.buffer) throw new Error('renderer returned no card');
-      const caption = `♦️ <b>JTF CARD RENDERER</b>\n${s.renderer === 'oldgen' ? '✦ Old Gen' : '🃏 Gen 2'} • <b>T${s.tier}</b> • <b>${s.name}</b>\n🎬 ${s.series}`;
-      await deps.bot.sendPhoto(chatId, out.buffer, { caption, parse_mode: 'HTML' }, { filename: `JTF_${s.name.replace(/[^a-z0-9]+/gi, '_')}_T${s.tier}.png`, contentType: 'image/png' });
-      sessions.delete(k);
-    } catch (e) {
-      console.error('[crender] render failed:', e.message, e.stack);
-      await deps.reply(chatId, '⚠️ Rimuru could not render that card. Your session is still open — send another image or /cancel.', { title: '♦️ CARD RENDERER 🛠️', color: '#FF5252' });
-    }
-    return true;
-  }
-  return true;
-}
-
-module.exports = { start, handleMessage, has, cancel, _sessions: sessions };
+const gen2=require('./hunt-card'),oldgen=require('./special-hunt-card'),cards=require('./custom-cards');
+const sessions=new Map(),TTL_MS=10*60*1000,FREE_DAILY=3;
+const PRICES={1:50_000_000,2:500_000_000,3:10_000_000_000,4:500_000_000_000,5:10_000_000_000_000,6:100_000_000_000_000};
+function key(c,u){return `${c}:${u}`;} function clean(v,m=500){return String(v||'').replace(/\s+/g,' ').trim().slice(0,m);} function tierOf(v){const m=clean(v).match(/^t?([1-6])$/i);return m?+m[1]:0;} function rendererOf(v){v=clean(v).toLowerCase();return ['1','gen2','gen 2','g2'].includes(v)?'gen2':['2','oldgen','old gen','old','special'].includes(v)?'oldgen':'';} function expire(){const n=Date.now();for(const[k,s]of sessions)if(n-s.updatedAt>TTL_MS)sessions.delete(k);} function has(c,u){expire();return sessions.has(key(c,u));} function cancel(c,u){return sessions.delete(key(c,u));}
+async function start(ctx){expire();sessions.set(key(ctx.chatId,ctx.userId),{step:'renderer',chatId:ctx.chatId,userId:ctx.userId,isStaff:!!ctx.isStaff,updatedAt:Date.now()});await ctx.reply('♦️ <b>CARD RENDERER 🛠️</b>\n\nChoose a renderer:\n\n<b>1️⃣ Gen 2</b>\n<b>2️⃣ Old Gen</b>\n\nNormal users receive <b>3 free successful renders daily</b>.\nReply <code>1</code> or <code>2</code>. Use <code>/cancel</code> anytime.',{title:'♦️ CARD RENDERER 🛠️',color:'#FFD34E',html:true});}
+async function dl(bot,msg){let id='';if(msg.photo?.length)id=msg.photo.at(-1).file_id;else if(msg.document&&/^image\//i.test(msg.document.mime_type||''))id=msg.document.file_id;if(!id)return null;const r=await fetch(await bot.getFileLink(id));if(!r.ok)throw Error(`Telegram image HTTP ${r.status}`);const b=Buffer.from(await r.arrayBuffer());if(b.length>20*1024*1024)throw Error('Artwork is larger than 20 MB');return b;}
+function money(n){return Number(n).toLocaleString('en-US');}
+async function handleMessage(msg,deps){expire();const c=msg.chat?.id,u=msg.from?.id,k=key(c,u),s=sessions.get(k);if(!s)return false;const t=clean(msg.text||msg.caption||'');if(/^\/?cancel$/i.test(t)){sessions.delete(k);await deps.reply(c,'❌ Card render cancelled.',{title:'♦️ CARD RENDERER 🛠️'});return true;}s.updatedAt=Date.now();
+if(s.step==='renderer'){const r=rendererOf(t);if(!r){await deps.reply(c,'Choose 1 for Gen 2 or 2 for Old Gen.');return true;}s.renderer=r;s.step='tier';await deps.reply(c,'🎴 Choose tier: <code>T1</code> to <code>T6</code>.',{html:true});return true;}
+if(s.step==='tier'){const x=tierOf(t);if(!x){await deps.reply(c,'Tier must be T1–T6.');return true;}s.tier=x;s.step='name';await deps.reply(c,'✍️ <b>Card name</b>\nExample: <code>Makima</code>',{html:true});return true;}
+if(s.step==='name'){if(!t)return true;s.name=clean(t,80);s.step='series';await deps.reply(c,'🎬 <b>Series / Source</b>\nExample: <code>Chainsaw Man</code>',{html:true});return true;}
+if(s.step==='series'){if(!t)return true;s.series=clean(t,100);s.step='info';await deps.reply(c,'📖 <b>Card info</b> — send text or <code>skip</code>.',{html:true});return true;}
+if(s.step==='info'){s.info=/^skip$/i.test(t)?'':clean(t,360);s.step='quote';await deps.reply(c,'💬 <b>Quote</b> — send one or <code>skip</code>.',{html:true});return true;}
+if(s.step==='quote'){s.quote=/^skip$/i.test(t)?'':clean(t,180);s.step='image';await deps.reply(c,`🖼️ Send the artwork.\n\nRenderer: <b>${s.renderer==='oldgen'?'Old Gen':'Gen 2'}</b>\nTier: <b>T${s.tier}</b>\nName: <b>${s.name}</b>`,{html:true});return true;}
+if(s.step==='image'){try{s.image=await dl(deps.bot,msg);}catch(e){await deps.reply(c,`⚠️ ${e.message}`);return true;}if(!s.image){await deps.reply(c,'Send a photo/image file.');return true;}const used=s.isStaff?0:cards.count(u),free=s.isStaff||used<FREE_DAILY,cost=free?0:PRICES[s.tier];s.cost=cost;s.step='confirm';await deps.reply(c,`♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${s.renderer==='oldgen'?'Old Gen':'Gen 2'}</b>\nTier: <b>T${s.tier}</b>\nName: <b>${s.name}</b>\nCost: <b>${cost?`🪙 ${money(cost)}`:'FREE'}</b>\n${s.isStaff?'👑 Staff unlimited render':`Free renders used today: <b>${Math.min(used,3)}/3</b>`}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,{html:true});return true;}
+if(s.step==='confirm'){if(!/^confirm$/i.test(t)){await deps.reply(c,'Reply <code>confirm</code> to render or <code>/cancel</code>.',{html:true});return true;}if(s.cost){const q=deps.eco.chargeWallet(u,s.cost,'custom card render');if(!q.ok){await deps.reply(c,q.message);return true;}s.charged=true;}await deps.reply(c,'⚙️ <b>Rendering your JTF Card...</b>',{html:true});try{const d=[s.info,s.quote?`“${s.quote}”`:''].filter(Boolean).join(' — ')||'A custom JTF collectible.',renderer=s.renderer==='oldgen'?oldgen:gen2,card={name:s.name,series:s.series,bio:d,description:d,forced_tier:s.tier,preview_tier:s.tier,character_id:`custom-${Date.now()}`},out=await renderer.render(card,s.image);if(!out?.buffer)throw Error('renderer returned no card');s.output=out.buffer;if(!s.isStaff)cards.mark(u);const cap=`♦️ <b>JTF CARD RENDERER</b>\n${s.renderer==='oldgen'?'✦ Old Gen':'🃏 Gen 2'} • <b>T${s.tier}</b> • <b>${s.name}</b>\n🎬 ${s.series}`;await deps.bot.sendPhoto(c,s.output,{caption:cap,parse_mode:'HTML'},{filename:`JTF_${s.name.replace(/[^a-z0-9]+/gi,'_')}_T${s.tier}.png`,contentType:'image/png'});s.step='save';await deps.reply(c,'💾 <b>Save this custom card to your collection?</b>\nReply <code>yes</code> or <code>no</code>.',{html:true});}catch(e){if(s.charged){deps.db.addWallet(u,s.cost);s.charged=false;}console.error('[crender] render failed:',e.message);await deps.reply(c,'⚠️ Render failed. Any charged coins were refunded. Send <code>confirm</code> to retry or /cancel.',{html:true});s.step='confirm';}return true;}
+if(s.step==='save'){if(/^no$/i.test(t)){sessions.delete(k);await deps.reply(c,'♦️ Card finished without saving.');return true;}if(!/^yes$/i.test(t)){await deps.reply(c,'Reply yes or no.');return true;}try{const id=cards.newId(),path=await cards.upload(id,s.output),row=cards.save({card_id:id,user_id:u,renderer:s.renderer,tier:s.tier,name:s.name,series:s.series,info:s.info,quote:s.quote},path);await deps.reply(c,`💾 <b>CARD SAVED</b>\n\nID: <code>#${row.card_id}</code>\n${row.name} • T${row.tier}\nUse <code>/customcards</code> to view your saved custom cards.`,{html:true});sessions.delete(k);}catch(e){await deps.reply(c,`⚠️ Could not save the card: ${e.message}\nYour render is complete, but storage needs to be configured/fixed.`);}return true;}return true;}
+module.exports={start,handleMessage,has,cancel,PRICES,FREE_DAILY,_sessions:sessions};
