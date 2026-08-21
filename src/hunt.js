@@ -5,6 +5,7 @@ const config = require('./config');
 const db = require('./db');
 const cardRenderer = require('./hunt-card');
 const specialCardRenderer = require('./special-hunt-card');
+const signatureCardRenderer = require('./jtf-gen-card');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const ANIME_PICTURES_API_URL = 'https://api.anime-pictures.net/api/v3';
@@ -169,11 +170,19 @@ function storedSpecialTier(card) {
   const m = String(card && card.image_url || '').match(/#jtf-oldgen-t([1-6])$/i);
   return m ? Number(m[1]) : 0;
 }
+function storedSignatureTier(card) {
+  const m = String(card && card.image_url || '').match(/#jtf-signature-t([1-6])$/i);
+  return m ? Number(m[1]) : 0;
+}
 function withStoredSpecialTier(card) {
   const tier = storedSpecialTier(card);
   return tier && card && !Number(card.forced_tier) ? { ...card, forced_tier: tier } : card;
 }
-function cardTierMeta(card) { return cardRenderer.tierFor(withStoredSpecialTier(card)); }
+function withStoredPresentationTier(card) {
+  const tier = storedSignatureTier(card) || storedSpecialTier(card);
+  return tier && card && !Number(card.forced_tier) ? { ...card, forced_tier: tier } : card;
+}
+function cardTierMeta(card) { return cardRenderer.tierFor(withStoredPresentationTier(card)); }
 
 function announceCaption(card, spawn) {
   const tier = cardTierMeta(card);
@@ -216,6 +225,24 @@ function specialAnnounceCaption(card, spawn) {
   lines.push('', `          ✦ 『 ${fancy(`T${tier.tier} ${tier.label}`)} 』`, '', `        ⏱️ ${fancy(String(secs))}𝐬 𝐑𝐄𝐌𝐀𝐈𝐍𝐈𝐍𝐆`, '           ⚡ 𝐅𝐢𝐫𝐬𝐭 𝐜𝐥𝐚𝐢𝐦 𝐰𝐢𝐧𝐬!');
   return lines.join('\n').slice(0, 1024);
 }
+function signatureAnnounceCaption(card, spawn) {
+  const tier = cardTierMeta(card);
+  const secs = secondsRemaining(spawn);
+  const series = seriesNameOf(card);
+  const lines = [
+    '╭━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╮',
+    '       ♦️  𝐉𝐓𝐅 𝐒𝐈𝐆𝐍𝐀𝐓𝐔𝐑𝐄  ♦️',
+    '╰━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━╯',
+    '',
+    '      ✨ 𝐀 𝐒𝐈𝐆𝐍𝐀𝐓𝐔𝐑𝐄 𝐂𝐀𝐑𝐃 𝐇𝐀𝐒 𝐀𝐑𝐑𝐈𝐕𝐄𝐃!',
+    '',
+    `              👤 ${fancy(stripUrls(card.name || 'Unknown'))}`,
+  ];
+  if (series) lines.push(`              🎬 ${fancy(series)}`);
+  lines.push('', `          ♦️ 『 ${fancy(`T${tier.tier} ${tier.label}`)} 』`, '', `        ⏱️ ${fancy(String(secs))}𝐬 𝐑𝐄𝐌𝐀𝐈𝐍𝐈𝐍𝐆`, '           ⚡ 𝐅𝐢𝐫𝐬𝐭 𝐜𝐥𝐚𝐢𝐦 𝐰𝐢𝐧𝐬!');
+  return lines.join('\n').slice(0, 1024);
+}
+
 function claimedCaption(char, claimerName) {
   const tier = cardTierMeta(char);
   return `🃏 ${fancy('CARD CLAIMED!')}\n👤 ${fancy(stripUrls(char.name))}\n${seriesNameOf(char) ? `🎬 ${fancy(seriesNameOf(char))}\n` : ''}⭐ ${fancy(`T${tier.tier} ${tier.label}`)}\n🎯 ${fancy('Claimed by')} ${safeUserName(claimerName)}`;
@@ -1775,6 +1802,7 @@ async function renderCardBuffer(card, sourceBuffer) {
 }
 async function sendCardPhoto(chatId, card, caption, markup) {
   if (!deps || typeof deps.sendPhoto !== 'function' || !card) return null;
+  if (storedSignatureTier(card)) return sendSignatureCardPhoto(chatId, withStoredPresentationTier(card), caption, markup);
   if (storedSpecialTier(card)) return sendSpecialCardPhoto(chatId, withStoredSpecialTier(card), caption, markup);
   const url = card.image_url;
   let downloaded = null;
@@ -1816,7 +1844,7 @@ function cacheSpecialRenderedCard(key, buffer) {
   while (renderedSpecialCardCache.size > 6) renderedSpecialCardCache.delete(renderedSpecialCardCache.keys().next().value);
 }
 async function fetchSpecialImageBuffer(url) {
-  url = String(url || '').replace(/#jtf-oldgen-t[1-6]$/i, '');
+  url = String(url || '').replace(/#jtf-(?:oldgen|signature)-t[1-6]$/i, '');
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), Math.max(12000, config.hunt.fetchTimeoutMs || 10000));
   timer.unref && timer.unref();
@@ -1865,6 +1893,67 @@ async function sendSpecialCardPhoto(chatId, card, caption, markup) {
   return { ok: false };
 }
 
+const renderedSignatureCardCache = new Map();
+function signatureRenderedCardKey(card) {
+  const tier = cardTierMeta(card);
+  return `signature|${card && (card.character_id || card.id) || 'unknown'}|${card && card.image_url || ''}|T${tier.tier}`;
+}
+function cacheSignatureRenderedCard(key, buffer) {
+  if (!key || !Buffer.isBuffer(buffer)) return;
+  renderedSignatureCardCache.set(key, buffer);
+  while (renderedSignatureCardCache.size > 6) renderedSignatureCardCache.delete(renderedSignatureCardCache.keys().next().value);
+}
+async function renderSignatureCardBuffer(card, sourceBuffer) {
+  if (!card || !Buffer.isBuffer(sourceBuffer)) return null;
+  const key = signatureRenderedCardKey(card);
+  if (renderedSignatureCardCache.has(key)) return renderedSignatureCardCache.get(key);
+  try {
+    const rendered = await signatureCardRenderer.render(withStoredPresentationTier(card), sourceBuffer);
+    if (rendered && Buffer.isBuffer(rendered.buffer)) {
+      cacheSignatureRenderedCard(key, rendered.buffer);
+      console.log(`[signature-cards] ${card.name || card.character_id}: mode=${rendered.composition || 'scene'} palette=${(rendered.accents || []).join('→') || 'tier'}`);
+      return rendered.buffer;
+    }
+  } catch (e) { console.warn(`[signature-cards] render failed for ${card.name || card.character_id}: ${e.message}`); }
+  return null;
+}
+async function sendSignatureCardPhoto(chatId, card, caption, markup) {
+  if (!deps || typeof deps.sendPhoto !== 'function' || !card) return null;
+  let downloaded = null;
+  try {
+    downloaded = await fetchSpecialImageBuffer(card.image_url);
+    const rendered = await renderSignatureCardBuffer(card, downloaded.buffer);
+    if (rendered) {
+      return await deps.sendPhoto(chatId, rendered, { caption, reply_markup: markup }, {
+        filename: `jtf-signature-${String(card.character_id || 'character').replace(/[^A-Za-z0-9_-]/g, '_')}.png`,
+        contentType: 'image/png',
+      });
+    }
+  } catch (e) { console.warn('[signature-cards] generated photo:', e.message); }
+  if (downloaded && downloaded.buffer) {
+    try { return await deps.sendPhoto(chatId, downloaded.buffer, { caption, reply_markup: markup }, { filename: 'signature-card-source.jpg', contentType: downloaded.contentType || 'image/jpeg' }); }
+    catch (e) { console.warn('[signature-cards] source buffer photo:', e.message); }
+  }
+  return { ok: false };
+}
+
+function asSignatureCard(card) {
+  if (!card) return null;
+  const tier = storedSpecialTier(card) || storedSignatureTier(card) || Number(cardTierMeta(card).tier) || 1;
+  const cleanUrl = String(card.image_url || '').replace(/#jtf-(?:oldgen|signature)-t[1-6]$/i, '');
+  return {
+    ...card,
+    image_url: `${cleanUrl}#jtf-signature-t${tier}`,
+    image_source: `${String(card.image_source || 'Danbooru').replace(/:T[1-6]$/i, '')}:JTFSignature:T${tier}`,
+    forced_tier: tier,
+    signature_card_style: 'jtf-signature',
+  };
+}
+async function fetchSignatureSpawnCharacter() {
+  const card = await fetchSpecialSpawnCharacter();
+  return asSignatureCard(card);
+}
+
 async function sendOfficialOverrideIfAny(chatId, card, caption, markup) {
   try {
     const tier = Number(card && card.forced_tier) || Number(cardTierMeta(card).tier) || 0;
@@ -1891,6 +1980,22 @@ async function spawnSpecial(opts = {}) {
   const specialCaption = specialAnnounceCaption(card, row), specialMarkup = claimMarkup();
   if (!(await sendOfficialOverrideIfAny(opts.chatId, card, specialCaption, specialMarkup))) await sendSpecialCardPhoto(opts.chatId, card, specialCaption, specialMarkup);
   return { ok: true, character: card, expiresAt, style: 'old-gen' };
+}
+
+async function spawnSignature(opts = {}) {
+  if (!config.hunt.enabled) return { ok: false, message: 'Cards are disabled.' };
+  expireIfNeeded();
+  const existing = db.getActiveHunt();
+  if (isSpawnClaimable(existing)) return { ok: false, message: `♦️ A card is already up for grabs (${secondsRemaining(existing)}s left).` };
+  if (existing) db.clearActiveHunt();
+  const card = await fetchSignatureSpawnCharacter();
+  if (!card) return { ok: false, message: '♦️ Rimuru could not prepare a JTF Signature card right now.' };
+  const expiresAt = Date.now() + config.hunt.claimWindowMs;
+  db.setActiveHunt(card, expiresAt, Number(opts.chatId) || 0);
+  const row = db.getActiveHunt();
+  const caption = signatureAnnounceCaption(card, row), markup = claimMarkup();
+  if (!(await sendOfficialOverrideIfAny(opts.chatId, card, caption, markup))) await sendSignatureCardPhoto(opts.chatId, card, caption, markup);
+  return { ok: true, character: card, expiresAt, style: 'jtf-signature' };
 }
 
 async function spawn(opts = {}) {
@@ -2051,7 +2156,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-v1.0.18] /char=OldGen-first; hourly=70% OldGen/30% Gen2; /hunt=Gen2; /shunt=OldGen; renderers=${cardRenderer.available() ? 'gen2-sharp' : 'gen2-source'}/${specialCardRenderer.available() ? 'oldgen-sharp' : 'oldgen-source'}`);
+  console.log(`[cards-signature] /hunt=Gen2; /shunt=OldGen; /card=JTF Signature; /crender=3 renderers; signature=${signatureCardRenderer.available() ? 'sharp' : 'source'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
@@ -2062,7 +2167,7 @@ module.exports = {
   leaderboardCaption, claimMarkup, normalizeJikan, normalizeAniList, normalizeKitsu,
   fetchRandomFromJikan, searchJikanCharacter, searchAniListCharacter, searchKitsuCharacter,
   fetchJikanPictures, fetchRandomFromAniList, fetchAniListById, fetchSpawnCharacter, resolveCharacter,
-  attach, spawn, spawnSpecial, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, rollAutoSpawnStyle, state, sendCardPhoto, sendSpecialCardPhoto, renderCardBuffer, renderSpecialCardBuffer,
+  attach, spawn, spawnSpecial, spawnSignature, claim, expireIfNeeded, searchAndShow, startAutoSpawn, autoSpawnTick, rollAutoSpawnStyle, state, sendCardPhoto, sendSpecialCardPhoto, sendSignatureCardPhoto, renderCardBuffer, renderSpecialCardBuffer, renderSignatureCardBuffer,
   FALLBACK_POOL, fallbackCard, pickFallbackCharacter, mergeMetadata, probeImage, fancy, sanitizeApiText,
   normalizeGelbooruTag, gelbooruTagVariants, gelbooruSeriesTag, discoverGelbooruTags, searchGelbooruArtwork,
   searchSafebooruArtwork, searchDanbooruSafeArtwork, searchArtworkSources, selectArtworkForIdentity, verifyArtworkWithVision,
@@ -2070,6 +2175,6 @@ module.exports = {
   normalizeAnimePicturesUrl, animePicturesNameVariants, animePicturesTagScore, resolveAnimePicturesCharacterTag,
   searchAnimePicturesPosts, fetchAnimePicturesPostDetails, animePicturesCandidateFromDetails, buildAnimePicturesArtworkPool,
   animePicturesArtworkForTier, selectAnimePicturesArtwork, parseCharTierQuery,
-  SPECIAL_DANBOORU_TAGS, specialDanbooruNamePatterns, discoverSpecialDanbooruTags, specialDanbooruQuality, specialDanbooruCandidate, searchSpecialDanbooruTag, buildSpecialDanbooruArtworkPool, specialDanbooruArtworkForTier, selectDanbooruSpecialArtwork, chooseSpecialCharacter, fetchSpecialSpawnCharacter, specialAnnounceCaption,
+  SPECIAL_DANBOORU_TAGS, specialDanbooruNamePatterns, discoverSpecialDanbooruTags, specialDanbooruQuality, specialDanbooruCandidate, searchSpecialDanbooruTag, buildSpecialDanbooruArtworkPool, specialDanbooruArtworkForTier, selectDanbooruSpecialArtwork, chooseSpecialCharacter, fetchSpecialSpawnCharacter, fetchSignatureSpawnCharacter, asSignatureCard, specialAnnounceCaption, signatureAnnounceCaption, storedSignatureTier,
   _clear: () => db.clearActiveHunt(),
 };
