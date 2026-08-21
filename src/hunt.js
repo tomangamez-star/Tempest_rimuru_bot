@@ -2066,11 +2066,19 @@ async function searchAndShow(query, opts = {}) {
   if (wanted==='oldgen') {
     try { card=await selectDanbooruSpecialArtwork(merged,{context:parsed.tier?`char-oldgen-t${parsed.tier}`:'char-oldgen',minPool:SPECIAL_MIN_ARTWORKS}); } catch(e){console.warn(`[char] ${merged.name}: Old Gen failed: ${e.message}`);}
     if(card){ await sendSpecialCardPhoto(opts.chatId,card,detailCaption(card),null); return {ok:true,character:card,previewTier:parsed.tier||null,style}; }
-  } else {
-    try { card=await selectArtworkForIdentity(merged,{context:parsed.tier?`char-${wanted}-t${parsed.tier}`:`char-${wanted}`}); } catch(e){console.warn(`[char] ${merged.name}: ${wanted} artwork failed: ${e.message}`);}
+  } else if (wanted==='signature') {
+    // JTF Signature deliberately uses the exact same premium Danbooru pool and
+    // tier artwork selection as Old Gen. Only the renderer changes afterward.
+    try { card=await selectDanbooruSpecialArtwork(merged,{context:parsed.tier?`char-signature-t${parsed.tier}`:'char-signature',minPool:SPECIAL_MIN_ARTWORKS}); } catch(e){console.warn(`[char] ${merged.name}: Signature Danbooru failed: ${e.message}`);}
     if(card){
-      if(wanted==='signature') await sendSignatureCardPhoto(opts.chatId,asSignatureCard(card),detailCaption(card),null);
-      else await sendCardPhoto(opts.chatId,card,detailCaption(card),null);
+      const signatureCard=asSignatureCard(card);
+      await sendSignatureCardPhoto(opts.chatId,signatureCard,detailCaption(signatureCard),null);
+      return {ok:true,character:signatureCard,previewTier:parsed.tier||null,style};
+    }
+  } else {
+    try { card=await selectArtworkForIdentity(merged,{context:parsed.tier?`char-gen2-t${parsed.tier}`:'char-gen2'}); } catch(e){console.warn(`[char] ${merged.name}: Gen 2 artwork failed: ${e.message}`);}
+    if(card){
+      await sendCardPhoto(opts.chatId,card,detailCaption(card),null);
       return {ok:true,character:card,previewTier:parsed.tier||null,style};
     }
   }
