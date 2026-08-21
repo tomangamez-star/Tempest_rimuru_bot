@@ -9,6 +9,7 @@
 const config = require('../config');
 const { fmt, shuffle, randInt, esc } = require('../utils');
 const rank = require('../rank');
+const spectator = require('../staff-spectator');
 
 const sessions = new Map(); // userId -> {bet, deck, player[], dealer[], doubled, done}
 
@@ -102,6 +103,8 @@ async function play(ctx) {
   cd.startGame(userId, 'blackjack', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
+  s.chatId = chatId; s.playerName = (msg && msg.from && (msg.from.first_name || msg.from.username)) || String(userId);
+  spectator.blackjack(s).catch(() => {});
 
   // Immediate blackjack check
   if (isBlackjack(s.player)) {
@@ -110,6 +113,7 @@ async function play(ctx) {
     eco.creditWallet(userId, payout);
     s.payout = payout;
     await reply(`${render(s)}\n\n♣ <b>BLACKJACK!</b> 3:2 — you get ${fmt(payout)} (net +${fmt(payout - bet.amount)})`, { html: true });
+    spectator.end('blackjack', s, 'Player blackjack').catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -155,6 +159,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     const text = `${render(s)}\n\n💥 <b>BUST!</b> You lost ${fmt(s.bet)}.`;
     await editMsg(text, { parse_mode: 'HTML' });
     await answerCb('💥 Bust!');
+    spectator.end('blackjack', s, 'Player bust').catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -184,6 +189,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     const text = `${render(s)}\n\n${emoji} (${net})`;
     await editMsg(text, { parse_mode: 'HTML' });
     await answerCb(result === 'win' ? '✅ Win!' : result === 'push' ? '🤝 Push' : '❌ Lost');
+    spectator.end('blackjack', s, `Round ${result}`).catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -193,6 +199,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
   // render even when SHOW_INLINE_BUTTONS=false (fixes "no button to press").
   await editMsg(render(s), { parse_mode: 'HTML', reply_markup: keyboard(s), alwaysShowMarkup: true });
   await answerCb('🎯 Dealt.');
+  spectator.blackjack(s).catch(() => {});
 }
 
 function parseBet(raw, eco, userId) {

@@ -10,6 +10,7 @@
 const config = require('../config');
 const { fmt, shuffle, esc } = require('../utils');
 const rank = require('../rank');
+const spectator = require('../staff-spectator');
 
 const sessions = new Map();
 
@@ -80,6 +81,8 @@ async function play(ctx) {
   cd.startGame(userId, 'higherlower', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
+  s.chatId = chatId; s.playerName = (msg && msg.from && (msg.from.first_name || msg.from.username)) || String(userId);
+  spectator.higherLower(s).catch(() => {});
   const sent = await reply(render(s), { html: true, reply_markup: keyboard(s), alwaysShowMarkup: true });
   return { sent, session: s };
 }
@@ -99,6 +102,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     rank.recordMatchResult(userId, s.bet, winnings > s.bet);
     await editMsg(`${render(s)}\n\n✅ <b>CASHED OUT</b> ${fmt(winnings)} (net +${fmt(winnings - s.bet)})`, { parse_mode: 'HTML' });
     await answerCb(`💰 Cashed out ${fmt(winnings)}`);
+    spectator.end('higher/lower', s, 'Cashed out').catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -123,6 +127,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     // must render even when SHOW_INLINE_BUTTONS=false (fixes "no button").
     await editMsg(text, { parse_mode: 'HTML', reply_markup: keyboard(s), alwaysShowMarkup: true });
     await answerCb(`✅ Streak ${s.streak}`);
+    spectator.higherLower(s).catch(() => {});
   } else {
     // Bust — lose initial bet + accumulated
     s.alive = false;
@@ -130,6 +135,7 @@ async function onAction(ctx, { bot, chatId, userId, reply, editMsg, answerCb, ec
     const text = `${render(s)}\n\n❌ <b>BUST!</b> Next card was <b>${esc(cardStr(next))}</b>. You lost ${fmt(s.bet)}.`;
     await editMsg(text, { parse_mode: 'HTML' });
     await answerCb('❌ Wrong guess!');
+    spectator.end('higher/lower', s, 'Bust').catch(() => {});
     sessions.delete(userId);
   }
 }

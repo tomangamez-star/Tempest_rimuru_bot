@@ -18,6 +18,7 @@
 const config = require('../config');
 const { fmt, shuffle, randInt } = require('../utils');
 const rank = require('../rank');
+const spectator = require('../staff-spectator');
 
 // In-memory game sessions (SQLite would be overkill; resets on restart are fine)
 const sessions = new Map();
@@ -159,6 +160,8 @@ async function play(ctx) {
   cd.startGame(userId, 'mines', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
+  s.chatId = chatId; s.playerName = (msg && msg.from && (msg.from.first_name || msg.from.username)) || String(userId);
+  spectator.mines(s).catch(() => {});
   // alwaysShowMarkup: the 5×5 grid is GAMEPLAY — it must render even when
   // SHOW_INLINE_BUTTONS=false (fixes the "mines grid missing" regression).
   const sent = await reply(statusText(s), { html: true, reply_markup: buildKeyboard(s), alwaysShowMarkup: true });
@@ -193,6 +196,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
       `👛 Wallet: ${fmt(eco.balance(userId).wallet)}`,
       { html: true }
     );
+    spectator.end('mines', s, 'Mine hit').catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -201,6 +205,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
   s.revealed.add(idx);
   s.picks += 1;
   if (config.mines.reshuffleAfterPick !== false) reshuffleMines(s);
+  spectator.mines(s).catch(() => {});
   if (s.picks >= MAX_PICKS) {
     // All safe cells found — auto cash out
     s.alive = false;
@@ -215,6 +220,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, callbackId, an
       `👛 Wallet: ${fmt(eco.balance(userId).wallet)}`,
       { html: true }
     );
+    spectator.end('mines', s, 'Perfect clear').catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -239,6 +245,7 @@ async function onCash(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
     { parse_mode: 'HTML', alwaysShowMarkup: true }
   );
   await answerCb(`💰 Cashed out ${fmt(winnings)}`);
+  spectator.end('mines', s, 'Cashed out').catch(() => {});
   sessions.delete(userId);
 }
 

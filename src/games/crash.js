@@ -13,6 +13,7 @@
 const config = require('../config');
 const { fmt } = require('../utils');
 const rank = require('../rank');
+const spectator = require('../staff-spectator');
 
 // In-memory live sessions (ephemeral — resets on redeploy, like mines).
 const sessions = new Map();
@@ -92,6 +93,7 @@ async function crashNow(s, deps) {
   s.alive = false;
   stopTimer(s);
   sessions.delete(s.userId);
+  spectator.end('crash', s, 'Rocket crashed').catch(() => {});
   // Rank progression: a crash at 1.00x = loss; crashing above 1.0x still
   // counts as a loss since the player never cashed out.
   rank.recordMatchResult(s.userId, s.bet, false);
@@ -157,6 +159,8 @@ async function play(ctx) {
     startedAt: Date.now(),
   };
   sessions.set(userId, s);
+  s.playerName = (ctx.msg && ctx.msg.from && (ctx.msg.from.first_name || ctx.msg.from.username)) || String(userId);
+  spectator.crash(s).catch(() => {});
 
   // Send the live message with the CASHOUT button (gameplay-critical markup).
   const sent = await reply(statusText(s), {
@@ -195,6 +199,7 @@ async function onCash(ctx, { chatId, userId, reply, editMsg, answerCb, eco }) {
   s.alive = false;
   stopTimer(s);
   sessions.delete(s.userId);
+  spectator.end('crash', s, 'Cashed out').catch(() => {});
   eco.creditWallet(userId, winnings);
   // Rank progression: a cashout at any multiplier is a WIN (player chose when
   // to stop).

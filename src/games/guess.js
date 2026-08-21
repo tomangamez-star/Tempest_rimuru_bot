@@ -15,6 +15,7 @@
 const config = require('../config');
 const { fmt, randInt } = require('../utils');
 const rank = require('../rank');
+const spectator = require('../staff-spectator');
 
 // In-memory game sessions (same pattern as mines/blackjack)
 const sessions = new Map();
@@ -90,6 +91,8 @@ async function play(ctx) {
   cd.startGame(userId, 'guess', config.perGameCooldownMs);
 
   const s = createSession(userId, bet.amount);
+  s.chatId = chatId; s.playerName = (msg && msg.from && (msg.from.first_name || msg.from.username)) || String(userId);
+  spectator.guess(s).catch(() => {});
   // alwaysShowMarkup: the 1-10 grid is GAMEPLAY — must render even when
   // SHOW_INLINE_BUTTONS=false (same rule as mines/race).
   const sent = await reply(statusText(s), { html: true, reply_markup: keyboard(s), alwaysShowMarkup: true });
@@ -133,6 +136,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
     // Game over — buttons replaced with a dead grid so nothing is clickable.
     await editMsg(text, { parse_mode: 'HTML', reply_markup: keyboard(s, true), alwaysShowMarkup: true });
     await answerCb(`🎉 Correct! +${fmt(payout)}`);
+    spectator.end('guess', s, 'Correct answer guessed').catch(() => {});
     sessions.delete(userId);
     return;
   }
@@ -155,6 +159,7 @@ async function onPick(ctx, { bot, chatId, userId, reply, editMsg, answerCb, eco 
       `👛 Wallet: ${fmt(eco.balance(userId).wallet)}`;
     await editMsg(text, { parse_mode: 'HTML', reply_markup: keyboard(s, true), alwaysShowMarkup: true });
     await answerCb('💥 Out of chances!');
+    spectator.end('guess', s, 'Out of chances').catch(() => {});
     sessions.delete(userId);
     return;
   }
