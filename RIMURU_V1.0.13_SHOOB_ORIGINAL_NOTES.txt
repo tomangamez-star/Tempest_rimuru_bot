@@ -10,6 +10,8 @@ WHAT CHANGED
 - Catalogue results and downloaded images are cached in memory to reduce repeat traffic.
 - Failure is isolated: Shoob outages return a clear message and never switch to a different renderer.
 - Added socket.io-client, used by Shoob's public catalogue channel.
+- Hotfix: mirror Shoob's public init/location handshake before card searches;
+  this fixes valid exact names such as Goku incorrectly returning no result.
 
 NO NEW ENVIRONMENT VARIABLES
 Deploy normally. npm install will install the added dependency from package.json/package-lock.json.
