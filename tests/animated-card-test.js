@@ -10,7 +10,7 @@ assert.strictEqual(animated.validateInput(Buffer.from('fake'), { mimeType: 'vide
 assert.throws(() => animated.validateInput(Buffer.alloc(0), { mimeType: 'video/mp4' }), /empty/i);
 assert.throws(() => animated.validateInput(Buffer.from('fake'), { mimeType: 'text/plain' }), /GIF, MP4/i);
 assert.throws(() => animated.validateInput(Buffer.from('fake'), { mimeType: 'video/mp4', duration: 9 }), /8 seconds/i);
-assert.ok(animated.LAYOUTS.gen2 && animated.LAYOUTS.oldgen && animated.LAYOUTS.signature && animated.LAYOUTS.ai);
+assert.strictEqual(typeof animated.chooseBorderByArtwork, 'function');
 assert.strictEqual(animated.BORDERS.length, 4);
 assert.strictEqual(animated.cleanSignature('@Caleb🔥 Bj'), '@Caleb Bj');
 console.log('ANIMATED CARD TEST OK');

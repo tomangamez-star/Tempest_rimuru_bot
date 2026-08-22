@@ -30,10 +30,9 @@ async function send(text, extra = {}) {
 
 (async () => {
   await crender.start({ chatId: 10, userId: 20, isStaff: false, reply: deps.reply });
-  await send('1');
-  await send('T6');
-  assert.strictEqual(crender._sessions.get('10:20').step, 'mode');
-  await send('2');
+  await send('5');
+  assert.strictEqual(crender._sessions.get('10:20').renderer, 'animation');
+  assert.strictEqual(crender._sessions.get('10:20').tier, 6);
   await send('Goku');
   await send('Dragon Ball');
   await send('skip');
