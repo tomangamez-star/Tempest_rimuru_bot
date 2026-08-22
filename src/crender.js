@@ -45,7 +45,8 @@ function rendererImpl(name) {
 async function start(ctx) {
   expire();
   sessions.set(key(ctx.chatId, ctx.userId), {
-    step: 'renderer', chatId: ctx.chatId, userId: ctx.userId, isStaff: !!ctx.isStaff, updatedAt: Date.now(),
+    step: 'renderer', chatId: ctx.chatId, userId: ctx.userId,
+    isStaff: !!ctx.isStaff, isOwner: !!ctx.isOwner, updatedAt: Date.now(),
   });
   await ctx.reply(
     '♦️ <b>CARD RENDERER 🛠️</b>\n\nChoose a renderer:\n\n' +
@@ -136,7 +137,7 @@ async function renderAndDeliver(s, deps) {
     if (!staticOut?.buffer) throw new Error('renderer returned no card');
     let output = staticOut.buffer;
     if (s.animated) {
-      deps.db.updateStarRenderPayment(s.paymentChargeId, 'rendering');
+      if (s.paymentChargeId) deps.db.updateStarRenderPayment(s.paymentChargeId, 'rendering');
       const motion = await animatedCard.render({
         mediaBuffer: s.animation.buffer,
         staticBuffer: staticOut.buffer,
@@ -149,11 +150,11 @@ async function renderAndDeliver(s, deps) {
     s.output = output;
     s.outputAnimated = !!s.animated;
     if (!s.isStaff && !s.animated) cards.mark(s.userId);
-    const cap = `♦️ <b>JTF CARD RENDERER</b>\n${rendererMeta(s.renderer).badge} • <b>T${s.tier}</b> • <b>${s.name}</b>\n🎬 ${s.series}${s.animated ? '\n✨ <b>PREMIUM MOTION • ⭐10</b>' : ''}`;
+    const cap = `♦️ <b>JTF CARD RENDERER</b>\n${rendererMeta(s.renderer).badge} • <b>T${s.tier}</b> • <b>${s.name}</b>\n🎬 ${s.series}${s.animated ? `\n✨ <b>PREMIUM MOTION${s.isOwner ? ' • OWNER PASS' : ' • ⭐10'}</b>` : ''}`;
     const sentCard = s.animated
       ? await deps.bot.sendAnimation(chatId, output, { caption: cap, parse_mode: 'HTML', duration: animatedCard.DURATION, width: animatedCard.WIDTH, height: animatedCard.HEIGHT }, { filename: `JTF_${s.name.replace(/[^a-z0-9]+/gi, '_')}_T6_MOTION.mp4`, contentType: 'video/mp4' })
       : await deps.bot.sendPhoto(chatId, output, { caption: cap, parse_mode: 'HTML' }, { filename: `JTF_${s.name.replace(/[^a-z0-9]+/gi, '_')}_T${s.tier}.png`, contentType: 'image/png' });
-    if (s.animated) deps.db.updateStarRenderPayment(s.paymentChargeId, 'delivered');
+    if (s.animated && s.paymentChargeId) deps.db.updateStarRenderPayment(s.paymentChargeId, 'delivered');
     s.renderMessageId = sentCard && sentCard.message_id;
     s.renderCaption = cap;
     s.step = 'save';
@@ -162,10 +163,12 @@ async function renderAndDeliver(s, deps) {
   } catch (error) {
     console.error('[crender] render failed:', error.message);
     if (s.animated) {
-      const refunded = await refundStars(s, deps, error.message);
-      await deps.reply(chatId, refunded
-        ? '⚠️ Animated render failed, so your ⭐10 was automatically refunded. Start /crender to try again.'
-        : '⚠️ Animated render failed. The automatic refund is pending; the payment ID was recorded for recovery.', { html: true });
+      const refunded = s.paymentChargeId ? await refundStars(s, deps, error.message) : false;
+      await deps.reply(chatId, s.isOwner
+        ? '⚠️ Animated render failed. No Stars were charged; start /crender to try again.'
+        : (refunded
+          ? '⚠️ Animated render failed, so your ⭐10 was automatically refunded. Start /crender to try again.'
+          : '⚠️ Animated render failed. The automatic refund is pending; the payment ID was recorded for recovery.'), { html: true });
       sessions.delete(key(s.chatId, s.userId));
     } else {
       if (s.charged) { deps.db.addWallet(s.userId, s.cost); s.charged = false; }
@@ -329,7 +332,7 @@ async function handleMessage(msg, deps) {
     s.step = 'confirm';
     await deps.reply(
       chatId,
-      `♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}${s.animated ? ' PREMIUM MOTION' : ''}</b>\nName: <b>${s.name}</b>\nCost: <b>${s.animated ? `⭐${ANIMATED_STAR_PRICE}` : (cost ? `🪙 ${money(cost)}` : 'FREE')}</b>\n${s.animated ? 'Payment is requested only after you confirm.' : (s.isStaff ? '👑 Staff unlimited render' : `Free renders used today: <b>${Math.min(used, 3)}/3</b>`)}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,
+      `♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}${s.animated ? ' PREMIUM MOTION' : ''}</b>\nName: <b>${s.name}</b>\nCost: <b>${s.animated ? (s.isOwner ? 'FREE' : `⭐${ANIMATED_STAR_PRICE}`) : (cost ? `🪙 ${money(cost)}` : 'FREE')}</b>\n${s.animated ? (s.isOwner ? '👑 Owner Premium Motion pass' : 'Payment is requested only after you confirm.') : (s.isStaff ? '👑 Staff unlimited render' : `Free renders used today: <b>${Math.min(used, 3)}/3</b>`)}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,
       { html: true },
     );
     return true;
@@ -341,6 +344,11 @@ async function handleMessage(msg, deps) {
       return true;
     }
     if (s.animated) {
+      if (s.isOwner) {
+        s.step = 'rendering';
+        await renderAndDeliver(s, deps);
+        return true;
+      }
       s.invoicePayload = `jtfanim:${userId}:${crypto.randomBytes(8).toString('hex')}`;
       await deps.bot.sendInvoice(
         chatId,
