@@ -47,6 +47,7 @@ const TelegramBot = require("node-telegram-bot-api"),
   timewallet = require("./timewallet"),
   waifu = require("./waifu"),
   hunt = require("./hunt"),
+  shoobCards = require("./shoob-cards"),
   crender = require("./crender"),
   customCards = require("./custom-cards"),
   staffSpectator = require("./staff-spectator"),
@@ -106,6 +107,8 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
     { command: "characters", description: "🃏 Your card collection" },
     { command: "viewchar", description: "🃏 View a card by number" },
     { command: "clb", description: "🃏 Card leaderboard" },
+    { command: "shoob", description: "🎴 Search Shoob originals" },
+    { command: "chatid", description: "🆔 Show this chat ID (owner)" },
     { command: "remember", description: "🧠 Store a memory (owner)" },
     { command: "recall", description: "🧠 Recall a memory (owner)" },
   ];
@@ -1668,6 +1671,17 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
     cardstyle: async (ctx) => {
       await promptCharStyle(ctx, "");
     },
+    shoob: async (ctx) => {
+      const result = await shoobCards.startSearch(bot, ctx.chatId, ctx.userId, (ctx.args || []).join(" "));
+      if (!result.ok) await ctx.reply(result.message, { title: "🎴 SHOOB ARCHIVE", color: THEME.gold, html: !0 });
+    },
+    chatid: async (ctx) => {
+      if (!ctx.isOwner)
+        return ctx.reply("Only the King can inspect archive chat IDs. 👑", { title: "🔒 OWNER ONLY", color: THEME.red });
+      const chat = ctx.msg.chat || {};
+      const name = esc(chat.title || chat.first_name || "Private chat");
+      await ctx.reply(`🆔 <b>CHAT ID</b>\n\n<b>Chat:</b> ${name}\n<b>Type:</b> ${esc(chat.type || "unknown")}\n<b>ID:</b> <code>${chat.id}</code>\n\nUse this exact number as <code>SHOOB_ARCHIVE_CHAT_ID</code>.`, { title: "🆔 CHAT ID", color: THEME.cyan, html: !0 });
+    },
     characters: async (ctx) => {
       const rows = db.getUserHuntCharacters(ctx.userId);
       await ctx.reply(hunt.collectionCaption(rows), {
@@ -2023,6 +2037,11 @@ ${res.message}`,
       userId = from.id,
       ctx = buildCtx(query.message || { chat: { id: chatId }, from }, []),
       pinfo = db.syncInfo();
+    if (data.startsWith("shoob:")) {
+      try { await shoobCards.handleNavigation(bot, query); }
+      catch (e) { console.error("[shoob] navigation:", e.message); await bot.answerCallbackQuery(query.id, { text: "That Shoob card could not be opened." }).catch(() => {}); }
+      return;
+    }
     if (admin.isPurgeLocked()) return;
     if (pinfo.configured && !pinfo.writable) {
       try {
@@ -2562,12 +2581,20 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
         owner = isOwner(userId),
         name = from.first_name || from.username || "mortal";
       try {
+        const replied = repliedUser(msg);
+        const mentioned = !replied && (text.match(/@([a-z0-9_]{5,})/i) || [])[1];
+        const subject = replied
+          ? db.getUser(Number(replied.id))
+          : mentioned
+            ? db.findUserByUsername(mentioned)
+            : null;
         const ans = await rimuru.reply(text, {
             id: userId,
             first_name: name,
             username: from.username,
             isOwner: owner,
             isStaff: isStaff(userId),
+            subject: subject ? { user_id: subject.user_id, first_name: subject.first_name, username: subject.username, wallet: subject.wallet, bank: subject.bank, networth: subject.networth, rank: subject.rank, rank_valid_matches: subject.rank_valid_matches } : null,
           }),
           textPromise = reply(chatId, ans, {
             title: "🐉 RIMURU",
@@ -2713,6 +2740,7 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
       reply: (chatId, text, opts) => reply(chatId, text, opts),
       sendPhoto: (chatId, image, opts, fileOpts) =>
         bot.sendPhoto(chatId, image, opts, fileOpts),
+      sendShoob: (chatId, card) => shoobCards.sendArchived(bot, chatId, card),
       answerCb: (text) =>
         bot
           .answerCallbackQuery(

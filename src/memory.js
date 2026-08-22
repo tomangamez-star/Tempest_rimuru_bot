@@ -20,6 +20,7 @@ const VALID_CATEGORIES = ['user_info', 'group_event', 'coin_stats', 'bot_fact', 
 function validCategory(cat) {
   return VALID_CATEGORIES.includes(String(cat || '').toLowerCase()) ? String(cat).toLowerCase() : 'general';
 }
+function displayValue(value) { try { const parsed = JSON.parse(value); return typeof parsed === 'string' ? parsed : JSON.stringify(parsed); } catch (_) { return String(value || ''); } }
 
 /**
  * Store a memory. Upserts by key.
@@ -86,11 +87,30 @@ function contextString(limit = 5) {
   return 'Recent memories:\n' + rows.map((r) => `  - ${r.key}: ${r.value}`).join('\n');
 }
 
+function userContext(userId, limit = 12) {
+  const prefix = `user:${Number(userId)}:`;
+  return db.getMemoriesByCategory('user_info')
+    .filter((row) => String(row.key || '').startsWith(prefix))
+    .slice(0, Math.max(1, Number(limit) || 12))
+    .map((row) => `${String(row.key).slice(prefix.length).replace(/_/g, ' ')}: ${displayValue(row.value)}`)
+    .join(' | ');
+}
+
+function conversationContext(userId, limit = 4) {
+  const prefix = `conv:${Number(userId)}:`;
+  return db.getMemoriesByCategory('conversation')
+    .filter((row) => String(row.key || '').startsWith(prefix))
+    .slice(0, Math.max(1, Number(limit) || 4))
+    .map((row) => displayValue(row.value)).join(' | ');
+}
+
 module.exports = {
   remember,
   recall,
   recallByCategory,
   forget,
   contextString,
+  userContext,
+  conversationContext,
   VALID_CATEGORIES,
 };

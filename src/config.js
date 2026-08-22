@@ -21,8 +21,8 @@ const config = {
   // Groq (Rimuru AI)
   groqApiKey: process.env.GROQ_API_KEY || '',
   groqModel: process.env.GROQ_MODEL || 'openai/gpt-oss-20b',
-  groqMaxTokens: Number(process.env.GROQ_MAX_TOKENS || 150),
-  groqTemperature: Number(process.env.GROQ_TEMPERATURE || 0.9),
+  groqMaxTokens: Number(process.env.GROQ_MAX_TOKENS || 350),
+  groqTemperature: Number(process.env.GROQ_TEMPERATURE || 0.65),
 
   // Runtime
   port: Number(process.env.PORT || 10000),

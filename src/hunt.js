@@ -2056,19 +2056,16 @@ async function searchAndShow(query, opts = {}) {
     }
     if (!original) {
       const tierText = parsed.tier ? ` at T${parsed.tier}` : '';
-      return { ok: false, message: `No exact Shoob card found for ${stripUrls(q)}${tierText}. Try the exact card name${parsed.tier ? ' or another tier' : ''}.` };
+      return { ok: false, message: `No archived Shoob card found for ${stripUrls(q)}${tierText}. The catalogue may still be ingesting${parsed.tier ? ', or that tier may not exist' : ''}.` };
     }
     try {
-      const image = await shoobCards.fetchImage(original);
-      const name = stripUrls(original.name || original.card_name || q);
+      if (!deps || typeof deps.sendShoob !== 'function') throw new Error('Shoob archive sender is not attached');
       const tier = shoobCards.tierOf(original);
-      const series = stripUrls(shoobCards.seriesOf(original));
-      const caption = [`🎴 ${fancy(name)}`, series ? `🎬 ${fancy(series)}` : '', tier ? `⭐ ${fancy(`T${tier} SHOOB ORIGINAL`)}` : '⭐ SHOOB ORIGINAL', `🆔 Shoob Card: ${shoobCards.cardIdOf(original)}`].filter(Boolean).join('\n');
-      await deps.sendPhoto(opts.chatId, image.buffer, { caption }, { filename: `shoob-${shoobCards.cardIdOf(original)}.png`, contentType: image.contentType });
+      await deps.sendShoob(opts.chatId, original);
       return { ok: true, character: original, previewTier: tier || null, style: 'shoob-original' };
     } catch (e) {
-      console.warn(`[char] Shoob image failed for ${q}: ${e.message}`);
-      return { ok: false, message: 'The exact Shoob card was found, but its original image could not be downloaded. Please try again.' };
+      console.warn(`[char] Shoob archive send failed for ${q}: ${e.message}`);
+      return { ok: false, message: 'The Shoob card was found, but Telegram could not resend its archived media. Please try again.' };
     }
   }
   const seed = await searchAniListCharacter(q);

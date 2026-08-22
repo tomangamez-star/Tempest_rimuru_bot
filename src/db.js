@@ -1365,6 +1365,8 @@ function getAttackEligibleUsers() {
 function setMemory(key, value, category = 'general') {
   prep('INSERT INTO bot_memory (key, value, category, updated_at) VALUES (?, ?, ?, datetime(\'now\')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, category = excluded.category, updated_at = datetime(\'now\')')
     .run(key, value, category);
+  const row = prep('SELECT key, value, category, updated_at FROM bot_memory WHERE key = ?').get(key);
+  if (row) queuePgWrite('bot_memory', [row.key, row.value, row.category, row.updated_at]);
 }
 
 function getMemory(key) {
@@ -1377,6 +1379,54 @@ function getMemoriesByCategory(category) {
 
 function deleteMemory(key) {
   prep('DELETE FROM bot_memory WHERE key = ?').run(key);
+  pgRun('bot_memory', 'DELETE FROM bot_memory WHERE key = $1', [key]).catch(() => {});
+}
+
+/* ===================== SHOOB TELEGRAM ARCHIVE ===================== */
+
+function normalizeShoobSearch(value) {
+  return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ')
+    .trim().replace(/\s+/g, ' ');
+}
+
+async function searchShoobCards(query, tier = 0, limit = 24, offset = 0) {
+  if (!pgReady || !pgPool) return { rows: [], total: 0, unavailable: true };
+  const wanted = normalizeShoobSearch(query);
+  if (!wanted) return { rows: [], total: 0 };
+  const safeTier = Math.max(0, Math.min(6, Number(tier) || 0));
+  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 24));
+  const safeOffset = Math.max(0, Number(offset) || 0);
+  const args = [wanted, `%${wanted}%`];
+  let tierSql = '';
+  if (safeTier) { args.push(safeTier); tierSql = ` AND tier = $${args.length}`; }
+  const where = `(normalized_name = $1 OR normalized_name LIKE $2 OR LOWER(series) LIKE $2)${tierSql}`;
+  const count = await pgPool.query(`SELECT COUNT(*)::bigint AS total FROM shoob_cards WHERE ${where}`, args);
+  args.push(safeLimit, safeOffset);
+  const rows = await pgPool.query(`SELECT source_url, name, normalized_name, series, tier, media_url, media_type,
+      telegram_file_id, telegram_media_type, telegram_message_id, archive_chat_id
+    FROM shoob_cards WHERE ${where}
+    ORDER BY CASE WHEN normalized_name = $1 THEN 0 WHEN normalized_name LIKE $2 THEN 1 ELSE 2 END,
+      tier DESC, updated_at DESC LIMIT $${args.length - 1} OFFSET $${args.length}`, args);
+  return { rows: rows.rows || [], total: Number(count.rows[0] && count.rows[0].total) || 0 };
+}
+
+async function shoobCatalogueStats() {
+  if (!pgReady || !pgPool) return { total: 0, unavailable: true };
+  const result = await pgPool.query(`SELECT COUNT(*)::bigint AS total,
+    COUNT(*) FILTER (WHERE telegram_media_type IN ('animation','video','document'))::bigint AS animated,
+    MAX(updated_at) AS updated_at FROM shoob_cards`);
+  const row = result.rows[0] || {};
+  return { total: Number(row.total) || 0, animated: Number(row.animated) || 0, updated_at: row.updated_at || null };
+}
+
+function getActiveGameSessions(userId) {
+  const now = Date.now();
+  prep('DELETE FROM game_sessions WHERE expires_at > 0 AND expires_at <= ?').run(now);
+  return prep('SELECT game, state, expires_at FROM game_sessions WHERE user_id = ? ORDER BY expires_at DESC').all(userId).map((row) => {
+    try { row.state = JSON.parse(row.state); } catch (_) {}
+    return row;
+  });
 }
 
 /* ===================== BOT STATE ===================== */
@@ -1568,6 +1618,37 @@ async function ensurePgTables() {
   // missing column (e.g. `networth`) and the bot stays stuck in standby /
   // read-only forever (never acquires the advisory lock, never responds).
   await migratePgColumns();
+  // Shoob media bytes live in Telegram's archive, not Postgres. Postgres only
+  // stores searchable metadata and the bot-specific Telegram file_id.
+  try {
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS shoob_cards (
+      source_url TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      normalized_name TEXT NOT NULL,
+      series TEXT DEFAULT '',
+      tier BIGINT DEFAULT 0,
+      media_url TEXT DEFAULT '',
+      media_type TEXT DEFAULT 'image',
+      telegram_file_id TEXT NOT NULL,
+      telegram_media_type TEXT DEFAULT 'photo',
+      telegram_message_id BIGINT DEFAULT 0,
+      archive_chat_id BIGINT DEFAULT 0,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+    await pgPool.query('CREATE INDEX IF NOT EXISTS shoob_cards_normalized_name_idx ON shoob_cards (normalized_name)');
+    await pgPool.query('CREATE INDEX IF NOT EXISTS shoob_cards_tier_idx ON shoob_cards (tier)');
+    await pgPool.query('CREATE INDEX IF NOT EXISTS shoob_cards_series_lower_idx ON shoob_cards (LOWER(series))');
+    await pgPool.query(`CREATE TABLE IF NOT EXISTS shoob_scraper_state (
+      state_key TEXT PRIMARY KEY,
+      next_page BIGINT DEFAULT 1,
+      last_completed_page BIGINT DEFAULT 0,
+      status TEXT DEFAULT 'new',
+      updated_at TIMESTAMPTZ DEFAULT NOW()
+    )`);
+  } catch (e) {
+    console.warn('[db] ensure Shoob catalogue tables:', e.message);
+  }
 }
 
 /* Per-column PG type/defaults for `ADD COLUMN IF NOT EXISTS` on legacy tables.
@@ -1640,6 +1721,14 @@ async function migratePgColumns() {
   }
   // ---- Legacy data reconciliation (each guarded; no-op when the legacy
   // column doesn't exist on this install) ----
+  try {
+    const typeRes = await pgPool.query(`SELECT data_type FROM information_schema.columns
+      WHERE table_schema='public' AND table_name='bot_memory' AND column_name='value' LIMIT 1`);
+    if (String(typeRes.rows[0] && typeRes.rows[0].data_type || '').toLowerCase() === 'jsonb') {
+      await pgPool.query('ALTER TABLE bot_memory ALTER COLUMN value TYPE TEXT USING value::text');
+      console.log('[db] bot_memory.value reconciled to TEXT for reliable personal memories');
+    }
+  } catch (e) { console.warn('[db] bot_memory value reconciliation skipped:', e.message); }
   try {
     // admin_users is keyed by Telegram user_id in SQLite. Some earlier PG
     // auto-DDL builds accidentally created it without a unique constraint,
@@ -2184,7 +2273,7 @@ module.exports = {
   // Inventory
   getInventory, addInventory, removeInventory, hasItem, getItemQty, addItem,
   // Game sessions
-  getGameSession, setGameSession, deleteGameSession,
+  getGameSession, setGameSession, deleteGameSession, getActiveGameSessions,
   // Logging
   logGameHistory, logActivity, logAudit, logChat, getChatLogs,
   getGameHistory, getAuditLog, getActivity,
@@ -2225,6 +2314,8 @@ module.exports = {
   getAttackEligibleUsers,
   // Memory
   setMemory, getMemory, getMemoriesByCategory, deleteMemory,
+  // Shoob Telegram archive
+  searchShoobCards, shoobCatalogueStats, normalizeShoobSearch,
   // Bot state
   setBotPaused, getBotPaused,
   getSetting, setSetting,
