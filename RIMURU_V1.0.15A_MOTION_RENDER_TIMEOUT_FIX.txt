@@ -1,0 +1,32 @@
+RIMURU v1.0.15A — MOTION RENDER TIMEOUT FIX
+
+Production evidence:
+[crender] render failed: animation rendering timed out
+
+ROOT CAUSE
+The live request was decoding 1280x720 30fps border sources (including 10-bit
+4:4:4 sources), cropping, rotating, scaling, black-keying, drawing six
+particles, compositing five layers, and encoding the result. Render's CPU
+could not complete that pipeline inside the 120-second safety timeout.
+
+FIX
+- All four border loops are now pre-baked to 700x900 portrait.
+- Assets are six seconds, 20fps, H.264, and yuv420p.
+- Border particles are baked into the assets once instead of drawn per render.
+- Live requests no longer rotate/crop the border or convert 10-bit video.
+- The inexpensive black-key remains live so artwork colors are not washed out.
+- Output uses the ultrafast H.264 preset at CRF 22.
+- Artwork motion, random border selection, VIP crest, owner signature,
+  foil sweep, payments, refunds, and owner-free behavior are unchanged.
+- No new environment variables.
+
+VALIDATION
+- Full real six-second compositor test passed.
+- Output: 700x900, 20fps, yuv420p H.264 MP4.
+- Local end-to-end benchmark: 8.8 seconds including test-video generation,
+  static Old Gen rendering, badge generation, and final encode.
+- Syntax and focused Premium Motion tests passed.
+
+DEPLOY
+Replace src/animated-card.js and all four files in:
+src/assets/motion-borders/
