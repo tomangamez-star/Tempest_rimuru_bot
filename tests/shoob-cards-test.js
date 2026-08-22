@@ -17,10 +17,15 @@ async function run() {
   const socketFactory = () => ({
     on(event, listener) {
       if (event === 'connect') setImmediate(listener);
-      if (event === 'cardindexres') setTimeout(() => listener({ data: { docs } }), 5);
+      if (event === 'cardindexres') this.catalogueListener = listener;
       return this;
     },
-    emit(event, payload) { request = { event, payload }; },
+    emit(event, payload) {
+      if (event === 'cardindex') {
+        request = { event, payload };
+        setImmediate(() => this.catalogueListener({ data: { docs } }));
+      }
+    },
     close() {},
   });
   const found = await shoob.findExact('Rimuru Tempest', 2, { socketFactory, timeoutMs: 500 });
