@@ -7,7 +7,7 @@
   "scripts": {
     "start": "node -r ./src/persistence-hardening.js --max-old-space-size=512 src/index.js",
     "dev": "node -r ./src/persistence-hardening.js --max-old-space-size=512 src/index.js",
-    "test": "node tests/smoke.js && node tests/dashboard-test.js && node tests/backup-regression-test.js && node tests/attack-test.js && node tests/waifu-test.js && node tests/hunt-test.js",
+    "test": "node tests/smoke.js && node tests/dashboard-test.js && node tests/backup-regression-test.js && node tests/attack-test.js && node tests/waifu-test.js && node tests/hunt-test.js && node tests/shoob-cards-test.js",
     "test:pg": "node tests/hydrate-pg-test.js && node tests/pg-persist-test.js && node tests/boot-cycle-test.js && node tests/regression-lock-race-test.js && node tests/bandwidth-test.js",
     "migrate": "node scripts/migrate-sqlite-to-pg.js",
     "migrate:dry": "node scripts/migrate-sqlite-to-pg.js --dry-run",
@@ -36,6 +36,7 @@
     "node-telegram-bot-api": "^0.66.0",
     "pg": "^8.23.0",
     "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.1",
     "sharp": "^0.35.3"
   }
 }

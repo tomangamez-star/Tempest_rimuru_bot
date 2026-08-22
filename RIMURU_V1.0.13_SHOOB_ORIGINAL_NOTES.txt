@@ -1,0 +1,24 @@
+RIMURU / JTF CARDS — V1.0.13 SHOOB ORIGINAL
+
+WHAT CHANGED
+- Added "4 - Shoob Original" to /cardstyle.
+- /char <exact name> [t1-t6] can now return Shoob's completed public card image unchanged.
+- Shoob Original is search-only. It was NOT added to /hunt, /shunt, /card, or automatic spawning.
+- Character matching is normalized but exact. Near-name and substring results are rejected.
+- A requested tier is strict: /char Rimuru Tempest t5 only accepts an exact T5 result.
+- Without a tier, the deterministic best exact result is selected (highest tier, then newest issue).
+- Catalogue results and downloaded images are cached in memory to reduce repeat traffic.
+- Failure is isolated: Shoob outages return a clear message and never switch to a different renderer.
+- Added socket.io-client, used by Shoob's public catalogue channel.
+
+NO NEW ENVIRONMENT VARIABLES
+Deploy normally. npm install will install the added dependency from package.json/package-lock.json.
+
+USAGE
+1. Send /cardstyle
+2. Reply 4
+3. Send /char Rimuru Tempest t5
+
+VALIDATION
+- All JavaScript files pass node --check.
+- Exact-name, strict-tier, ordering, and catalogue-request behavior have regression coverage.
