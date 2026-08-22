@@ -96,12 +96,19 @@ function loadCataloguePage(name, tier, options = {}) {
       const data = payload && payload.data || payload || {};
       finish(null, Array.isArray(data.docs) ? data.docs : []);
     });
-    socket.on('connect', () => socket.emit('cardindex', {
-      page: 1,
-      category: tier ? String(tier) : null,
-      search: String(name || '').trim(),
-      series: null,
-    }));
+    socket.on('connect', () => {
+      // Shoob's own website initializes the public session and reports the
+      // current page before requesting cardindex. Without this handshake the
+      // socket can connect but return an empty catalogue to headless clients.
+      socket.emit('init');
+      socket.emit('location', '/cards');
+      setTimeout(() => socket.emit('cardindex', {
+        page: 1,
+        category: tier ? String(tier) : null,
+        search: String(name || '').trim(),
+        series: null,
+      }), 75);
+    });
   });
 }
 
