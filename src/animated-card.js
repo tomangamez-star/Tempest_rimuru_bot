@@ -1,133 +1,30 @@
 'use strict';
-
-const fs = require('fs');
-const os = require('os');
-const path = require('path');
-const { spawn } = require('child_process');
-
-const WIDTH = 700;
-const HEIGHT = 900;
-const FPS = 24;
-const DURATION = 6;
-const MAX_INPUT_BYTES = 15 * 1024 * 1024;
-const MAX_OUTPUT_BYTES = 19 * 1024 * 1024;
-
-const STYLE = {
-  gen2: { color: '66D9FF', second: 'FFFFFF', speed: 34, label: 'GEN 2 MOTION' },
-  oldgen: { color: 'FF6A00', second: 'FFD34E', speed: 48, label: 'OLD GEN MOTION' },
-  signature: { color: 'D26BFF', second: '73E7FF', speed: 40, label: 'JTF SIGNATURE MOTION' },
-  ai: { color: 'FF4FD8', second: '68F7FF', speed: 56, label: 'AI CUSTOM MOTION' },
+const fs=require('fs'),os=require('os'),path=require('path'),crypto=require('crypto');
+const {spawn}=require('child_process');
+const WIDTH=700,HEIGHT=900,FPS=24,DURATION=6,MAX_INPUT_BYTES=15*1024*1024,MAX_OUTPUT_BYTES=19*1024*1024;
+const BORDER_DIR=path.join(__dirname,'assets','motion-borders');
+const LAYOUTS={
+  gen2:{x:57,y:101,width:586,height:467},oldgen:{x:50,y:47,width:600,height:505},
+  signature:{x:63,y:86,width:574,height:458},ai:{x:39,y:39,width:622,height:490},
 };
-
-function ffmpegPath() {
-  try { return require('ffmpeg-static'); }
-  catch (_) { throw new Error('ffmpeg-static is not installed'); }
-}
-
-function run(args, timeoutMs = 90000) {
-  return new Promise((resolve, reject) => {
-    const child = spawn(ffmpegPath(), args, { stdio: ['ignore', 'ignore', 'pipe'] });
-    let stderr = '';
-    const timer = setTimeout(() => {
-      child.kill('SIGKILL');
-      reject(new Error('animation rendering timed out'));
-    }, timeoutMs);
-    child.stderr.on('data', (chunk) => { stderr = (stderr + chunk).slice(-8000); });
-    child.once('error', (error) => { clearTimeout(timer); reject(error); });
-    child.once('close', (code) => {
-      clearTimeout(timer);
-      if (code === 0) resolve();
-      else reject(new Error(`FFmpeg exited ${code}: ${stderr.split('\n').slice(-4).join(' ').trim()}`));
-    });
-  });
-}
-
-function extFor(mime = '') {
-  const value = String(mime).toLowerCase();
-  if (value.includes('gif')) return '.gif';
-  if (value.includes('webm')) return '.webm';
-  return '.mp4';
-}
-
-function validateInput(buffer, meta = {}) {
-  if (!Buffer.isBuffer(buffer) || !buffer.length) throw new Error('The animation file is empty');
-  if (buffer.length > MAX_INPUT_BYTES) throw new Error('Animation must be 15 MB or smaller');
-  const duration = Number(meta.duration) || 0;
-  if (duration > 8.5) throw new Error('Animation must be 8 seconds or shorter');
-  const mime = String(meta.mimeType || '').toLowerCase();
-  if (mime && !/(gif|video|mp4|webm|quicktime)/.test(mime)) throw new Error('Send a GIF, MP4, MOV, or WEBM animation');
-  return true;
-}
-
-async function workspace(mediaBuffer, mimeType) {
-  const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), 'rimuru-motion-'));
-  const input = path.join(dir, `input${extFor(mimeType)}`);
-  await fs.promises.writeFile(input, mediaBuffer);
-  return { dir, input };
-}
-
-async function extractPoster(mediaBuffer, meta = {}) {
-  validateInput(mediaBuffer, meta);
-  const temp = await workspace(mediaBuffer, meta.mimeType);
-  const poster = path.join(temp.dir, 'poster.png');
-  try {
-    await run([
-      '-hide_banner', '-loglevel', 'error', '-y', '-ss', '0.10', '-i', temp.input,
-      '-vf', `scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1`,
-      '-frames:v', '1', poster,
-    ], 30000);
-    return await fs.promises.readFile(poster);
-  } finally { await fs.promises.rm(temp.dir, { recursive: true, force: true }); }
-}
-
-function effectFilter(renderer) {
-  const s = STYLE[renderer] || STYLE.gen2;
-  const star = (size, x, y, phase, alpha) =>
-    `drawtext=text='*':fontsize=${size}:fontcolor=white@${alpha}:x='mod(${x}+t*${s.speed},w+40)-20':y='${y}+${phase}*sin(t*1.4)'`;
-  return [
-    `drawbox=x=7:y=7:w=${WIDTH - 14}:h=${HEIGHT - 14}:color=0x${s.color}@0.72:t=5`,
-    `drawbox=x=15:y=15:w=${WIDTH - 30}:h=${HEIGHT - 30}:color=0x${s.second}@0.35:t=2`,
-    star(24, 20, 90, 16, 0.82),
-    star(17, 170, 240, 24, 0.70),
-    star(28, 340, 460, 18, 0.76),
-    star(15, 510, 690, 28, 0.68),
-    `drawtext=text='${s.label}':fontsize=14:fontcolor=0x${s.second}@0.58:x=w-tw-24:y=24+6*sin(t*2)`,
-    'vignette=PI/5',
-  ].join(',');
-}
-
-async function render(options = {}) {
-  const mediaBuffer = options.mediaBuffer;
-  const staticBuffer = options.staticBuffer;
-  const meta = { mimeType: options.mimeType, duration: options.duration };
-  validateInput(mediaBuffer, meta);
-  if (!Buffer.isBuffer(staticBuffer) || !staticBuffer.length) throw new Error('Static card base is missing');
-  const temp = await workspace(mediaBuffer, options.mimeType);
-  const staticPath = path.join(temp.dir, 'card.png');
-  const output = path.join(temp.dir, 'animated-card.mp4');
-  await fs.promises.writeFile(staticPath, staticBuffer);
-  const effects = effectFilter(options.renderer);
-  try {
-    const filter = [
-      `[0:v]fps=${FPS},scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1,format=rgba[motion]`,
-      `[1:v]scale=${WIDTH}:${HEIGHT},format=rgba,colorchannelmixer=aa=0.80[card]`,
-      `[motion][card]overlay=0:0:shortest=0,${effects},format=yuv420p[out]`,
-    ].join(';');
-    await run([
-      '-hide_banner', '-loglevel', 'error', '-y', '-stream_loop', '-1', '-i', temp.input,
-      '-loop', '1', '-i', staticPath,
-      '-filter_complex', filter, '-map', '[out]', '-an', '-t', String(DURATION),
-      '-r', String(FPS), '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '24',
-      '-movflags', '+faststart', output,
-    ]);
-    const buffer = await fs.promises.readFile(output);
-    if (!buffer.length) throw new Error('FFmpeg produced an empty animation');
-    if (buffer.length > MAX_OUTPUT_BYTES) throw new Error('Animated card exceeded Telegram-safe size');
-    return { buffer, contentType: 'video/mp4', duration: DURATION, width: WIDTH, height: HEIGHT };
-  } finally { await fs.promises.rm(temp.dir, { recursive: true, force: true }); }
-}
-
-module.exports = {
-  WIDTH, HEIGHT, FPS, DURATION, MAX_INPUT_BYTES, STYLE,
-  validateInput, extractPoster, render, _run: run,
-};
+const BORDERS=[
+  {key:'cyber-blue',file:'cyber-blue.mp4',primary:'#54D8FF',secondary:'#D8FAFF'},
+  {key:'cyber-red',file:'cyber-red.mp4',primary:'#FF304C',secondary:'#FFB04A'},
+  {key:'electric-green',file:'electric-green.mp4',primary:'#64FF32',secondary:'#E1FF69'},
+  {key:'neon-purple',file:'neon-purple.mp4',primary:'#E238FF',secondary:'#5AE7FF'},
+];
+function ffmpegPath(){try{return require('ffmpeg-static');}catch(_){return 'ffmpeg';}}
+function sharp(){try{return require('sharp');}catch(_){throw new Error('sharp is not installed');}}
+function run(args,timeoutMs=120000){return new Promise((resolve,reject)=>{const child=spawn(ffmpegPath(),args,{stdio:['ignore','ignore','pipe']});let stderr='';const timer=setTimeout(()=>{child.kill('SIGKILL');reject(new Error('animation rendering timed out'));},timeoutMs);child.stderr.on('data',c=>{stderr=(stderr+c).slice(-10000);});child.once('error',e=>{clearTimeout(timer);reject(e);});child.once('close',code=>{clearTimeout(timer);code===0?resolve():reject(new Error(`FFmpeg exited ${code}: ${stderr.split('\n').slice(-6).join(' ').trim()}`));});});}
+function extFor(mime=''){const v=String(mime).toLowerCase();if(v.includes('gif'))return'.gif';if(v.includes('webm'))return'.webm';if(v.includes('quicktime'))return'.mov';return'.mp4';}
+function validateInput(buffer,meta={}){if(!Buffer.isBuffer(buffer)||!buffer.length)throw new Error('The animation file is empty');if(buffer.length>MAX_INPUT_BYTES)throw new Error('Animation must be 15 MB or smaller');const duration=Number(meta.duration)||0;if(duration>8.5)throw new Error('Animation must be 8 seconds or shorter');const mime=String(meta.mimeType||'').toLowerCase();if(mime&&!/(gif|video|mp4|webm|quicktime)/.test(mime))throw new Error('Send a GIF, MP4, MOV, or WEBM animation');return true;}
+async function workspace(mediaBuffer,mimeType){const dir=await fs.promises.mkdtemp(path.join(os.tmpdir(),'rimuru-motion-'));const input=path.join(dir,`input${extFor(mimeType)}`);await fs.promises.writeFile(input,mediaBuffer);return{dir,input};}
+async function extractPoster(mediaBuffer,meta={}){validateInput(mediaBuffer,meta);const t=await workspace(mediaBuffer,meta.mimeType),poster=path.join(t.dir,'poster.png');try{await run(['-hide_banner','-loglevel','error','-y','-ss','0.10','-i',t.input,'-vf',`scale=${WIDTH}:${HEIGHT}:force_original_aspect_ratio=increase,crop=${WIDTH}:${HEIGHT},setsar=1`,'-frames:v','1',poster],30000);return await fs.promises.readFile(poster);}finally{await fs.promises.rm(t.dir,{recursive:true,force:true});}}
+function escapeXml(v){return String(v||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&apos;'}[c]));}
+function cleanSignature(v){return String(v||'').replace(/[^@a-z0-9_. -]/gi,'').replace(/\s+/g,' ').trim().slice(0,32)||'JTF COLLECTOR';}
+function chooseBorder(seed=''){const d=crypto.createHash('sha256').update(String(seed||crypto.randomBytes(8).toString('hex'))).digest(),available=BORDERS.filter(x=>fs.existsSync(path.join(BORDER_DIR,x.file)));if(!available.length)throw new Error('Premium motion border assets are missing');return available[d[0]%available.length];}
+async function makeBadge(dir,border,signature){const out=path.join(dir,'premium-badge.png'),svg=Buffer.from(`<svg width="700" height="900" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="m"><stop stop-color="#fff"/><stop offset=".25" stop-color="${border.secondary}"/><stop offset=".6" stop-color="${border.primary}"/><stop offset="1" stop-color="#fff"/></linearGradient><filter id="g" x="-80%" y="-100%" width="260%" height="300%"><feGaussianBlur stdDeviation="8" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter><filter id="s"><feGaussianBlur in="SourceAlpha" stdDeviation="5"/><feOffset dy="4"/><feComponentTransfer><feFuncA type="linear" slope=".72"/></feComponentTransfer><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter></defs><g filter="url(#s)"><path d="M218 10 H482 L508 35 L482 69 H218 L192 35 Z" fill="#07080d" fill-opacity=".88" stroke="url(#m)" stroke-width="4"/><path d="M270 11 L287 1 L304 11 L321 1 L338 11 L350 0 L362 11 L379 1 L396 11 L413 1 L430 11" fill="none" stroke="${border.secondary}" stroke-width="3"/></g><text x="350" y="48" text-anchor="middle" font-size="31" font-family="Nimbus Sans Narrow,DejaVu Sans,sans-serif" font-style="italic" font-weight="900" letter-spacing="5" fill="url(#m)" stroke="#050509" stroke-width="2" paint-order="stroke" filter="url(#g)">VIP EDITION</text><g transform="translate(350 870)" filter="url(#g)"><path d="M-210 0 H-80 L-62 -11 H62 L80 0 H210" fill="none" stroke="${border.primary}" stroke-width="2"/><text x="0" y="7" text-anchor="middle" font-size="19" font-family="URW Gothic,DejaVu Sans,sans-serif" font-style="italic" font-weight="900" letter-spacing="2.2" fill="#fff" stroke="${border.primary}" stroke-width="1.2" paint-order="stroke">${escapeXml(cleanSignature(signature))}</text></g></svg>`);await sharp()(svg).png().toFile(out);return out;}
+async function makeShine(dir,border){const out=path.join(dir,'foil-shine.png'),svg=Buffer.from(`<svg width="230" height="1100" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="s"><stop stop-color="#fff" stop-opacity="0"/><stop offset=".42" stop-color="${border.secondary}" stop-opacity=".04"/><stop offset=".51" stop-color="#fff" stop-opacity=".30"/><stop offset=".60" stop-color="${border.primary}" stop-opacity=".08"/><stop offset="1" stop-color="#fff" stop-opacity="0"/></linearGradient><filter id="b"><feGaussianBlur stdDeviation="8"/></filter></defs><path d="M180 -80 H230 L50 1180 H0 Z" fill="url(#s)" filter="url(#b)"/></svg>`);await sharp()(svg).png().toFile(out);return out;}
+function particles(border){const c=border.secondary.replace('#','0x'),p=(size,x,y,speed,amp,phase,a)=>`drawtext=text='✦':fontsize=${size}:fontcolor=${c}@${a}:x='mod(${x}+t*${speed},w+50)-25':y='${y}+${amp}*sin(t*1.7+${phase})'`;return[p(13,15,130,31,16,0,.48),p(20,110,260,47,24,1,.62),p(11,250,390,38,20,2,.46),p(24,390,520,55,30,3,.68),p(15,530,690,34,22,4,.52),p(10,620,790,43,18,5,.44)].join(',');}
+async function render(o={}){validateInput(o.mediaBuffer,{mimeType:o.mimeType,duration:o.duration});if(!Buffer.isBuffer(o.staticBuffer)||!o.staticBuffer.length)throw new Error('Static card base is missing');const t=await workspace(o.mediaBuffer,o.mimeType),card=path.join(t.dir,'card.png'),output=path.join(t.dir,'animated-card.mp4');await fs.promises.writeFile(card,o.staticBuffer);const l=LAYOUTS[o.renderer]||LAYOUTS.gen2,b=chooseBorder(o.seed||`${o.renderer}:${o.signature}:${Date.now()}`),border=path.join(BORDER_DIR,b.file),badge=await makeBadge(t.dir,b,o.signature),shine=await makeShine(t.dir,b);try{const filter=[`[0:v]fps=${FPS},scale=${l.width}:${l.height}:force_original_aspect_ratio=increase,crop=${l.width}:${l.height},setsar=1,eq=saturation=1.08:brightness=0.025,format=rgba[motion]`,`[1:v]scale=${WIDTH}:${HEIGHT},setsar=1,format=rgba[base]`,`[base][motion]overlay=${l.x}:${l.y}:shortest=0[art]`,`[2:v]fps=${FPS},crop=980:650:150:35,transpose=1,scale=${WIDTH}:${HEIGHT},setsar=1,format=rgba,colorkey=0x000000:0.20:0.12,colorchannelmixer=aa=0.92[border]`,`[art][border]overlay=0:0:shortest=0[framed]`,`[3:v]format=rgba[badge]`,`[framed][badge]overlay=0:'3*sin(t*2.1)':shortest=0[vip]`,`[4:v]format=rgba[shine]`,`[vip][shine]overlay=x='-260+t*165':y=-100:shortest=0,${particles(b)},vignette=PI/7,format=yuv420p[out]`].join(';');await run(['-hide_banner','-loglevel','error','-y','-stream_loop','-1','-i',t.input,'-loop','1','-i',card,'-stream_loop','-1','-i',border,'-loop','1','-i',badge,'-loop','1','-i',shine,'-filter_complex',filter,'-map','[out]','-an','-t',String(DURATION),'-r',String(FPS),'-c:v','libx264','-preset','veryfast','-crf','21','-pix_fmt','yuv420p','-movflags','+faststart',output]);const buffer=await fs.promises.readFile(output);if(!buffer.length)throw new Error('FFmpeg produced an empty animation');if(buffer.length>MAX_OUTPUT_BYTES)throw new Error('Animated card exceeded Telegram-safe size');return{buffer,contentType:'video/mp4',duration:DURATION,width:WIDTH,height:HEIGHT,border:b.key};}finally{await fs.promises.rm(t.dir,{recursive:true,force:true});}}
+module.exports={WIDTH,HEIGHT,FPS,DURATION,MAX_INPUT_BYTES,MAX_OUTPUT_BYTES,LAYOUTS,BORDERS,validateInput,extractPoster,render,chooseBorder,cleanSignature,_run:run};

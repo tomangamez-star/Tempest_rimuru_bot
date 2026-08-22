@@ -46,7 +46,8 @@ async function start(ctx) {
   expire();
   sessions.set(key(ctx.chatId, ctx.userId), {
     step: 'renderer', chatId: ctx.chatId, userId: ctx.userId,
-    isStaff: !!ctx.isStaff, isOwner: !!ctx.isOwner, updatedAt: Date.now(),
+    isStaff: !!ctx.isStaff, isOwner: !!ctx.isOwner,
+    telegramUsername: clean(ctx.msg?.from?.username || '', 32), updatedAt: Date.now(),
   });
   await ctx.reply(
     '♦️ <b>CARD RENDERER 🛠️</b>\n\nChoose a renderer:\n\n' +
@@ -144,6 +145,8 @@ async function renderAndDeliver(s, deps) {
         mimeType: s.animation.mimeType,
         duration: s.animation.duration,
         renderer: s.renderer,
+        signature: s.signature,
+        seed: `${s.userId}:${s.name}:${s.series}:${s.invoicePayload || Date.now()}`,
       });
       output = motion.buffer;
     }
@@ -301,12 +304,30 @@ async function handleMessage(msg, deps) {
 
   if (s.step === 'quote') {
     s.quote = /^skip$/i.test(text) ? '' : clean(text, 180);
+    if (s.animated) {
+      s.step = 'signature';
+      const suggested = s.telegramUsername ? `@${s.telegramUsername}` : 'JTF COLLECTOR';
+      await deps.reply(chatId, `👑 <b>VIP SIGNATURE</b>\n\nSend the username/name that should replace the normal watermark.\nExample: <code>${suggested}</code>\n\nSend <code>auto</code> to use that suggestion.`, { html: true });
+      return true;
+    }
     s.step = 'image';
     await deps.reply(
       chatId,
       s.animated
         ? `🎞️ Send a <b>GIF or short looping video</b>.\n\nMaximum: <b>8 seconds / 15 MB</b>\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T6 Premium Motion</b>\nName: <b>${s.name}</b>`
         : `🖼️ Send the artwork.\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}</b>\nName: <b>${s.name}</b>`,
+      { html: true },
+    );
+    return true;
+  }
+
+  if (s.step === 'signature') {
+    const fallback = s.telegramUsername ? `@${s.telegramUsername}` : 'JTF COLLECTOR';
+    s.signature = animatedCard.cleanSignature(/^auto$/i.test(text) ? fallback : text);
+    s.step = 'image';
+    await deps.reply(
+      chatId,
+      `🎞️ Send a <b>GIF or short looping video</b>.\n\nMaximum: <b>8 seconds / 15 MB</b>\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T6 Premium Motion</b>\nVIP signature: <b>${s.signature}</b>`,
       { html: true },
     );
     return true;
@@ -332,7 +353,7 @@ async function handleMessage(msg, deps) {
     s.step = 'confirm';
     await deps.reply(
       chatId,
-      `♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}${s.animated ? ' PREMIUM MOTION' : ''}</b>\nName: <b>${s.name}</b>\nCost: <b>${s.animated ? (s.isOwner ? 'FREE' : `⭐${ANIMATED_STAR_PRICE}`) : (cost ? `🪙 ${money(cost)}` : 'FREE')}</b>\n${s.animated ? (s.isOwner ? '👑 Owner Premium Motion pass' : 'Payment is requested only after you confirm.') : (s.isStaff ? '👑 Staff unlimited render' : `Free renders used today: <b>${Math.min(used, 3)}/3</b>`)}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,
+      `♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}${s.animated ? ' PREMIUM MOTION' : ''}</b>\nName: <b>${s.name}</b>${s.animated ? `\nVIP signature: <b>${s.signature}</b>\nBorder: <b>random premium VFX</b>` : ''}\nCost: <b>${s.animated ? (s.isOwner ? 'FREE' : `⭐${ANIMATED_STAR_PRICE}`) : (cost ? `🪙 ${money(cost)}` : 'FREE')}</b>\n${s.animated ? (s.isOwner ? '👑 Owner Premium Motion pass' : 'Payment is requested only after you confirm.') : (s.isStaff ? '👑 Staff unlimited render' : `Free renders used today: <b>${Math.min(used, 3)}/3</b>`)}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,
       { html: true },
     );
     return true;
