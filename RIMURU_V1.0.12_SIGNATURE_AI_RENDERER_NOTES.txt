@@ -1,0 +1,27 @@
+RIMURU v1.0.12 — SIGNATURE V2 + AI CUSTOM RENDERER
+
+Changed/new production files:
+  src/jtf-gen-card.js
+  src/ai-template-card.js
+  src/crender.js
+  src/bot.js
+  .env.example
+
+JTF Signature v2:
+  - Removes the horizontal top name ribbon.
+  - Adds a vertical, adaptive-font name rail on the left.
+  - Adds a transparent head/hair escape layer above the upper frame.
+  - Removes the old T4-T6 unmasked premium bleed that leaked artwork.
+  - Retains safe local flat-background isolation.
+  - Complex scene artwork uses REMOVEBG_API_KEY when configured.
+
+Renderer 4 — JTF AI Custom:
+  - Select option 4 in /crender.
+  - Uses GROQ_API_KEY + GROQ_VISION_MODEL to inspect the supplied artwork and
+    return a text-free design blueprint (theme, motif, palette and font mood).
+  - Rimuru/Sharp writes all accurate names, descriptions, stars and series.
+  - Falls back to a deterministic local themed blueprint if Groq is unavailable.
+  - Saved renders continue through the existing custom-card storage flow.
+
+No changes were made to Hunt/Old Gen artwork selection, claiming, collection,
+leaderboards, database hydration or Postgres persistence.
