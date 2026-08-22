@@ -6,7 +6,7 @@
 CREATE TABLE IF NOT EXISTS bot_memory (
   id         SERIAL PRIMARY KEY,
   key        TEXT UNIQUE NOT NULL,
-  value      JSONB NOT NULL,
+  value      TEXT NOT NULL,
   category   TEXT NOT NULL DEFAULT 'general',
   updated_at TIMESTAMPTZ DEFAULT NOW()
 );
