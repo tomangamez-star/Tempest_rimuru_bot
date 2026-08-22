@@ -3,6 +3,7 @@
 const gen2 = require('./hunt-card');
 const oldgen = require('./special-hunt-card');
 const signature = require('./jtf-gen-card');
+const aiTemplate = require('./ai-template-card');
 const cards = require('./custom-cards');
 
 const sessions = new Map();
@@ -13,6 +14,7 @@ const RENDERERS = {
   gen2: { key: 'gen2', label: 'Gen 2', badge: '🃏 Gen 2', aliases: ['1', 'gen2', 'gen 2', 'g2'] },
   oldgen: { key: 'oldgen', label: 'Old Gen', badge: '✦ Old Gen', aliases: ['2', 'oldgen', 'old gen', 'old', 'special'] },
   signature: { key: 'signature', label: 'JTF Signature', badge: '♦️ JTF Signature', aliases: ['3', 'signature', 'jtf', 'jtf gen', 'jtfgen', 'sig', 'gen3', 'gen 3'] },
+  ai: { key: 'ai', label: 'JTF AI Custom', badge: '✦ JTF AI Custom', aliases: ['4', 'ai', 'ai custom', 'custom ai', 'gen4', 'gen 4', 'fourth'] },
 };
 
 function key(chatId, userId) { return `${chatId}:${userId}`; }
@@ -33,6 +35,7 @@ function rendererMeta(name) { return RENDERERS[name] || RENDERERS.gen2; }
 function rendererImpl(name) {
   if (name === 'oldgen') return oldgen;
   if (name === 'signature') return signature;
+  if (name === 'ai') return aiTemplate;
   return gen2;
 }
 
@@ -46,8 +49,9 @@ async function start(ctx) {
     '<b>1️⃣ Gen 2</b>\n' +
     '<b>2️⃣ Old Gen</b>\n' +
     '<b>3️⃣ JTF Signature</b>\n\n' +
+    '<b>4️⃣ JTF AI Custom</b> — artwork-directed template\n\n' +
     'Normal users receive <b>3 free successful renders daily</b>.\n' +
-    'Reply <code>1</code>, <code>2</code>, or <code>3</code>. Use <code>/cancel</code> anytime.',
+    'Reply <code>1</code>, <code>2</code>, <code>3</code>, or <code>4</code>. Use <code>/cancel</code> anytime.',
     { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true },
   );
 }
@@ -85,7 +89,7 @@ async function handleMessage(msg, deps) {
   if (s.step === 'renderer') {
     const renderer = rendererName(text);
     if (!renderer) {
-      await deps.reply(chatId, 'Choose 1 for Gen 2, 2 for Old Gen, or 3 for JTF Signature.');
+      await deps.reply(chatId, 'Choose 1 for Gen 2, 2 for Old Gen, 3 for JTF Signature, or 4 for JTF AI Custom.');
       return true;
     }
     s.renderer = renderer;

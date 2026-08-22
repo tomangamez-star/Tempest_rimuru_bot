@@ -137,7 +137,14 @@ function wrap(value, chars=49, lines=4) {
   if(!out.length)out.push('A JTF Signature collectible has entered the archive.');
   return out;
 }
-function nameSize(name){const n=clean(name,100).length;return n<=12?35:n<=19?31:n<=27?27:23;}
+function verticalNameSize(name){const n=clean(name,100).length;return n<=10?34:n<=16?30:n<=23?25:21;}
+function signatureFont(name, tier) {
+  const s=clean(name,100).toLowerCase();
+  if (/makima|aizen|sukuna|madara|demon|devil|curse/.test(s)) return 'Nimbus Sans Narrow,DejaVu Sans Condensed,Arial Narrow,sans-serif';
+  if (/frieren|violet|emilia|asuna|holo|historia/.test(s)) return 'URW Bookman,DejaVu Serif,serif';
+  if (/gojo|rimuru|zero two|kirito|sung jin/.test(s)) return 'URW Gothic,DejaVu Sans,sans-serif';
+  return Number(tier)>=4?'Nimbus Sans Narrow,DejaVu Sans Condensed,Arial Narrow,sans-serif':'DejaVu Sans Condensed,Arial Narrow,sans-serif';
+}
 function seriesSize(series){const n=clean(series,100).length;return n<=24?20:n<=38?17:n<=54?14:12;}
 
 function starsSvg(tier, a1, a2) {
@@ -164,7 +171,7 @@ function generatedBackdropSvg(a1,a2,tier,mode) {
 
 async function flatBackgroundSubject(imageBuffer, analysis) {
   const sharp=getSharp();
-  if (!sharp || analysis.mode!=='isolated') return null;
+  if (!sharp || (analysis.mode!=='isolated' && !(analysis.mode==='hybrid' && Number(analysis.borderSpread)<50))) return null;
   const prepared=sharp(imageBuffer).rotate().resize(ART.width,ART.height,{fit:'contain',position:'centre',background:{r:0,g:0,b:0,alpha:0}}).ensureAlpha();
   const {data,info}=await prepared.raw().toBuffer({resolveWithObject:true});
   const bg=analysis.bg, out=Buffer.from(data);
@@ -199,7 +206,7 @@ function overlaySvg(card, analysis) {
   const id=esc(String(card.character_id||card.id||'signature').replace(/^anilist-/i,''));
   const lines=wrap(card.bio||card.description||'',52,4).map(esc);
   const desc=lines.map((l,i)=>`<text x="350" y="${673+i*29}" text-anchor="middle" font-size="19" font-family="DejaVu Sans,Arial,sans-serif" font-weight="700" fill="#FFF">${l}</text>`).join('');
-  const ns=nameSize(nameRaw),ss=seriesSize(seriesRaw),t=tier.tier;
+  const ns=verticalNameSize(nameRaw),ss=seriesSize(seriesRaw),t=tier.tier,font=signatureFont(nameRaw,t);
   const tierDetail=t>=4?`<path d="M83 152 C120 122 152 140 188 104" fill="none" stroke="url(#sigAccent)" stroke-width="${t>=6?7:t>=5?5:3}" opacity="${t>=5?'.60':'.35'}"/><path d="M535 136 C565 100 596 118 624 88" fill="none" stroke="url(#sigAccent)" stroke-width="${t>=6?7:t>=5?5:3}" opacity="${t>=5?'.60':'.35'}"/>${t>=5?'<circle cx="350" cy="450" r="270" fill="none" stroke="url(#sigAccent)" stroke-opacity=".16" stroke-width="18"/>':''}`:'';
   return Buffer.from(`<svg width="700" height="900" xmlns="http://www.w3.org/2000/svg"><defs>
     <linearGradient id="sigAccent" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${a1}"/><stop offset=".55" stop-color="${a2}"/><stop offset="1" stop-color="${tier.base2}"/></linearGradient>
@@ -212,13 +219,13 @@ function overlaySvg(card, analysis) {
   <path d="M62 51 H608 L650 93 V750 L590 835 H144 L61 754 Z" fill="none" stroke="#FFFFFF" stroke-width="9"/>
   <path d="M62 51 H608 L650 93 V750 L590 835 H144 L61 754 Z" fill="none" stroke="url(#sigAccent)" stroke-opacity=".60" stroke-width="3"/>
   ${tierDetail}
-  <!-- PSD-like rarity symbol detached at upper-left -->
-  <text x="55" y="111" text-anchor="middle" font-size="66" font-family="DejaVu Sans,Arial,sans-serif" font-style="italic" font-weight="900" fill="#FFF" stroke="#111" stroke-width="2.5" paint-order="stroke" filter="url(#shadow)">${esc(tier.symbol)}</text>
-  <text x="58" y="137" text-anchor="middle" font-size="11" font-family="DejaVu Sans,Arial,sans-serif" font-weight="900" fill="${a1}">T${t} ${tier.label}</text>
-  <!-- exact name-ribbon region from PSD: x112..565, y22..97 -->
-  <path d="M113 31 H567 L550 78 H124 L94 60 L119 54 L103 42 Z" fill="url(#sigAccent)" stroke="#FFF" stroke-opacity=".72" stroke-width="2" filter="url(#shadow)"/>
-  <path d="M143 42 H520" stroke="#FFF" stroke-opacity=".30" stroke-width="2"/>
-  <text x="337" y="64" text-anchor="middle" font-size="${ns}" font-family="DejaVu Sans,Arial,sans-serif" font-style="italic" font-weight="900" fill="#FFF" stroke="#151515" stroke-width="1.8" paint-order="stroke">${name}</text>
+  <!-- Signature v2: the old top ribbon is deliberately gone so the isolated
+       head/hair can escape the frame. The name now owns a vertical left rail. -->
+  <path d="M22 158 L48 135 H93 L104 151 V511 L82 535 H38 L22 518 Z" fill="#090A0F" fill-opacity=".74" stroke="url(#sigAccent)" stroke-width="4" filter="url(#shadow)"/>
+  <path d="M34 178 V493" stroke="#FFF" stroke-opacity=".24" stroke-width="2"/>
+  <text x="64" y="337" text-anchor="middle" transform="rotate(-90 64 337)" font-size="${ns}" font-family="${font}" font-style="italic" font-weight="900" letter-spacing="${t>=5?'2.4':'1.1'}" fill="#FFF" stroke="${a1}" stroke-width="${t>=5?'3.2':'2.2'}" paint-order="stroke" filter="url(#starGlow)">${name}</text>
+  <g filter="url(#shadow)"><circle cx="61" cy="105" r="40" fill="#090A0F" fill-opacity=".80" stroke="url(#sigAccent)" stroke-width="4"/><text x="61" y="124" text-anchor="middle" font-size="58" font-family="${font}" font-style="italic" font-weight="900" fill="#FFF" stroke="#111" stroke-width="2.5" paint-order="stroke">${esc(tier.symbol)}</text></g>
+  <text x="62" y="154" text-anchor="middle" font-size="11" font-family="${font}" font-weight="900" fill="${a2}">T${t} ${tier.label}</text>
   <!-- art-window edge / PSD glow box -->
   <path d="M61 82 H639 V555 L618 565 H82 L61 555 Z" fill="none" stroke="url(#sigAccent)" stroke-opacity=".48" stroke-width="3"/>
   <!-- PSD star divider at ~557..585 -->
@@ -249,18 +256,16 @@ async function render(card, imageBuffer) {
   const tier=tierFor(card),analysis=await analyzeArtwork(imageBuffer,tier);
   const backdrop=generatedBackdropSvg(analysis.accent1,analysis.accent2,tier.tier,analysis.mode);
 
-  let art;
-  if(analysis.mode==='isolated') {
-    // Premium cards prefer the stronger segmentation service when configured.
-    // Local matte is deliberately a fallback because anime hair/skin can share
-    // flat-background colors and the old implementation amputated subjects.
-    let subject=(tier.tier>=4 && String(process.env.REMOVEBG_API_KEY||'').trim()) ? await externalBackgroundSubject(imageBuffer) : null;
-    if(!subject) subject=await flatBackgroundSubject(imageBuffer,analysis);
-    if(!subject && String(process.env.REMOVEBG_API_KEY||'').trim()) subject=await externalBackgroundSubject(imageBuffer);
-    if(subject) {
-      const subjectFit=await sharp(subject).resize(ART.width,ART.height,{fit:'contain',position:'bottom',background:{r:0,g:0,b:0,alpha:0}}).png().toBuffer();
+  let art, isolatedSubject=null, alignedSubject=null;
+  // A real transparent subject is also used for the head-escape layer. When
+  // remove.bg is configured it works for complex scenes; the conservative
+  // local matte is retained only for genuinely flat/isolated artwork.
+  if(String(process.env.REMOVEBG_API_KEY||'').trim()) isolatedSubject=await externalBackgroundSubject(imageBuffer);
+  if(!isolatedSubject && (analysis.mode==='isolated'||analysis.mode==='hybrid')) isolatedSubject=await flatBackgroundSubject(imageBuffer,analysis);
+  if(isolatedSubject) alignedSubject=await sharp(isolatedSubject).trim({background:{r:0,g:0,b:0,alpha:0},threshold:8}).resize(ART.width,564,{fit:'contain',position:'bottom',background:{r:0,g:0,b:0,alpha:0}}).png().toBuffer();
+  if(analysis.mode!=='scene' && isolatedSubject) {
+      const subjectFit=await sharp(alignedSubject).extract({left:0,top:84,width:ART.width,height:ART.height}).png().toBuffer();
       art=await sharp({create:{width:ART.width,height:ART.height,channels:4,background:'#F5F5F5'}}).composite([{input:backdrop},{input:subjectFit}]).png().toBuffer();
-    }
   }
   if(!art) {
     // Preserve strong scenes. Hybrid gets subtle JTF props; scene mode barely
@@ -274,13 +279,16 @@ async function render(card, imageBuffer) {
   // beneath the description rather than a generic black box.
   const lower=Buffer.from(`<svg width="700" height="900" xmlns="http://www.w3.org/2000/svg"><defs><linearGradient id="l" x1="0" y1="0" x2="1" y2="1"><stop stop-color="${analysis.accent1}" stop-opacity=".22"/><stop offset=".55" stop-color="#F7F7F7"/><stop offset="1" stop-color="${analysis.accent2}" stop-opacity=".55"/></linearGradient></defs><rect width="700" height="900" fill="#F4F4F4"/><path d="M62 51 H608 L650 93 V750 L590 835 H144 L61 754 Z" fill="url(#l)"/><g fill="${analysis.accent1}" opacity=".13"><polygon points="90,690 145,660 200,690 200,750 145,780 90,750"/><polygon points="430,620 490,588 550,620 550,684 490,716 430,684"/></g></svg>`);
 
-  let premiumBleed=null;
-  if(tier.tier>=4){
-    premiumBleed=await sharp(imageBuffer).rotate().resize(578,748,{fit:'cover',position:'attention'}).modulate({saturation:1.06,brightness:.92}).png().toBuffer();
+  let headEscape=null;
+  if(alignedSubject){
+    // The lower 480px align with the normal art window. Only the upper slice,
+    // minus the left name rail, is allowed above the border.
+    const escapeMask=Buffer.from(`<svg width="580" height="180" xmlns="http://www.w3.org/2000/svg"><path d="M112 0 H568 Q580 0 580 12 V180 H112 Z" fill="#fff"/></svg>`);
+    headEscape=await sharp(alignedSubject).extract({left:0,top:0,width:580,height:180}).composite([{input:escapeMask,blend:'dest-in'}]).png().toBuffer();
   }
   const layers=[{input:lower,left:0,top:0}];
-  if(premiumBleed) layers.push({input:premiumBleed,left:62,top:84,blend:'over'});
   layers.push({input:masked,left:ART.left,top:ART.top},{input:overlaySvg(card,analysis),left:0,top:0});
+  if(headEscape) layers.push({input:headEscape,left:ART.left,top:0,blend:'over'});
   const buffer=await sharp({create:{width:WIDTH,height:HEIGHT,channels:4,background:'#F5F5F5'}})
     .composite(layers)
     .png({compressionLevel:9,adaptiveFiltering:true})
