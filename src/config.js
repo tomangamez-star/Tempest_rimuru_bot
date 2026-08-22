@@ -5,11 +5,18 @@
  */
 require('dotenv').config();
 
+const allowedUpdates = Array.from(new Set([
+  ...(process.env.ALLOWED_UPDATES || 'message,callback_query').split(',')
+    .map((v) => v.trim() === 'messages' ? 'message' : v.trim())
+    .filter(Boolean),
+  'pre_checkout_query',
+]));
+
 const config = {
   // Telegram
   telegramToken: process.env.TELEGRAM_TOKEN || '',
   ownerId: String(process.env.OWNER_ID || '8781690556'),
-  allowedUpdates: (process.env.ALLOWED_UPDATES || 'messages,callback_query').split(','),
+  allowedUpdates,
 
   // Groq (Rimuru AI)
   groqApiKey: process.env.GROQ_API_KEY || '',

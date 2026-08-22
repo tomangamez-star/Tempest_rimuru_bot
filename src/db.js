@@ -123,6 +123,7 @@ const TABLE_COLS = {
   custom_cards: 'card_id, user_id, renderer, tier, name, series, info, quote, storage_path, created_at',
   custom_render_usage: 'user_id, day_key, render_count, updated_at',
   card_overrides: 'override_key, card_id, name, tier, renderer, set_by, created_at',
+  star_render_payments: 'charge_id, payload, user_id, chat_id, amount, currency, status, renderer, card_name, created_at, updated_at',
   bot_memory: 'key, value, category, updated_at',
   settings: 'key, value, updated_at',
 };
@@ -157,6 +158,7 @@ const TABLE_PKS = {
   custom_cards: 'card_id',
   custom_render_usage: 'user_id, day_key',
   card_overrides: 'override_key',
+  star_render_payments: 'charge_id',
   bot_memory: 'key',
   settings: 'key',
 };
@@ -399,6 +401,19 @@ function createTables() {
     );
     CREATE TABLE IF NOT EXISTS card_overrides (
       override_key TEXT PRIMARY KEY, card_id TEXT, name TEXT, tier INTEGER, renderer TEXT, set_by INTEGER, created_at INTEGER
+    );
+    CREATE TABLE IF NOT EXISTS star_render_payments (
+      charge_id TEXT PRIMARY KEY,
+      payload TEXT UNIQUE,
+      user_id INTEGER,
+      chat_id INTEGER,
+      amount INTEGER DEFAULT 0,
+      currency TEXT DEFAULT 'XTR',
+      status TEXT DEFAULT 'paid',
+      renderer TEXT DEFAULT '',
+      card_name TEXT DEFAULT '',
+      created_at INTEGER DEFAULT 0,
+      updated_at INTEGER DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS hunt_spawn (
       character_id TEXT PRIMARY KEY,
@@ -2097,6 +2112,43 @@ function setCardOverride(row){
 function getCardOverride(key){ return prep('SELECT * FROM card_overrides WHERE override_key=?').get(key); }
 function deleteCardOverride(key){ prep('DELETE FROM card_overrides WHERE override_key=?').run(key); if(pgPool&&pgReady) pgPool.query('DELETE FROM card_overrides WHERE override_key=$1',[key]).catch(()=>{}); }
 
+/* ===================== PREMIUM STAR RENDERS ===================== */
+function getStarRenderPayment(chargeId) {
+  return prep('SELECT * FROM star_render_payments WHERE charge_id=?').get(String(chargeId || '')) || null;
+}
+function getStarRenderPaymentByPayload(payload) {
+  return prep('SELECT * FROM star_render_payments WHERE payload=?').get(String(payload || '')) || null;
+}
+function recordStarRenderPayment(row) {
+  const now = Date.now();
+  const chargeId = String(row.charge_id || '');
+  if (!chargeId) throw new Error('missing Telegram payment charge ID');
+  const result = prep(`INSERT OR IGNORE INTO star_render_payments
+    (charge_id,payload,user_id,chat_id,amount,currency,status,renderer,card_name,created_at,updated_at)
+    VALUES (?,?,?,?,?,?,?,?,?,?,?)`).run(
+      chargeId, String(row.payload || ''), Number(row.user_id) || 0, Number(row.chat_id) || 0,
+      Number(row.amount) || 0, String(row.currency || 'XTR'), String(row.status || 'paid'),
+      String(row.renderer || ''), String(row.card_name || ''), Number(row.created_at) || now, now,
+    );
+  const saved = getStarRenderPayment(chargeId);
+  pgRun('star_render_payments', `INSERT INTO star_render_payments
+    (charge_id,payload,user_id,chat_id,amount,currency,status,renderer,card_name,created_at,updated_at)
+    VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+    ON CONFLICT (charge_id) DO NOTHING`, [
+      saved.charge_id,saved.payload,saved.user_id,saved.chat_id,saved.amount,saved.currency,
+      saved.status,saved.renderer,saved.card_name,saved.created_at,saved.updated_at,
+    ]);
+  return { inserted: result.changes === 1, payment: saved };
+}
+function updateStarRenderPayment(chargeId, status) {
+  const now = Date.now();
+  prep('UPDATE star_render_payments SET status=?, updated_at=? WHERE charge_id=?')
+    .run(String(status || ''), now, String(chargeId || ''));
+  pgRun('star_render_payments', 'UPDATE star_render_payments SET status=$1, updated_at=$2 WHERE charge_id=$3',
+    [String(status || ''), now, String(chargeId || '')]);
+  return getStarRenderPayment(chargeId);
+}
+
 /* ===================== CLOSE ===================== */
 
 function close() {
@@ -2168,6 +2220,7 @@ module.exports = {
   getCachedHuntCharacter, getHuntPool,
   // Custom cards
   getCustomRenderCount, incrementCustomRenderCount, saveCustomCard, getCustomCard, getUserCustomCards, getLatestCustomCardByNameTier, setCardOverride, getCardOverride, deleteCardOverride,
+  getStarRenderPayment, getStarRenderPaymentByPayload, recordStarRenderPayment, updateStarRenderPayment,
   // Attack
   getAttackEligibleUsers,
   // Memory

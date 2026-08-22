@@ -111,7 +111,7 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
   ];
 function createBot() {
   const bot = new TelegramBot(config.telegramToken, {
-    polling: !0,
+    polling: { params: { allowed_updates: config.allowedUpdates } },
     onlyFirstMatch: !1,
     filepath: !1,
   });
@@ -1570,15 +1570,12 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
         });
       try {
         const b = await customCards.download(card.storage_path);
-        await bot.sendPhoto(
-          ctx.chatId,
-          b,
-          {
-            caption: `♦️ <b>${card.name}</b> • T${card.tier} • <code>#${card.card_id}</code>`,
-            parse_mode: "HTML",
-          },
-          { filename: `${card.card_id}.png`, contentType: "image/png" },
-        );
+        const caption = `♦️ <b>${card.name}</b> • T${card.tier} • <code>#${card.card_id}</code>${/\.mp4$/i.test(card.storage_path || "") ? "\n✨ PREMIUM MOTION" : ""}`;
+        if (/\.mp4$/i.test(card.storage_path || "")) {
+          await bot.sendAnimation(ctx.chatId, b, { caption, parse_mode: "HTML" }, { filename: `${card.card_id}.mp4`, contentType: "video/mp4" });
+        } else {
+          await bot.sendPhoto(ctx.chatId, b, { caption, parse_mode: "HTML" }, { filename: `${card.card_id}.png`, contentType: "image/png" });
+        }
       } catch (e) {
         await ctx.reply(`Could not load that card: ${e.message}`, {
           title: "♦️ CUSTOM CARDS",
@@ -1621,7 +1618,7 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
         );
       const o = customCards.setOverride(cardId, ctx.userId);
       if (!o)
-        return ctx.reply("That saved custom card was not found.", {
+        return ctx.reply("That card was not found, or it is animated. Premium Motion cards cannot replace static spawn cards.", {
           title: "👑 CARD OVERRIDE",
           color: THEME.red,
         });
@@ -2381,6 +2378,9 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
       return;
     }
     await maybeReact(msg);
+    if (msg.successful_payment) {
+      if (await crender.handlePayment(msg, { bot, reply, eco, db })) return;
+    }
     const pendingStyle = charStylePending.get(Number(userId));
     if (
       pendingStyle &&
@@ -2724,6 +2724,12 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
   } catch (e) {
     console.error("[hunt] wiring failed:", e.message);
   }
+  bot.on("pre_checkout_query", (query) => {
+    crender.handlePreCheckout(query, { bot, reply, eco, db }).catch((error) => {
+      console.error("[crender-stars] pre-checkout error:", error.message);
+      bot.answerPreCheckoutQuery(query.id, false, { error_message: "Rimuru could not validate this render. Please try again." }).catch(() => {});
+    });
+  });
   (bot.on("message", onMessage), bot.on("callback_query", onCallbackQuery));
   try {
     waifu.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
