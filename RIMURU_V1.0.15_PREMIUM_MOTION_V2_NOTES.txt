@@ -1,0 +1,37 @@
+RIMURU v1.0.15 — PREMIUM MOTION V2
+
+Built from Tempest_rimuru_bot-main (28).zip only.
+
+USER FLOW
+- /crender -> renderer -> T6 -> Premium Animated
+- After quote, Rimuru asks for a VIP signature/name.
+- Send "auto" to use the Telegram username when available.
+- Owner remains free. Other users receive the existing 10-Star invoice.
+- Final output remains a six-second 700x900 H.264 MP4.
+
+COMPOSITOR V2
+- Removes the old 80% flattened-card overlay that froze/ghosted the source.
+- Uses a renderer-specific live artwork window for Gen2, Old Gen,
+  JTF Signature, and AI Custom.
+- Protects the name, star row, information panel, and footer from the live video.
+- Randomly and deterministically selects one of four bundled VFX borders:
+  cyber blue, cyber red, electric green, or neon purple.
+- Rotates/crops the landscape border loop into a portrait card overlay.
+- Removes the black VFX background and preserves the emitted glow.
+- Adds a palette-matched floating VIP EDITION crest.
+- Replaces the large automatic motion watermark with the supplied signature.
+- Adds a diagonal holographic foil sweep, six drifting depth particles,
+  improved source saturation, and a restrained vignette.
+- Keeps payment/refund/idempotency behavior from v1.0.14.
+
+DEPLOYMENT
+- No new environment variables.
+- Replace the supplied files at the same paths, including all four MP4 assets.
+- npm install continues to install ffmpeg-static and sharp from package.json.
+
+VALIDATION
+- JavaScript syntax checks passed.
+- Existing animated-card input guards passed.
+- Existing regular-user XTR invoice/pre-checkout flow passed.
+- Real six-second FFmpeg integration render passed at 700x900 / 24 fps.
+- All four supplied VFX assets were decoded and inspected.
