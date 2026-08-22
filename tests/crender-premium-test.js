@@ -38,6 +38,8 @@ async function send(text, extra = {}) {
   await send('Dragon Ball');
   await send('skip');
   await send('skip');
+  assert.strictEqual(crender._sessions.get('10:20').step, 'signature');
+  await send('@PremiumOwner');
   await send('', { animation: { file_id: 'motion', mime_type: 'video/mp4', duration: 6, file_size: 3 } });
   await send('confirm');
   assert.ok(invoice, 'Telegram Stars invoice was not sent');
