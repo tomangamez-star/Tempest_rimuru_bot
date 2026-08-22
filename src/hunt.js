@@ -6,6 +6,7 @@ const db = require('./db');
 const cardRenderer = require('./hunt-card');
 const specialCardRenderer = require('./special-hunt-card');
 const signatureCardRenderer = require('./jtf-gen-card');
+const shoobCards = require('./shoob-cards');
 
 const ANILIST_URL = 'https://graphql.anilist.co';
 const ANIME_PICTURES_API_URL = 'https://api.anime-pictures.net/api/v3';
@@ -2045,6 +2046,31 @@ async function searchAndShow(query, opts = {}) {
   const parsed = parseCharTierQuery(query);
   const q = parsed.name;
   if (!q) return { ok: false, message: 'Usage: /char <name> [t1-t6]' };
+  const wanted = ['gen2','oldgen','signature','shoob'].includes(String(opts.style||'')) ? String(opts.style) : 'oldgen';
+  if (wanted === 'shoob') {
+    let original;
+    try { original = await shoobCards.findExact(q, parsed.tier); }
+    catch (e) {
+      console.warn(`[char] Shoob catalogue failed for ${q}: ${e.message}`);
+      return { ok: false, message: 'Shoob Original is temporarily unavailable. Please try again shortly.' };
+    }
+    if (!original) {
+      const tierText = parsed.tier ? ` at T${parsed.tier}` : '';
+      return { ok: false, message: `No exact Shoob card found for ${stripUrls(q)}${tierText}. Try the exact card name${parsed.tier ? ' or another tier' : ''}.` };
+    }
+    try {
+      const image = await shoobCards.fetchImage(original);
+      const name = stripUrls(original.name || original.card_name || q);
+      const tier = shoobCards.tierOf(original);
+      const series = stripUrls(shoobCards.seriesOf(original));
+      const caption = [`🎴 ${fancy(name)}`, series ? `🎬 ${fancy(series)}` : '', tier ? `⭐ ${fancy(`T${tier} SHOOB ORIGINAL`)}` : '⭐ SHOOB ORIGINAL', `🆔 Shoob Card: ${shoobCards.cardIdOf(original)}`].filter(Boolean).join('\n');
+      await deps.sendPhoto(opts.chatId, image.buffer, { caption }, { filename: `shoob-${shoobCards.cardIdOf(original)}.png`, contentType: image.contentType });
+      return { ok: true, character: original, previewTier: tier || null, style: 'shoob-original' };
+    } catch (e) {
+      console.warn(`[char] Shoob image failed for ${q}: ${e.message}`);
+      return { ok: false, message: 'The exact Shoob card was found, but its original image could not be downloaded. Please try again.' };
+    }
+  }
   const seed = await searchAniListCharacter(q);
   if (!seed) return { ok: false, message: `No character found for ${stripUrls(q)}.` };
   const merged = mergeMetadata(seed, []);
@@ -2061,7 +2087,6 @@ async function searchAndShow(query, opts = {}) {
       } catch (e) { console.warn(`[char] official custom override ${override.card.card_id} failed: ${e.message}`); }
     }
   }
-  const wanted = ['gen2','oldgen','signature'].includes(String(opts.style||'')) ? String(opts.style) : 'oldgen';
   let card=null, style=wanted;
   if (wanted==='oldgen') {
     try { card=await selectDanbooruSpecialArtwork(merged,{context:parsed.tier?`char-oldgen-t${parsed.tier}`:'char-oldgen',minPool:SPECIAL_MIN_ARTWORKS}); } catch(e){console.warn(`[char] ${merged.name}: Old Gen failed: ${e.message}`);}
