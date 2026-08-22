@@ -1,0 +1,50 @@
+RIMURU v1.0.17 — SHOOB ARCHIVE + SUPPORT BRAIN
+
+INSTALL
+Copy this archive into the bot root and allow matching files to be replaced.
+No MongoDB and no Supabase Storage bucket are used.
+
+AFTER DEPLOYMENT
+1. Create a private Telegram group/channel for the Shoob archive.
+2. Add Rimuru as an administrator with permission to post media.
+3. Type /chatid there. Only the configured owner can use this command.
+4. In the GitHub repository, add Actions secrets:
+   DATABASE_URL          = the existing Supabase Postgres URL
+   TELEGRAM_TOKEN        = Rimuru's existing Telegram bot token
+   SHOOB_ARCHIVE_CHAT_ID = the exact negative number returned by /chatid
+5. Open Actions > Rimuru Shoob Archive Ingestion > Run workflow.
+6. The scheduled worker continues every 20 minutes, 20 gallery pages per run.
+
+ARCHITECTURE
+- GitHub Actions runs Chrome and reads Shoob's public gallery/detail pages.
+- Telegram stores the actual static/animated card media in the private archive.
+- Supabase Postgres stores only searchable metadata and Rimuru-specific file_ids.
+- /shoob <name> [T1-T6] searches the archive with Previous/Next controls.
+- /cardstyle option 4 and /char reuse the same archive.
+- Search sessions are user-bound and expire after 15 minutes.
+- Telegram retry_after responses are respected during ingestion.
+- Existing completed source_url records are skipped and page progress resumes.
+
+RIMURU SUPPORT BRAIN
+- Curated knowledge covers the casino, games, economy, ranks, cards, Waifu,
+  custom renderers, Shoob, moderation, owner features and command aliases.
+- Live read-only context includes the current user's balance, rank/progress,
+  leaderboard position, collections and active game sessions.
+- A replied-to or @mentioned user's public rank/networth/game state may be used.
+- Private memories are never included in another user's context.
+- Birthdays and personal preferences persist through the existing bot_memory
+  SQLite/Postgres pipeline; writes are queued to Postgres immediately.
+- Existing JSONB bot_memory installs are reconciled safely to TEXT.
+
+VERIFIED
+- Syntax checked across all source, game, crime, test and script JavaScript.
+- Python scraper compiles.
+- Shoob archive search/resend/session tests pass.
+- Rimuru support knowledge, live-context and birthday-memory tests pass.
+- Existing animation and premium-render payment-flow tests still pass.
+
+NOTES
+- The first full catalogue ingestion takes many scheduled runs. /shoob will
+  become progressively richer as the archive fills.
+- Telegram file_ids are bot-specific, so ingestion must use Rimuru's token.
+- Do not expose the archive group, bot token or DATABASE_URL publicly.
