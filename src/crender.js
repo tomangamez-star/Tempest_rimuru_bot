@@ -18,6 +18,7 @@ const RENDERERS = {
   oldgen: { key: 'oldgen', label: 'Old Gen', badge: '✦ Old Gen', aliases: ['2', 'oldgen', 'old gen', 'old', 'special'] },
   signature: { key: 'signature', label: 'JTF Signature', badge: '♦️ JTF Signature', aliases: ['3', 'signature', 'jtf', 'jtf gen', 'jtfgen', 'sig', 'gen3', 'gen 3'] },
   ai: { key: 'ai', label: 'JTF AI Custom', badge: '✦ JTF AI Custom', aliases: ['4', 'ai', 'ai custom', 'custom ai', 'gen4', 'gen 4', 'fourth'] },
+  animation: { key: 'animation', label: 'JTF Animation', badge: '🎞️ JTF Animation', aliases: ['5', 'animation', 'animated', 'motion', 'jtf animation'] },
 };
 
 function key(chatId, userId) { return `${chatId}:${userId}`; }
@@ -55,9 +56,10 @@ async function start(ctx) {
     '<b>2️⃣ Old Gen</b>\n' +
     '<b>3️⃣ JTF Signature</b>\n\n' +
     '<b>4️⃣ JTF AI Custom</b> — artwork-directed template\n\n' +
+    '<b>5️⃣ JTF Animation</b> — premium motion-native card • ⭐10\n\n' +
     'Normal users receive <b>3 free successful static renders daily</b>.\n' +
-    '✨ Every renderer supports <b>T6 Premium Motion</b> for <b>⭐10</b>.\n' +
-    'Reply <code>1</code>, <code>2</code>, <code>3</code>, or <code>4</code>. Use <code>/cancel</code> anytime.',
+    'Renderer 5 is the dedicated <b>T6 Premium Motion</b> experience.\n' +
+    'Reply <code>1</code>–<code>5</code>. Use <code>/cancel</code> anytime.',
     { title: '♦️ CARD RENDERER 🛠️', color: '#FFD34E', html: true },
   );
 }
@@ -130,30 +132,27 @@ async function renderAndDeliver(s, deps) {
   const chatId = s.chatId;
   await deps.reply(chatId, s.animated ? '✨ <b>Forging your animated T6 JTF Card...</b>' : '⚙️ <b>Rendering your JTF Card...</b>', { html: true });
   try {
-    const renderer = rendererImpl(s.renderer);
-    const artwork = s.animated
-      ? await animatedCard.extractPoster(s.animation.buffer, s.animation)
-      : s.image;
-    const staticOut = await renderer.render(cardData(s), artwork);
-    if (!staticOut?.buffer) throw new Error('renderer returned no card');
-    let output = staticOut.buffer;
+    let output;
     if (s.animated) {
       if (s.paymentChargeId) deps.db.updateStarRenderPayment(s.paymentChargeId, 'rendering');
       const motion = await animatedCard.render({
         mediaBuffer: s.animation.buffer,
-        staticBuffer: staticOut.buffer,
         mimeType: s.animation.mimeType,
         duration: s.animation.duration,
-        renderer: s.renderer,
+        name: s.name, series: s.series, info: s.info, quote: s.quote,
         signature: s.signature,
-        seed: `${s.userId}:${s.name}:${s.series}:${s.invoicePayload || Date.now()}`,
       });
       output = motion.buffer;
+      s.motionBorder = motion.border;
+    } else {
+      const staticOut = await rendererImpl(s.renderer).render(cardData(s), s.image);
+      if (!staticOut?.buffer) throw new Error('renderer returned no card');
+      output = staticOut.buffer;
     }
     s.output = output;
     s.outputAnimated = !!s.animated;
     if (!s.isStaff && !s.animated) cards.mark(s.userId);
-    const cap = `♦️ <b>JTF CARD RENDERER</b>\n${rendererMeta(s.renderer).badge} • <b>T${s.tier}</b> • <b>${s.name}</b>\n🎬 ${s.series}${s.animated ? `\n✨ <b>PREMIUM MOTION${s.isOwner ? ' • OWNER PASS' : ' • ⭐10'}</b>` : ''}`;
+    const cap = `♦️ <b>JTF CARD RENDERER</b>\n${rendererMeta(s.renderer).badge} • <b>T${s.tier}</b> • <b>${s.name}</b>\n🎬 ${s.series}${s.animated ? `\n✨ <b>PREMIUM MOTION${s.isOwner ? ' • OWNER PASS' : ' • ⭐10'} • ${s.motionBorder}</b>` : ''}`;
     const sentCard = s.animated
       ? await deps.bot.sendAnimation(chatId, output, { caption: cap, parse_mode: 'HTML', duration: animatedCard.DURATION, width: animatedCard.WIDTH, height: animatedCard.HEIGHT }, { filename: `JTF_${s.name.replace(/[^a-z0-9]+/gi, '_')}_T6_MOTION.mp4`, contentType: 'video/mp4' })
       : await deps.bot.sendPhoto(chatId, output, { caption: cap, parse_mode: 'HTML' }, { filename: `JTF_${s.name.replace(/[^a-z0-9]+/gi, '_')}_T${s.tier}.png`, contentType: 'image/png' });
@@ -241,10 +240,18 @@ async function handleMessage(msg, deps) {
   if (s.step === 'renderer') {
     const renderer = rendererName(text);
     if (!renderer) {
-      await deps.reply(chatId, 'Choose 1 for Gen 2, 2 for Old Gen, 3 for JTF Signature, or 4 for JTF AI Custom.');
+      await deps.reply(chatId, 'Choose 1 for Gen 2, 2 for Old Gen, 3 for JTF Signature, 4 for JTF AI Custom, or 5 for JTF Animation.');
       return true;
     }
     s.renderer = renderer;
+    if (renderer === 'animation') {
+      s.animated = true;
+      s.tier = 6;
+      s.step = 'name';
+      await deps.reply(chatId, '🎞️ <b>JTF ANIMATION • T6 PREMIUM</b>\n\n✍️ Send the card name.\nExample: <code>Makima</code>', { html: true });
+      return true;
+    }
+    s.animated = false;
     s.step = 'tier';
     await deps.reply(chatId, '🎴 Choose tier: <code>T1</code> to <code>T6</code>.', { html: true });
     return true;
@@ -257,23 +264,7 @@ async function handleMessage(msg, deps) {
       return true;
     }
     s.tier = tier;
-    if (tier === 6) {
-      s.step = 'mode';
-      await deps.reply(chatId, '💎 <b>T6 OUTPUT</b>\n\n<b>1️⃣ Static T6</b> — normal renderer pricing\n<b>2️⃣ Premium Animated T6</b> — ⭐10\n\nPremium accepts a GIF or short looping video and adds moving stars, glow, shimmer and renderer-specific aura.', { html: true });
-    } else {
-      s.animated = false;
-      s.step = 'name';
-      await deps.reply(chatId, '✍️ <b>Card name</b>\nExample: <code>Makima</code>', { html: true });
-    }
-    return true;
-  }
-
-  if (s.step === 'mode') {
-    if (!/^[12]$/.test(text)) {
-      await deps.reply(chatId, 'Reply <code>1</code> for Static T6 or <code>2</code> for Premium Animated T6.', { html: true });
-      return true;
-    }
-    s.animated = text === '2';
+    s.animated = false;
     s.step = 'name';
     await deps.reply(chatId, '✍️ <b>Card name</b>\nExample: <code>Makima</code>', { html: true });
     return true;
@@ -353,7 +344,7 @@ async function handleMessage(msg, deps) {
     s.step = 'confirm';
     await deps.reply(
       chatId,
-      `♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}${s.animated ? ' PREMIUM MOTION' : ''}</b>\nName: <b>${s.name}</b>${s.animated ? `\nVIP signature: <b>${s.signature}</b>\nBorder: <b>random premium VFX</b>` : ''}\nCost: <b>${s.animated ? (s.isOwner ? 'FREE' : `⭐${ANIMATED_STAR_PRICE}`) : (cost ? `🪙 ${money(cost)}` : 'FREE')}</b>\n${s.animated ? (s.isOwner ? '👑 Owner Premium Motion pass' : 'Payment is requested only after you confirm.') : (s.isStaff ? '👑 Staff unlimited render' : `Free renders used today: <b>${Math.min(used, 3)}/3</b>`)}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,
+      `♦️ <b>RENDER CONFIRMATION</b>\n\nRenderer: <b>${rendererMeta(s.renderer).label}</b>\nTier: <b>T${s.tier}${s.animated ? ' PREMIUM MOTION' : ''}</b>\nName: <b>${s.name}</b>${s.animated ? `\nVIP signature: <b>${s.signature}</b>\nBorder: <b>automatically matched to artwork</b>` : ''}\nCost: <b>${s.animated ? (s.isOwner ? 'FREE' : `⭐${ANIMATED_STAR_PRICE}`) : (cost ? `🪙 ${money(cost)}` : 'FREE')}</b>\n${s.animated ? (s.isOwner ? '👑 Owner Premium Motion pass' : 'Payment is requested only after you confirm.') : (s.isStaff ? '👑 Staff unlimited render' : `Free renders used today: <b>${Math.min(used, 3)}/3</b>`)}\n\nReply <code>confirm</code> or <code>/cancel</code>.`,
       { html: true },
     );
     return true;

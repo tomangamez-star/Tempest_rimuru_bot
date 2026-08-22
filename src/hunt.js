@@ -2175,7 +2175,7 @@ function startAutoSpawn(_bot, env = {}) {
   }, msUntilMinute(25));
   autoSpawnKickoff.unref && autoSpawnKickoff.unref();
   console.log('[hunt] hourly auto-spawn scheduled at :25');
-  console.log(`[cards-signature] /hunt=Gen2; /shunt=OldGen; /card=JTF Signature; /crender=3 renderers; signature=${signatureCardRenderer.available() ? 'sharp' : 'source'}`);
+  console.log(`[cards-signature] /hunt=Gen2; /shunt=OldGen; /card=JTF Signature; /crender=5 renderers; animation=dedicated; signature=${signatureCardRenderer.available() ? 'sharp' : 'source'}`);
   return autoSpawnKickoff;
 }
 function state() { return { activeSpawn: db.getActiveHunt() || null, enabled: config.hunt.enabled }; }
