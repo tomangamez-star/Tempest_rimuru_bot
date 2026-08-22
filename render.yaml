@@ -45,7 +45,7 @@ services:
       - key: DATA_DIR
         value: ./data
       - key: ALLOWED_UPDATES
-        value: "messages,callback_query"
+        value: "message,callback_query,pre_checkout_query"
       - key: PUBLIC_URL
         value: "" # optional: set to your Render URL if you enable webhooks
       # Admin dashboard (served on the same :PORT as /health):

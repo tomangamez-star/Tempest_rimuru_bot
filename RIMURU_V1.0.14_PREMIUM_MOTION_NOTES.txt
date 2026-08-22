@@ -1,0 +1,41 @@
+RIMURU / JTF CARDS — V1.0.14 PREMIUM MOTION
+
+WHAT LANDED
+- Premium Motion is an extension of all four existing /crender styles.
+- It is available only after choosing T6.
+- Static T6 remains available with the existing rules and coin pricing.
+- Premium Animated T6 costs exactly 10 Telegram Stars (XTR).
+- Accepted inputs: Telegram GIF/animation, MP4, MOV, or WEBM.
+- Input guardrails: maximum 8 seconds and 15 MB.
+- Output: silent 700x900, 24 FPS, 6-second H.264 MP4 animation.
+- The uploaded animation remains visibly moving beneath the completed card.
+- Each renderer adds its own colour identity, moving stars, glow and shimmer.
+- Animated cards can be saved and viewed through /customcards and /cview.
+- Animated saved cards cannot become static /char or spawn overrides.
+
+PAYMENT SAFETY
+- Telegram pre-checkout validates the live user session, payload, XTR currency,
+  and exact 10-Star amount before approving payment.
+- Telegram charge IDs are unique and idempotent; duplicate payment updates do
+  not create duplicate renders.
+- Payment state is durable in SQLite and mirrored immediately to Postgres:
+  paid -> rendering -> delivered, or refunded/refund_pending on failure.
+- If rendering fails after payment, Rimuru calls refundStarPayment automatically.
+- If Render restarts after pre-checkout but before delivery, a late payment with
+  no live render session is rejected/refunded rather than silently consumed.
+
+DEPLOYMENT
+- No new environment variables are required.
+- ffmpeg-static is installed through package.json/package-lock.json.
+- ALLOWED_UPDATES automatically includes message, callback_query, and
+  pre_checkout_query; legacy "messages" is normalized to "message".
+
+TEST FLOW
+1. /crender
+2. Choose renderer 1-4
+3. Choose T6
+4. Choose 2 (Premium Animated T6)
+5. Enter card text and upload a short GIF/MP4
+6. Reply confirm
+7. Pay the ⭐10 invoice
+8. Confirm the MP4 loops and optionally save it
