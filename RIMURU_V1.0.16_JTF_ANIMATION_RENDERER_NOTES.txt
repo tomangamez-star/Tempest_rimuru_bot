@@ -1,0 +1,27 @@
+RIMURU v1.0.16 — JTF ANIMATION RENDERER
+
+INSTALL
+Copy the files in this archive into the bot root and allow matching files to be replaced.
+The new motion-stars folder belongs at src/assets/motion-stars, beside src/assets/motion-borders and src/assets/ranks.
+No environment variables are required.
+
+WHAT CHANGED
+- /crender option 5 is now a dedicated JTF Animation renderer, not an animation extension layered over renderers 1–4.
+- Renderers 1–4 remain static and keep their existing templates.
+- JTF Animation is always T6, costs 10 Telegram Stars for normal users, and remains free for the configured bot owner.
+- Artwork colour analysis selects cyber blue, cyber red, electric green, or neon purple motion borders automatically.
+- The selected border palette drives the fresh template styling.
+- Added six independently rotating stars with alternating direction, speed, phase, and highlight timing.
+- Added a large, fast diagonal shine that crosses the full card twice per six-second loop.
+- Replaced the old VIP crest with integrated VIP typography.
+- User-provided signature remains on the card.
+- Output remains MP4: 700x900, 20 fps, 6 seconds, H.264/yuv420p.
+- Existing charge, owner bypass, refund, idempotency, collection saving, and error handling are preserved.
+
+VERIFIED
+- JavaScript syntax checks passed.
+- Animated card unit test passed.
+- Premium /crender payment-flow test passed.
+- Full six-second render integration test passed.
+- Red, green, blue, and purple artwork-selection checks passed.
+- Test output: 700x900, 20 fps, 6.0 seconds, about 3.1 MB.
