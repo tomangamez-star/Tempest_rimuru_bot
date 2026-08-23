@@ -10,6 +10,7 @@ async function run() {
   const db = {
     normalizeShoobSearch(value) { return String(value || '').normalize('NFKD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/&/g, ' and ').replace(/[^a-z0-9]+/g, ' ').trim().replace(/\s+/g, ' '); },
     async searchShoobCards() { return { rows: docs, total: docs.length }; },
+    async shoobCatalogueStats() { return { total: 300, characters: 120, series: 40, photos: 290, animations: 5, videos: 5, t1: 50, t2: 50, t3: 50, t4: 50, t5: 50, t6: 50, status: 'running', last_completed_page: 20, current_page: 21, next_page: 21, total_pages: 2404, cards_archived_latest: 300, cards_skipped_latest: 2, cards_failed_latest: 0, pages_completed_latest: 20, elapsed_seconds: 600, gallery_avg_ms: 4000, telegram_avg_ms: 900, postgres_avg_ms: 20, query_ms: 8, last_success_at: '2026-08-23T10:00:00Z' }; },
   };
   const originalLoad = Module._load;
   Module._load = function(request, parent, isMain) {
@@ -35,6 +36,10 @@ async function run() {
   const result = await shoob.startSearch(bot, -100, 77, 'Rimuru Tempest');
   assert.strictEqual(result.ok, true);
   assert.ok(shoob._sessions.size === 1);
+  const dashboard = await shoob.catalogueDashboard();
+  assert.ok(dashboard.includes('Archived cards: 300'));
+  assert.ok(dashboard.includes('🟢 RUNNING'));
+  assert.ok(dashboard.includes('30.00 cards/min'));
   console.log('SHOOB ARCHIVE TEST OK');
   Module._load = originalLoad;
 }
