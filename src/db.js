@@ -1413,11 +1413,39 @@ async function searchShoobCards(query, tier = 0, limit = 24, offset = 0) {
 
 async function shoobCatalogueStats() {
   if (!pgReady || !pgPool) return { total: 0, unavailable: true };
-  const result = await pgPool.query(`SELECT COUNT(*)::bigint AS total,
-    COUNT(*) FILTER (WHERE telegram_media_type IN ('animation','video','document'))::bigint AS animated,
-    MAX(updated_at) AS updated_at FROM shoob_cards`);
+  const started = Date.now();
+  const result = await pgPool.query(`WITH catalogue AS (
+      SELECT COUNT(*)::bigint AS total,
+        COUNT(DISTINCT normalized_name)::bigint AS characters,
+        COUNT(DISTINCT NULLIF(TRIM(series), ''))::bigint AS series,
+        COUNT(*) FILTER (WHERE telegram_media_type='photo')::bigint AS photos,
+        COUNT(*) FILTER (WHERE telegram_media_type='animation')::bigint AS animations,
+        COUNT(*) FILTER (WHERE telegram_media_type='video')::bigint AS videos,
+        COUNT(*) FILTER (WHERE telegram_media_type='document')::bigint AS documents,
+        COUNT(*) FILTER (WHERE tier=1)::bigint AS t1,
+        COUNT(*) FILTER (WHERE tier=2)::bigint AS t2,
+        COUNT(*) FILTER (WHERE tier=3)::bigint AS t3,
+        COUNT(*) FILTER (WHERE tier=4)::bigint AS t4,
+        COUNT(*) FILTER (WHERE tier=5)::bigint AS t5,
+        COUNT(*) FILTER (WHERE tier=6)::bigint AS t6,
+        MIN(created_at) AS first_card_at, MAX(updated_at) AS updated_at
+      FROM shoob_cards), scraper AS (
+      SELECT * FROM shoob_scraper_state WHERE state_key='main'
+    ) SELECT catalogue.*, scraper.next_page, scraper.last_completed_page, scraper.current_page,
+      scraper.total_pages, scraper.status, scraper.run_id, scraper.run_started_at, scraper.run_finished_at,
+      scraper.last_success_at, scraper.heartbeat_at, scraper.cards_archived_latest,
+      scraper.cards_skipped_latest, scraper.cards_failed_latest, scraper.pages_completed_latest,
+      scraper.elapsed_seconds, scraper.gallery_avg_ms, scraper.telegram_avg_ms,
+      scraper.postgres_avg_ms, scraper.last_error FROM catalogue LEFT JOIN scraper ON TRUE`);
   const row = result.rows[0] || {};
-  return { total: Number(row.total) || 0, animated: Number(row.animated) || 0, updated_at: row.updated_at || null };
+  const numeric = ['total','characters','series','photos','animations','videos','documents','t1','t2','t3','t4','t5','t6',
+    'next_page','last_completed_page','current_page','total_pages','cards_archived_latest','cards_skipped_latest',
+    'cards_failed_latest','pages_completed_latest','elapsed_seconds','gallery_avg_ms','telegram_avg_ms','postgres_avg_ms'];
+  for (const key of numeric) row[key] = Number(row[key]) || 0;
+  row.query_ms = Date.now() - started;
+  const heartbeat = row.heartbeat_at ? new Date(row.heartbeat_at).getTime() : 0;
+  if (row.status === 'running' && heartbeat && Date.now() - heartbeat > 15 * 60 * 1000) row.status = 'stalled';
+  return row;
 }
 
 function getActiveGameSessions(userId) {
@@ -1646,6 +1674,18 @@ async function ensurePgTables() {
       status TEXT DEFAULT 'new',
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )`);
+    const shoobStateColumns = {
+      current_page: 'BIGINT DEFAULT 0', total_pages: 'BIGINT DEFAULT 2404', run_id: "TEXT DEFAULT ''",
+      run_started_at: 'TIMESTAMPTZ', run_finished_at: 'TIMESTAMPTZ', last_success_at: 'TIMESTAMPTZ',
+      heartbeat_at: 'TIMESTAMPTZ', cards_archived_latest: 'BIGINT DEFAULT 0',
+      cards_skipped_latest: 'BIGINT DEFAULT 0', cards_failed_latest: 'BIGINT DEFAULT 0',
+      pages_completed_latest: 'BIGINT DEFAULT 0', elapsed_seconds: 'DOUBLE PRECISION DEFAULT 0',
+      gallery_avg_ms: 'DOUBLE PRECISION DEFAULT 0', telegram_avg_ms: 'DOUBLE PRECISION DEFAULT 0',
+      postgres_avg_ms: 'DOUBLE PRECISION DEFAULT 0', last_error: "TEXT DEFAULT ''",
+    };
+    for (const [column, definition] of Object.entries(shoobStateColumns)) {
+      await pgPool.query(`ALTER TABLE shoob_scraper_state ADD COLUMN IF NOT EXISTS ${column} ${definition}`);
+    }
   } catch (e) {
     console.warn('[db] ensure Shoob catalogue tables:', e.message);
   }

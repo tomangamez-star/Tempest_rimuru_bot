@@ -108,6 +108,7 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
     { command: "viewchar", description: "🃏 View a card by number" },
     { command: "clb", description: "🃏 Card leaderboard" },
     { command: "shoob", description: "🎴 Search Shoob originals" },
+    { command: "cstats", description: "📊 Live Shoob catalogue stats" },
     { command: "chatid", description: "🆔 Show this chat ID (owner)" },
     { command: "remember", description: "🧠 Store a memory (owner)" },
     { command: "recall", description: "🧠 Recall a memory (owner)" },
@@ -1674,6 +1675,10 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
     shoob: async (ctx) => {
       const result = await shoobCards.startSearch(bot, ctx.chatId, ctx.userId, (ctx.args || []).join(" "));
       if (!result.ok) await ctx.reply(result.message, { title: "🎴 SHOOB ARCHIVE", color: THEME.gold, html: !0 });
+    },
+    cstats: async (ctx) => {
+      const dashboard = await shoobCards.catalogueDashboard();
+      await ctx.reply(dashboard, { title: "📊 SHOOB CATALOGUE", color: THEME.cyan });
     },
     chatid: async (ctx) => {
       if (!ctx.isOwner)

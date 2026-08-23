@@ -24,6 +24,58 @@ async function findExact(name, requestedTier = 0) {
   const result = await findMatches(name, requestedTier, { limit: 24 });
   return exactCandidates(result.rows, name, requestedTier)[0] || result.rows[0] || null;
 }
+function compactNumber(value) { return Number(value || 0).toLocaleString('en-US'); }
+function duration(seconds) {
+  seconds = Math.max(0, Number(seconds) || 0);
+  if (!seconds) return 'calculating';
+  const days = Math.floor(seconds / 86400), hours = Math.floor((seconds % 86400) / 3600), mins = Math.floor((seconds % 3600) / 60);
+  return [days ? `${days}d` : '', hours ? `${hours}h` : '', mins || (!days && !hours) ? `${mins}m` : ''].filter(Boolean).join(' ');
+}
+function dateText(value) { if (!value) return 'Never'; const d = new Date(value); return Number.isNaN(d.getTime()) ? 'Unknown' : d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC'; }
+async function catalogueDashboard() {
+  const s = await db.shoobCatalogueStats();
+  if (s.unavailable) return '⚠️ Postgres is unavailable, so catalogue statistics cannot be read.';
+  const totalPages = s.total_pages || 2404, completedPage = s.last_completed_page || 0;
+  const remainingPages = Math.max(0, totalPages - completedPage);
+  const avgPerPage = completedPage > 0 ? s.total / completedPage : 0;
+  const remainingCards = Math.round(remainingPages * avgPerPage);
+  const perMinute = s.elapsed_seconds > 0 ? s.cards_archived_latest / (s.elapsed_seconds / 60) : 0;
+  const etaSeconds = perMinute > 0 ? (remainingCards / perMinute) * 60 : 0;
+  const statusMap = { running: '🟢 RUNNING', waiting: '🟡 WAITING', completed: '✅ COMPLETED', stalled: '🔴 STALLED', new: '⚪ NEW' };
+  const status = statusMap[String(s.status || '').toLowerCase()] || `⚪ ${String(s.status || 'UNKNOWN').toUpperCase()}`;
+  return [
+    '🎴 SHOOB CATALOGUE — LIVE',
+    '',
+    `📚 Archived cards: ${compactNumber(s.total)}`,
+    `👤 Unique characters: ${compactNumber(s.characters)}`,
+    `🎬 Anime series: ${compactNumber(s.series)}`,
+    '',
+    `🖼 Photos: ${compactNumber(s.photos)}`,
+    `✨ GIFs: ${compactNumber(s.animations)}`,
+    `🎞 Videos: ${compactNumber(s.videos)}`,
+    `📦 Other files: ${compactNumber(s.documents)}`,
+    '',
+    `⭐ T1 ${compactNumber(s.t1)} • T2 ${compactNumber(s.t2)} • T3 ${compactNumber(s.t3)}`,
+    `⭐ T4 ${compactNumber(s.t4)} • T5 ${compactNumber(s.t5)} • T6 ${compactNumber(s.t6)}`,
+    '',
+    `⚙️ Scraper: ${status}`,
+    `📄 Gallery progress: ${compactNumber(completedPage)}/${compactNumber(totalPages)} pages`,
+    `📍 Current/next page: ${compactNumber(s.current_page || s.next_page || 1)}/${compactNumber(s.next_page || 1)}`,
+    `🆕 Latest run: +${compactNumber(s.cards_archived_latest)} archived • ${compactNumber(s.cards_skipped_latest)} skipped • ${compactNumber(s.cards_failed_latest)} failed`,
+    `✅ Pages completed this run: ${compactNumber(s.pages_completed_latest)}`,
+    `⏱ Archive rate: ${perMinute ? perMinute.toFixed(2) : '0.00'} cards/min`,
+    `⚡ Throughput: ${perMinute ? (perMinute / 60).toFixed(3) : '0.000'} cards/sec`,
+    `🧮 Estimated remaining: ${avgPerPage ? `≈${compactNumber(remainingCards)} cards` : 'calculating'}`,
+    `🏁 Estimated completion: ${etaSeconds ? duration(etaSeconds) : 'calculating'}`,
+    '',
+    `🌐 Shoob page response: ${Math.round(s.gallery_avg_ms || 0)} ms`,
+    `✈️ Telegram upload: ${Math.round(s.telegram_avg_ms || 0)} ms`,
+    `🐘 Postgres write: ${Math.round(s.postgres_avg_ms || 0)} ms`,
+    `🔎 Dashboard query: ${Math.round(s.query_ms || 0)} ms`,
+    `🕒 Last successful archive: ${dateText(s.last_success_at)}`,
+    s.last_error ? `⚠️ Last error: ${String(s.last_error).slice(0, 240)}` : '',
+  ].join('\n').trim();
+}
 function caption(card, index = 0, total = 1) {
   const position = total > 1 ? `\n📚 Result ${index + 1}/${total}` : '';
   return [`🎴 ${card.name}`, card.series ? `🎬 ${card.series}` : '', `⭐ T${tierOf(card) || '?'} SHOOB ORIGINAL`, `🆔 Shoob Card: ${cardIdOf(card)}${position}`].filter(Boolean).join('\n');
@@ -76,4 +128,4 @@ async function handleNavigation(bot, query) {
   return true;
 }
 
-module.exports = { normalizeName, tierOf, cardIdOf, seriesOf, parseQuery, exactCandidates, findMatches, findExact, caption, inputMediaType, sendArchived, startSearch, handleNavigation, _sessions: sessions };
+module.exports = { normalizeName, tierOf, cardIdOf, seriesOf, parseQuery, exactCandidates, findMatches, findExact, catalogueDashboard, caption, inputMediaType, sendArchived, startSearch, handleNavigation, _sessions: sessions };
