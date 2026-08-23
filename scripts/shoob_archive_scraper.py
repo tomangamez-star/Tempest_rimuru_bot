@@ -4,7 +4,7 @@
 Media bytes are never written to Supabase Storage. Telegram returns a bot-
 specific file_id which Rimuru can resend instantly from any permitted chat.
 """
-import html, os, re, shutil, subprocess, time
+import html, os, re, shutil, subprocess, time, uuid
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -49,7 +49,30 @@ def ensure_schema(conn):
           state_key TEXT PRIMARY KEY, next_page BIGINT DEFAULT 1,
           last_completed_page BIGINT DEFAULT 0, status TEXT DEFAULT 'new',
           updated_at TIMESTAMPTZ DEFAULT NOW())""")
+        for column, definition in {
+            "current_page": "BIGINT DEFAULT 0", "total_pages": "BIGINT DEFAULT 2404",
+            "run_id": "TEXT DEFAULT ''", "run_started_at": "TIMESTAMPTZ",
+            "run_finished_at": "TIMESTAMPTZ", "last_success_at": "TIMESTAMPTZ",
+            "heartbeat_at": "TIMESTAMPTZ", "cards_archived_latest": "BIGINT DEFAULT 0",
+            "cards_skipped_latest": "BIGINT DEFAULT 0", "cards_failed_latest": "BIGINT DEFAULT 0",
+            "pages_completed_latest": "BIGINT DEFAULT 0", "elapsed_seconds": "DOUBLE PRECISION DEFAULT 0",
+            "gallery_avg_ms": "DOUBLE PRECISION DEFAULT 0", "telegram_avg_ms": "DOUBLE PRECISION DEFAULT 0",
+            "postgres_avg_ms": "DOUBLE PRECISION DEFAULT 0", "last_error": "TEXT DEFAULT ''"
+        }.items():
+            cur.execute(f"ALTER TABLE shoob_scraper_state ADD COLUMN IF NOT EXISTS {column} {definition}")
     conn.commit()
+
+def db_retry(conn, operation, attempts=4):
+    for attempt in range(attempts):
+        try:
+            return operation()
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as exc:
+            try: conn.rollback()
+            except Exception: pass
+            if attempt + 1 >= attempts: raise
+            wait = 1.5 * (attempt + 1)
+            print(f"[shoob] Postgres busy; retrying in {wait:.1f}s: {exc}", flush=True)
+            time.sleep(wait)
 
 def state(conn):
     with conn.cursor() as cur:
@@ -64,6 +87,27 @@ def save_state(conn, next_page, completed, status="running"):
           next_page=EXCLUDED.next_page,last_completed_page=EXCLUDED.last_completed_page,
           status=EXCLUDED.status,updated_at=NOW()""", (next_page, completed, status))
     conn.commit()
+
+def run_state(conn, **values):
+    allowed = {
+        "next_page", "last_completed_page", "current_page", "total_pages", "status", "run_id",
+        "run_started_at", "run_finished_at", "last_success_at", "heartbeat_at",
+        "cards_archived_latest", "cards_skipped_latest", "cards_failed_latest",
+        "pages_completed_latest", "elapsed_seconds", "gallery_avg_ms", "telegram_avg_ms",
+        "postgres_avg_ms", "last_error"
+    }
+    values = {key: value for key, value in values.items() if key in allowed}
+    if not values: return
+    columns = list(values)
+    assignments = ",".join(f"{key}=EXCLUDED.{key}" for key in columns)
+    placeholders = ",".join(["%s"] * (len(columns) + 1))
+    sql = f"""INSERT INTO shoob_scraper_state(state_key,{','.join(columns)},updated_at)
+      VALUES({placeholders},NOW()) ON CONFLICT(state_key) DO UPDATE SET
+      {assignments},updated_at=NOW()"""
+    def execute():
+        with conn.cursor() as cur: cur.execute(sql, ["main", *[values[key] for key in columns]])
+        conn.commit()
+    db_retry(conn, execute)
 
 def exists(conn, source):
     with conn.cursor() as cur:
@@ -160,8 +204,8 @@ def api(method, payload):
 def archive(card):
     caption = f"🎴 {card['name']}\n🎬 {card['series']}\n⭐ T{card['tier']} SHOOB ORIGINAL\n🔗 {card['source_url']}"
     ext = os.path.splitext(urlparse(card["media_url"]).path.lower())[1]
-    if card["media_type"] == "image": method, field, stored = "sendPhoto", "photo", "photo"
-    elif ext == ".gif": method, field, stored = "sendAnimation", "animation", "animation"
+    if ext == ".gif": method, field, stored = "sendAnimation", "animation", "animation"
+    elif card["media_type"] == "image": method, field, stored = "sendPhoto", "photo", "photo"
     elif ext in (".mp4", ".mov", ".m4v"): method, field, stored = "sendVideo", "video", "video"
     else: method, field, stored = "sendDocument", "document", "document"
     msg = api(method, {"chat_id": ARCHIVE_CHAT, field: card["media_url"], "caption": caption})
@@ -184,24 +228,88 @@ def save_card(conn, card, archived):
     conn.commit()
 
 def main():
-    conn = psycopg2.connect(DATABASE_URL); ensure_schema(conn)
-    first = state(conn)
-    if first > END_PAGE: print("Shoob catalogue already complete"); return
-    last = min(END_PAGE, first + BATCH_SIZE - 1); browser = driver()
-    inserted = skipped = failed = 0
+    conn = psycopg2.connect(DATABASE_URL, connect_timeout=20, application_name="rimuru_shoob_scraper",
+                            keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=5)
+    browser = None; run_started = time.monotonic(); run_id = uuid.uuid4().hex[:12]
+    inserted = skipped = failed = pages_done = 0
+    gallery_samples, telegram_samples, postgres_samples = [], [], []
     try:
+        ensure_schema(conn); first = state(conn)
+        if first > END_PAGE:
+            run_state(conn, status="completed", current_page=END_PAGE, total_pages=END_PAGE,
+                      heartbeat_at=datetime.now(timezone.utc), run_finished_at=datetime.now(timezone.utc))
+            print("Shoob catalogue already complete"); return
+        last = min(END_PAGE, first + BATCH_SIZE - 1)
+        run_state(conn, status="running", current_page=first, total_pages=END_PAGE, run_id=run_id,
+                  run_started_at=datetime.now(timezone.utc), run_finished_at=None,
+                  heartbeat_at=datetime.now(timezone.utc), cards_archived_latest=0,
+                  cards_skipped_latest=0, cards_failed_latest=0, pages_completed_latest=0,
+                  elapsed_seconds=0, gallery_avg_ms=0, telegram_avg_ms=0, postgres_avg_ms=0, last_error="")
+        browser = driver()
         for page in range(first, last + 1):
-            urls = gallery_urls(browser, page); print(f"page {page}: {len(urls)} cards")
+            run_state(conn, status="running", current_page=page, heartbeat_at=datetime.now(timezone.utc))
+            gallery_started = time.monotonic(); urls = gallery_urls(browser, page)
+            gallery_samples.append((time.monotonic() - gallery_started) * 1000)
+            if not urls:
+                raise RuntimeError(f"Shoob gallery page {page} returned no card links; progress retained")
+            print(f"page {page}: {len(urls)} cards")
+            page_failed = 0; page_error = ""
             for source in urls:
-                try:
-                    if exists(conn, source): skipped += 1; continue
-                    card = detail(browser, source); archived = archive(card); save_card(conn, card, archived)
-                    inserted += 1; print(f"archived {card['name']} T{card['tier']}"); time.sleep(DELAY)
-                except Exception as exc: failed += 1; print(f"skip {source}: {exc}")
-            save_state(conn, page + 1, page)
-        save_state(conn, last + 1, last, "completed" if last >= END_PAGE else "waiting")
+                if exists(conn, source): skipped += 1; continue
+                card_saved = False; card = None; archived = None
+                for attempt in range(3):
+                    try:
+                        if card is None: card = detail(browser, source)
+                        if archived is None:
+                            started = time.monotonic(); archived = archive(card)
+                            telegram_samples.append((time.monotonic() - started) * 1000)
+                        started = time.monotonic(); db_retry(conn, lambda: save_card(conn, card, archived))
+                        postgres_samples.append((time.monotonic() - started) * 1000)
+                        inserted += 1; card_saved = True
+                        print(f"archived {card['name']} T{card['tier']}"); time.sleep(DELAY); break
+                    except Exception as exc:
+                        page_error = f"{source}: {exc}"[:900]
+                        print(f"attempt {attempt + 1}/3 failed {page_error}", flush=True)
+                        if attempt < 2: time.sleep(2 * (attempt + 1))
+                if not card_saved: failed += 1; page_failed += 1
+                elapsed = time.monotonic() - run_started
+                run_state(conn, heartbeat_at=datetime.now(timezone.utc), cards_archived_latest=inserted,
+                          cards_skipped_latest=skipped, cards_failed_latest=failed,
+                          pages_completed_latest=pages_done, elapsed_seconds=elapsed,
+                          gallery_avg_ms=sum(gallery_samples)/len(gallery_samples),
+                          telegram_avg_ms=(sum(telegram_samples)/len(telegram_samples) if telegram_samples else 0),
+                          postgres_avg_ms=(sum(postgres_samples)/len(postgres_samples) if postgres_samples else 0),
+                          last_error=page_error if page_failed else "")
+            if page_failed:
+                # Never move beyond a partially failed page. Already archived cards
+                # are idempotently skipped on the next scheduled retry.
+                run_state(conn, status="stalled", next_page=page, current_page=page,
+                          last_completed_page=page - 1, run_finished_at=datetime.now(timezone.utc),
+                          heartbeat_at=datetime.now(timezone.utc), last_error=page_error)
+                print(f"page {page} retained for retry: {page_failed} card(s) failed", flush=True)
+                break
+            pages_done += 1
+            run_state(conn, next_page=page + 1, last_completed_page=page, current_page=page,
+                      pages_completed_latest=pages_done, last_success_at=datetime.now(timezone.utc),
+                      heartbeat_at=datetime.now(timezone.utc), last_error="")
+        else:
+            final_status = "completed" if last >= END_PAGE else "waiting"
+            run_state(conn, status=final_status, next_page=last + 1, last_completed_page=last,
+                      current_page=last, run_finished_at=datetime.now(timezone.utc),
+                      heartbeat_at=datetime.now(timezone.utc), last_success_at=datetime.now(timezone.utc),
+                      elapsed_seconds=time.monotonic() - run_started)
+    except Exception as exc:
+        try:
+            run_state(conn, status="stalled", run_finished_at=datetime.now(timezone.utc),
+                      heartbeat_at=datetime.now(timezone.utc), elapsed_seconds=time.monotonic() - run_started,
+                      last_error=str(exc)[:900])
+        except Exception: pass
+        raise
     finally:
-        browser.quit(); conn.close()
+        if browser:
+            try: browser.quit()
+            except Exception: pass
+        conn.close()
     print(f"done pages {first}-{last}: archived={inserted} skipped={skipped} failed={failed}")
 
 if __name__ == "__main__": main()
