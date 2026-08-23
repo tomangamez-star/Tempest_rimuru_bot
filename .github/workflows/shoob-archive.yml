@@ -3,7 +3,7 @@ name: Rimuru Shoob Archive Ingestion
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/2 * * * *"
+    - cron: "*/10 * * * *"
 
 concurrency:
   group: rimuru-shoob-archive
@@ -21,9 +21,8 @@ jobs:
       - uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-          install-chromedriver: false
       - name: Install scraper dependencies
-        run: pip install requests beautifulsoup4 psycopg2-binary selenium
+        run: pip install requests beautifulsoup4 psycopg2-binary selenium undetected-chromedriver setuptools
       - name: Ingest next Shoob batch
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
