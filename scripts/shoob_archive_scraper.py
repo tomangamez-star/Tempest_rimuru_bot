@@ -87,7 +87,10 @@ def driver():
         version_text = subprocess.check_output(
             [chrome_binary, "--version"], text=True, stderr=subprocess.STDOUT
         )
-        match = re.search(r"(\d+)\.", version_text)
+        # Chrome may print a warning timestamp before the version line, e.g.
+        # "[0823/083832...] ... Google Chrome 151.0...". Match the browser
+        # label explicitly so the timestamp can never become version_main.
+        match = re.search(r"(?:Google Chrome|Chromium)\s+(\d+)\.", version_text, re.I)
         if match:
             chrome_major = int(match.group(1))
             print(f"[shoob] Chrome {chrome_major} detected at {chrome_binary}", flush=True)
