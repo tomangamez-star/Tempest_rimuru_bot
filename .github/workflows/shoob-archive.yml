@@ -13,21 +13,17 @@ jobs:
   ingest:
     runs-on: ubuntu-latest
     timeout-minutes: 330
-
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-
       - uses: browser-actions/setup-chrome@v1
         with:
           chrome-version: stable
-
+          install-chromedriver: true
       - name: Install scraper dependencies
-        run: pip install requests beautifulsoup4 psycopg2-binary selenium undetected-chromedriver setuptools
-
+        run: pip install requests beautifulsoup4 psycopg2-binary selenium
       - name: Ingest next Shoob batch
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
