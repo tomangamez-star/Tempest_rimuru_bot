@@ -11,7 +11,7 @@ from urllib.parse import urljoin, urlparse
 import requests
 import psycopg2
 from bs4 import BeautifulSoup
-import undetected_chromedriver as uc
+from selenium import webdriver
 from selenium.webdriver.common.by import By
 
 BASE = os.getenv("SHOOB_BASE_URL", "https://shoob.gg")
@@ -71,9 +71,6 @@ def exists(conn, source):
         return cur.fetchone() is not None
 
 def driver():
-    # GitHub's stable Chrome can briefly be one major behind the newest driver
-    # published upstream. undetected-chromedriver otherwise downloads that
-    # newest driver and Chrome rejects the session (for example 151 vs 152).
     chrome_binary = (
         os.getenv("CHROME_PATH")
         or shutil.which("chrome")
@@ -82,7 +79,6 @@ def driver():
         or shutil.which("chromium")
         or shutil.which("chromium-browser")
     )
-    chrome_major = None
     if chrome_binary:
         version_text = subprocess.check_output(
             [chrome_binary, "--version"], text=True, stderr=subprocess.STDOUT
@@ -92,27 +88,29 @@ def driver():
         # label explicitly so the timestamp can never become version_main.
         match = re.search(r"(?:Google Chrome|Chromium)\s+(\d+)\.", version_text, re.I)
         if match:
-            chrome_major = int(match.group(1))
-            print(f"[shoob] Chrome {chrome_major} detected at {chrome_binary}", flush=True)
+            print(f"[shoob] Chrome {match.group(1)} detected at {chrome_binary}", flush=True)
 
-    options = uc.ChromeOptions()
+    options = webdriver.ChromeOptions()
     options.add_argument("--headless=new"); options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage"); options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    kwargs = {"options": options, "use_subprocess": True}
     if chrome_binary:
-        kwargs["browser_executable_path"] = chrome_binary
-    if chrome_major:
-        kwargs["version_main"] = chrome_major
-    return uc.Chrome(**kwargs)
+        options.binary_location = chrome_binary
+    print("[shoob] launching Chrome with the workflow-matched ChromeDriver", flush=True)
+    browser = webdriver.Chrome(options=options)
+    browser.set_page_load_timeout(45)
+    print("[shoob] Chrome session ready", flush=True)
+    return browser
 
 def gallery_urls(browser, page):
+    print(f"[shoob] loading gallery page {page}", flush=True)
     browser.get(f"{BASE}/cards?page={page}"); time.sleep(4)
     seen, urls = set(), []
     for node in browser.find_elements(By.XPATH, "//a[contains(@href, '/cards/info/')]"):
         href = urljoin(BASE, node.get_attribute("href") or "")
         if "/cards/info/" in href and href not in seen: seen.add(href); urls.append(href)
+    print(f"[shoob] gallery page {page}: {len(urls)} card link(s)", flush=True)
     return urls
 
 def detail(browser, source):
