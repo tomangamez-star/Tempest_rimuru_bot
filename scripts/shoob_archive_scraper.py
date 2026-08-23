@@ -4,7 +4,7 @@
 Media bytes are never written to Supabase Storage. Telegram returns a bot-
 specific file_id which Rimuru can resend instantly from any permitted chat.
 """
-import html, os, re, time
+import html, os, re, shutil, subprocess, time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse
 
@@ -71,12 +71,38 @@ def exists(conn, source):
         return cur.fetchone() is not None
 
 def driver():
+    # GitHub's stable Chrome can briefly be one major behind the newest driver
+    # published upstream. undetected-chromedriver otherwise downloads that
+    # newest driver and Chrome rejects the session (for example 151 vs 152).
+    chrome_binary = (
+        os.getenv("CHROME_PATH")
+        or shutil.which("chrome")
+        or shutil.which("google-chrome")
+        or shutil.which("google-chrome-stable")
+        or shutil.which("chromium")
+        or shutil.which("chromium-browser")
+    )
+    chrome_major = None
+    if chrome_binary:
+        version_text = subprocess.check_output(
+            [chrome_binary, "--version"], text=True, stderr=subprocess.STDOUT
+        )
+        match = re.search(r"(\d+)\.", version_text)
+        if match:
+            chrome_major = int(match.group(1))
+            print(f"[shoob] Chrome {chrome_major} detected at {chrome_binary}", flush=True)
+
     options = uc.ChromeOptions()
     options.add_argument("--headless=new"); options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage"); options.add_argument("--disable-gpu")
     options.add_argument("--window-size=1920,1080")
     options.add_argument("--disable-blink-features=AutomationControlled")
-    return uc.Chrome(options=options, use_subprocess=True)
+    kwargs = {"options": options, "use_subprocess": True}
+    if chrome_binary:
+        kwargs["browser_executable_path"] = chrome_binary
+    if chrome_major:
+        kwargs["version_main"] = chrome_major
+    return uc.Chrome(**kwargs)
 
 def gallery_urls(browser, page):
     browser.get(f"{BASE}/cards?page={page}"); time.sleep(4)
