@@ -3,7 +3,7 @@ name: Rimuru Shoob Archive Ingestion
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/20 * * * *"
+    - cron: "*/2 * * * *"
 
 concurrency:
   group: rimuru-shoob-archive
