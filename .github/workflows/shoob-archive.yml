@@ -28,6 +28,8 @@ jobs:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           SHOOB_ARCHIVE_CHAT_ID: ${{ secrets.SHOOB_ARCHIVE_CHAT_ID }}
-          SHOOB_BATCH_SIZE: "20"
+          # 80 pages keeps one ingestion run alive much longer, reducing
+          # dependence on GitHub's best-effort cron scheduler.
+          SHOOB_BATCH_SIZE: "80"
           SHOOB_SEND_DELAY: "1.25"
         run: python scripts/shoob_archive_scraper.py
