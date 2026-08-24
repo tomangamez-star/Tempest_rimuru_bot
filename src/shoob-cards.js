@@ -33,7 +33,12 @@ function duration(seconds) {
 }
 function dateText(value) { if (!value) return 'Never'; const d = new Date(value); return Number.isNaN(d.getTime()) ? 'Unknown' : d.toISOString().replace('T', ' ').slice(0, 19) + ' UTC'; }
 async function catalogueDashboard() {
-  const s = await db.shoobCatalogueStats();
+  let s;
+  try { s = await db.shoobCatalogueStats(); }
+  catch (e) {
+    console.error('[cstats] catalogue query:', e.message);
+    return '⚠️ The Shoob catalogue database is busy right now. No cards were lost—try /cstats again shortly.';
+  }
   if (s.unavailable) return '⚠️ Postgres is unavailable, so catalogue statistics cannot be read.';
   const totalPages = s.total_pages || 2404, completedPage = s.last_completed_page || 0;
   const remainingPages = Math.max(0, totalPages - completedPage);
@@ -103,7 +108,12 @@ async function startSearch(bot, chatId, userId, rawQuery) {
   sweepSessions();
   const parsed = parseQuery(rawQuery);
   if (!parsed.query) return { ok: false, message: 'Usage: /shoob &lt;character name&gt; [T1–T6]' };
-  const result = await findMatches(parsed.query, parsed.tier, { limit: 24 });
+  let result;
+  try { result = await findMatches(parsed.query, parsed.tier, { limit: 24 }); }
+  catch (e) {
+    console.error('[shoob] catalogue search:', e.message);
+    return { ok: false, message: 'The Shoob catalogue database is busy right now. No cards were lost—try again shortly.' };
+  }
   if (result.unavailable) return { ok: false, message: 'The Shoob archive needs Postgres to be connected.' };
   if (!result.rows.length) return { ok: false, message: `No archived Shoob cards found for ${parsed.query}${parsed.tier ? ` at T${parsed.tier}` : ''}. The catalogue may still be ingesting.` };
   const id = crypto.randomBytes(4).toString('hex');

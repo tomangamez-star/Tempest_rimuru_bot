@@ -1390,6 +1390,22 @@ function normalizeShoobSearch(value) {
     .trim().replace(/\s+/g, ' ');
 }
 
+// Shoob is read-heavy while the normal pool is also draining Rimuru's durable
+// mirror queue. The primary instance already owns one live PG session for its
+// advisory lock, so short catalogue reads use that connection instead of
+// waiting for a new pool slot. This does not release or disturb the lock.
+async function shoobPgQuery(sql, params = []) {
+  if (pgClient && pgLockHeld) {
+    try { return await pgClient.query(sql, params); }
+    catch (e) {
+      pgLastError = e;
+      console.warn('[db] Shoob owner-session query failed; trying pool:', e.message);
+    }
+  }
+  if (!pgPool) throw new Error('Postgres pool unavailable');
+  return pgPool.query(sql, params);
+}
+
 async function searchShoobCards(query, tier = 0, limit = 24, offset = 0) {
   if (!pgReady || !pgPool) return { rows: [], total: 0, unavailable: true };
   const wanted = normalizeShoobSearch(query);
@@ -1401,20 +1417,23 @@ async function searchShoobCards(query, tier = 0, limit = 24, offset = 0) {
   let tierSql = '';
   if (safeTier) { args.push(safeTier); tierSql = ` AND tier = $${args.length}`; }
   const where = `(normalized_name = $1 OR normalized_name LIKE $2 OR LOWER(series) LIKE $2)${tierSql}`;
-  const count = await pgPool.query(`SELECT COUNT(*)::bigint AS total FROM shoob_cards WHERE ${where}`, args);
   args.push(safeLimit, safeOffset);
-  const rows = await pgPool.query(`SELECT source_url, name, normalized_name, series, tier, media_url, media_type,
-      telegram_file_id, telegram_media_type, telegram_message_id, archive_chat_id
+  const rows = await shoobPgQuery(`SELECT source_url, name, normalized_name, series, tier, media_url, media_type,
+      telegram_file_id, telegram_media_type, telegram_message_id, archive_chat_id,
+      COUNT(*) OVER()::bigint AS full_count
     FROM shoob_cards WHERE ${where}
     ORDER BY CASE WHEN normalized_name = $1 THEN 0 WHEN normalized_name LIKE $2 THEN 1 ELSE 2 END,
       tier DESC, updated_at DESC LIMIT $${args.length - 1} OFFSET $${args.length}`, args);
-  return { rows: rows.rows || [], total: Number(count.rows[0] && count.rows[0].total) || 0 };
+  const resultRows = rows.rows || [];
+  const total = Number(resultRows[0] && resultRows[0].full_count) || 0;
+  for (const row of resultRows) delete row.full_count;
+  return { rows: resultRows, total };
 }
 
 async function shoobCatalogueStats() {
   if (!pgReady || !pgPool) return { total: 0, unavailable: true };
   const started = Date.now();
-  const result = await pgPool.query(`WITH catalogue AS (
+  const result = await shoobPgQuery(`WITH catalogue AS (
       SELECT COUNT(*)::bigint AS total,
         COUNT(DISTINCT normalized_name)::bigint AS characters,
         COUNT(DISTINCT NULLIF(TRIM(series), ''))::bigint AS series,
