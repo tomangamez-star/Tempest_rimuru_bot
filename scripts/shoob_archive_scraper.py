@@ -26,6 +26,9 @@ ARCHIVE_CHAT = os.getenv("SHOOB_ARCHIVE_CHAT_ID", "")
 if not DATABASE_URL or not TOKEN or not ARCHIVE_CHAT:
     raise RuntimeError("DATABASE_URL, TELEGRAM_TOKEN and SHOOB_ARCHIVE_CHAT_ID are required")
 
+class PermanentCardError(ValueError):
+    """One broken Shoob detail page, not a batch/network/database failure."""
+
 def clean(v): return " ".join(str(v or "").split()).strip()
 def normalize(v):
     return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", clean(v).lower().replace("&", " and "))).strip()
@@ -45,6 +48,10 @@ def ensure_schema(conn):
           updated_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("CREATE INDEX IF NOT EXISTS shoob_cards_normalized_name_idx ON shoob_cards(normalized_name)")
         cur.execute("CREATE INDEX IF NOT EXISTS shoob_cards_tier_idx ON shoob_cards(tier)")
+        cur.execute("""CREATE TABLE IF NOT EXISTS shoob_scrape_failures (
+          source_url TEXT PRIMARY KEY, gallery_page BIGINT DEFAULT 0,
+          error_text TEXT DEFAULT '', attempts BIGINT DEFAULT 1,
+          first_seen_at TIMESTAMPTZ DEFAULT NOW(), last_seen_at TIMESTAMPTZ DEFAULT NOW())""")
         cur.execute("""CREATE TABLE IF NOT EXISTS shoob_scraper_state (
           state_key TEXT PRIMARY KEY, next_page BIGINT DEFAULT 1,
           last_completed_page BIGINT DEFAULT 0, status TEXT DEFAULT 'new',
@@ -114,6 +121,17 @@ def exists(conn, source):
         cur.execute("SELECT 1 FROM shoob_cards WHERE source_url=%s AND telegram_file_id<>'' LIMIT 1", (source,))
         return cur.fetchone() is not None
 
+def quarantine_failure(conn, source, page, error):
+    def execute():
+        with conn.cursor() as cur:
+            cur.execute("""INSERT INTO shoob_scrape_failures(source_url,gallery_page,error_text,attempts,last_seen_at)
+              VALUES(%s,%s,%s,1,NOW()) ON CONFLICT(source_url) DO UPDATE SET
+              gallery_page=EXCLUDED.gallery_page,error_text=EXCLUDED.error_text,
+              attempts=shoob_scrape_failures.attempts+1,last_seen_at=NOW()""",
+              (source, page, clean(error)[:900]))
+        conn.commit()
+    db_retry(conn, execute)
+
 def driver():
     chrome_binary = (
         os.getenv("CHROME_PATH")
@@ -166,7 +184,7 @@ def detail(browser, source):
             candidate = clean(node.get_text(" ", strip=True))
             if candidate and tier_of(candidate): title = candidate; break
         if title: break
-    if not title: raise ValueError("card title not found")
+    if not title: raise PermanentCardError("card title not found")
     tier = tier_of(title)
     name = re.sub(r"\s*(?:-|\||:)?\s*(?:T|Tier\s*)[1-6]\s*$", "", title, flags=re.I).strip()
     crumbs = [clean(n.get_text(" ", strip=True)) for n in soup.select(".breadcrumb-new li, .breadcrumb li, nav[aria-label='breadcrumb'] li")]
@@ -186,7 +204,7 @@ def detail(browser, source):
                 url = urljoin(BASE, node.get(attr) or "")
                 if card_media(url): media_url = url; break
             if media_url: break
-    if not name or not series or not tier or not media_url: raise ValueError("incomplete card metadata")
+    if not name or not series or not tier or not media_url: raise PermanentCardError("incomplete card metadata")
     return {"source_url": source, "name": name, "normalized_name": normalize(name), "series": series,
             "tier": tier, "media_url": media_url, "media_type": media_type}
 
@@ -253,10 +271,10 @@ def main():
             if not urls:
                 raise RuntimeError(f"Shoob gallery page {page} returned no card links; progress retained")
             print(f"page {page}: {len(urls)} cards")
-            page_failed = 0; page_error = ""
+            page_failed = 0; page_quarantined = 0; page_error = ""
             for source in urls:
                 if exists(conn, source): skipped += 1; continue
-                card_saved = False; card = None; archived = None
+                card_saved = False; card = None; archived = None; last_exception = None
                 for attempt in range(3):
                     try:
                         if card is None: card = detail(browser, source)
@@ -268,10 +286,22 @@ def main():
                         inserted += 1; card_saved = True
                         print(f"archived {card['name']} T{card['tier']}"); time.sleep(DELAY); break
                     except Exception as exc:
+                        last_exception = exc
                         page_error = f"{source}: {exc}"[:900]
                         print(f"attempt {attempt + 1}/3 failed {page_error}", flush=True)
                         if attempt < 2: time.sleep(2 * (attempt + 1))
-                if not card_saved: failed += 1; page_failed += 1
+                if not card_saved:
+                    failed += 1
+                    if isinstance(last_exception, PermanentCardError):
+                        try:
+                            quarantine_failure(conn, source, page, str(last_exception))
+                            page_quarantined += 1
+                            print(f"quarantined malformed card on page {page}: {source} ({last_exception})", flush=True)
+                        except Exception as quarantine_error:
+                            page_failed += 1
+                            page_error = f"could not quarantine {source}: {quarantine_error}"[:900]
+                    else:
+                        page_failed += 1
                 elapsed = time.monotonic() - run_started
                 run_state(conn, heartbeat_at=datetime.now(timezone.utc), cards_archived_latest=inserted,
                           cards_skipped_latest=skipped, cards_failed_latest=failed,
@@ -280,14 +310,22 @@ def main():
                           telegram_avg_ms=(sum(telegram_samples)/len(telegram_samples) if telegram_samples else 0),
                           postgres_avg_ms=(sum(postgres_samples)/len(postgres_samples) if postgres_samples else 0),
                           last_error=page_error if page_failed else "")
+            # One or two isolated malformed detail pages must not trap the
+            # catalogue forever. Three or more on one gallery page probably
+            # means Shoob changed its layout, so retain that page for safety.
+            if page_quarantined >= 3:
+                page_failed += page_quarantined
+                page_error = f"{page_quarantined} malformed cards on page {page}; possible Shoob layout change"
             if page_failed:
                 # Never move beyond a partially failed page. Already archived cards
                 # are idempotently skipped on the next scheduled retry.
                 run_state(conn, status="stalled", next_page=page, current_page=page,
                           last_completed_page=page - 1, run_finished_at=datetime.now(timezone.utc),
                           heartbeat_at=datetime.now(timezone.utc), last_error=page_error)
-                print(f"page {page} retained for retry: {page_failed} card(s) failed", flush=True)
+                print(f"page {page} retained for retry: {page_failed} blocking failure(s), {page_quarantined} quarantined", flush=True)
                 break
+            if page_quarantined:
+                print(f"page {page}: continued past {page_quarantined} quarantined malformed card(s)", flush=True)
             pages_done += 1
             run_state(conn, next_page=page + 1, last_completed_page=page, current_page=page,
                       pages_completed_latest=pages_done, last_success_at=datetime.now(timezone.utc),
