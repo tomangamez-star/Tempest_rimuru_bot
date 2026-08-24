@@ -48,6 +48,7 @@ const TelegramBot = require("node-telegram-bot-api"),
   waifu = require("./waifu"),
   hunt = require("./hunt"),
   shoobCards = require("./shoob-cards"),
+  shoobWorkflow = require("./shoob-workflow"),
   crender = require("./crender"),
   customCards = require("./custom-cards"),
   staffSpectator = require("./staff-spectator"),
@@ -109,6 +110,7 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
     { command: "clb", description: "🃏 Card leaderboard" },
     { command: "shoob", description: "🎴 Search Shoob originals" },
     { command: "cstats", description: "📊 Live Shoob catalogue stats" },
+    { command: "scrapestart", description: "⚡ Force Shoob ingestion (owner)" },
     { command: "chatid", description: "🆔 Show this chat ID (owner)" },
     { command: "remember", description: "🧠 Store a memory (owner)" },
     { command: "recall", description: "🧠 Recall a memory (owner)" },
@@ -1679,6 +1681,18 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
     cstats: async (ctx) => {
       const dashboard = await shoobCards.catalogueDashboard();
       await ctx.reply(dashboard, { title: "📊 SHOOB CATALOGUE", color: THEME.cyan });
+    },
+    scrapestart: async (ctx) => {
+      if (!ctx.isOwner)
+        return ctx.reply("Only the King can control the Shoob archive worker. 👑", { title: "🔒 OWNER ONLY", color: THEME.red });
+      const result = await shoobWorkflow.forceStart();
+      if (!result.ok)
+        return ctx.reply(`⚠️ ${result.message}`, { title: "⚡ SHOOB FORCE START", color: THEME.red });
+      const runUrl = result.run && (result.run.html_url || result.run.run_url);
+      const suffix = runUrl ? `\n\n🔗 ${runUrl}` : "\n\nUse /cstats to watch catalogue progress.";
+      return ctx.reply(`${result.alreadyActive ? "🟡" : "🟢"} ${result.message}${suffix}`, {
+        title: "⚡ SHOOB FORCE START", color: result.alreadyActive ? THEME.gold : THEME.cyan,
+      });
     },
     chatid: async (ctx) => {
       if (!ctx.isOwner)

@@ -37,6 +37,14 @@ const config = {
   databaseUrl: process.env.DATABASE_URL || process.env.SUPABASE_URL || '',
   dbSyncIntervalMs: Number(process.env.DB_SYNC_INTERVAL_MS || 30000),
 
+  // Owner-triggered GitHub Actions control for the Shoob archive worker.
+  githubActions: {
+    token: process.env.GITHUB_ACTIONS_TOKEN || '',
+    repository: process.env.GITHUB_REPOSITORY || 'tomangamez-star/Tempest_rimuru_bot',
+    workflow: process.env.GITHUB_SHOOB_WORKFLOW || 'shoob-archive.yml',
+    ref: process.env.GITHUB_WORKFLOW_REF || 'main',
+  },
+
   // Auto-Backup
   autoBackup: {
     enabled: String(process.env.AUTO_BACKUP_ENABLED || 'true').toLowerCase() !== 'false',
