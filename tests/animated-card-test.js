@@ -1,5 +1,6 @@
 'use strict';
 const assert = require('assert');
+const fs = require('fs');
 const animated = require('../src/animated-card');
 
 assert.strictEqual(animated.DURATION, 6);
@@ -18,4 +19,8 @@ assert.strictEqual(plan.length, 6);
 assert.deepStrictEqual(plan, animated.motionPlan('Rimuru|Tensura|owner'));
 assert.strictEqual(new Set(plan.map((star) => star.phase)).size, 6);
 assert(plan.every((star) => [-1, 1].includes(star.direction)));
+const source = fs.readFileSync(require.resolve('../src/animated-card'), 'utf8');
+assert(!source.includes("assets', 'motion-borders"));
+assert(!source.includes('<circle cx="60" cy="60"'));
+assert(source.includes('particleFilters'));
 console.log('ANIMATED CARD TEST OK');
