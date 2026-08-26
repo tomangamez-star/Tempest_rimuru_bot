@@ -13,4 +13,9 @@ assert.throws(() => animated.validateInput(Buffer.from('fake'), { mimeType: 'vid
 assert.strictEqual(typeof animated.chooseBorderByArtwork, 'function');
 assert.strictEqual(animated.BORDERS.length, 4);
 assert.strictEqual(animated.cleanSignature('@Caleb🔥 Bj'), '@Caleb Bj');
+const plan = animated.motionPlan('Rimuru|Tensura|owner');
+assert.strictEqual(plan.length, 6);
+assert.deepStrictEqual(plan, animated.motionPlan('Rimuru|Tensura|owner'));
+assert.strictEqual(new Set(plan.map((star) => star.phase)).size, 6);
+assert(plan.every((star) => [-1, 1].includes(star.direction)));
 console.log('ANIMATED CARD TEST OK');
