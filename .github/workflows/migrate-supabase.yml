@@ -1,0 +1,84 @@
+name: Migrate Rimuru Supabase
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirmation:
+        description: 'Type MIGRATE_RIMURU to replace the new database public schema'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate confirmation and secrets
+        env:
+          CONFIRMATION: ${{ inputs.confirmation }}
+          OLD_DATABASE_URL: ${{ secrets.OLD_DATABASE_URL }}
+          NEW_DATABASE_URL: ${{ secrets.NEW_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          test "$CONFIRMATION" = "MIGRATE_RIMURU" || { echo "Wrong confirmation text."; exit 1; }
+          test -n "$OLD_DATABASE_URL" || { echo "OLD_DATABASE_URL secret is missing."; exit 1; }
+          test -n "$NEW_DATABASE_URL" || { echo "NEW_DATABASE_URL secret is missing."; exit 1; }
+          test "$OLD_DATABASE_URL" != "$NEW_DATABASE_URL" || { echo "Old and new database URLs must differ."; exit 1; }
+
+      - name: Export old Rimuru public schema and data
+        env:
+          OLD_DATABASE_URL: ${{ secrets.OLD_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/rimuru-migration"
+          docker run --rm \
+            -e OLD_DATABASE_URL \
+            -v "$RUNNER_TEMP/rimuru-migration:/migration" \
+            postgres:17-alpine \
+            sh -ec 'pg_dump "$OLD_DATABASE_URL" --format=custom --no-owner --no-privileges --schema=public --file=/migration/rimuru.dump'
+          test -s "$RUNNER_TEMP/rimuru-migration/rimuru.dump"
+          echo "Old database export completed."
+
+      - name: Replace new database public schema
+        env:
+          NEW_DATABASE_URL: ${{ secrets.NEW_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e NEW_DATABASE_URL \
+            -v "$RUNNER_TEMP/rimuru-migration:/migration:ro" \
+            postgres:17-alpine \
+            sh -ec '
+              psql "$NEW_DATABASE_URL" -v ON_ERROR_STOP=1 -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;"
+              pg_restore "$NEW_DATABASE_URL" --exit-on-error --no-owner --no-privileges --schema=public /migration/rimuru.dump
+            '
+          echo "New database restore completed."
+
+      - name: Verify every public table row count
+        env:
+          OLD_DATABASE_URL: ${{ secrets.OLD_DATABASE_URL }}
+          NEW_DATABASE_URL: ${{ secrets.NEW_DATABASE_URL }}
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            -e OLD_DATABASE_URL \
+            -e NEW_DATABASE_URL \
+            postgres:17-alpine \
+            sh -ec '
+              tables=$(psql "$OLD_DATABASE_URL" -At -c "SELECT tablename FROM pg_tables WHERE schemaname = '\''public'\'' ORDER BY tablename")
+              test -n "$tables" || { echo "No public tables found in old database."; exit 1; }
+              failed=0
+              printf "%-36s %12s %12s\n" TABLE OLD NEW
+              for table in $tables; do
+                safe_table=$(printf "%s" "$table" | sed '"'"'s/"/""/g'"'"')
+                old_count=$(psql "$OLD_DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT COUNT(*) FROM public.\"$safe_table\"")
+                new_count=$(psql "$NEW_DATABASE_URL" -At -v ON_ERROR_STOP=1 -c "SELECT COUNT(*) FROM public.\"$safe_table\"")
+                printf "%-36s %12s %12s\n" "$table" "$old_count" "$new_count"
+                if [ "$old_count" != "$new_count" ]; then failed=1; fi
+              done
+              test "$failed" -eq 0 || { echo "Row-count verification failed."; exit 1; }
+            '
+          echo "Migration verified: every public table has matching row counts."
