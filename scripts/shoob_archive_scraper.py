@@ -208,25 +208,83 @@ def detail(browser, source):
     return {"source_url": source, "name": name, "normalized_name": normalize(name), "series": series,
             "tier": tier, "media_url": media_url, "media_type": media_type}
 
-def api(method, payload):
+class TelegramError(RuntimeError):
+    pass
+
+def api(method, payload, files=None):
     endpoint = f"https://api.telegram.org/bot{TOKEN}/{method}"
     for attempt in range(6):
-        response = requests.post(endpoint, data=payload, timeout=90)
+        try:
+            response = requests.post(endpoint, data=payload, files=files, timeout=90)
+        except requests.RequestException:
+            # Requests errors may contain the bot token in their URL.
+            raise RuntimeError("Telegram request failed or timed out") from None
         data = response.json()
         if response.ok and data.get("ok"): return data["result"]
         retry = int((data.get("parameters") or {}).get("retry_after") or 0)
         if retry: time.sleep(retry + 1)
+        elif 400 <= response.status_code < 500:
+            raise TelegramError(data.get("description") or "Telegram rejected upload")
         elif attempt < 5: time.sleep(2 + attempt)
-    raise RuntimeError(data.get("description") or "Telegram upload failed")
+    raise TelegramError(data.get("description") or "Telegram upload failed")
 
-def archive(card):
+def download_media(card, browser=None):
+    """Bounded runner download; reject error pages instead of archiving them."""
+    limit = 49 * 1024 * 1024
+    with requests.Session() as session:
+        session.headers.update({"Referer": card["source_url"], "User-Agent": "Mozilla/5.0"})
+        if browser is not None:
+            session.headers["User-Agent"] = browser.execute_script("return navigator.userAgent")
+            for cookie in browser.get_cookies():
+                session.cookies.set(cookie["name"], cookie["value"],
+                                    domain=cookie.get("domain", urlparse(BASE).hostname),
+                                    path=cookie.get("path", "/"), secure=cookie.get("secure", False))
+        with session.get(card["media_url"], stream=True, timeout=(15, 60)) as response:
+            response.raise_for_status()
+            chunks = []; size = 0
+            for chunk in response.iter_content(65536):
+                size += len(chunk)
+                if size > limit: raise RuntimeError("Card media exceeds 49 MiB upload limit")
+                chunks.append(chunk)
+            content = b"".join(chunks)
+    if content.startswith(b"\xff\xd8\xff"): kind = ("jpg", "image/jpeg", "photo")
+    elif content.startswith(b"\x89PNG\r\n\x1a\n"): kind = ("png", "image/png", "photo")
+    elif content.startswith((b"GIF87a", b"GIF89a")): kind = ("gif", "image/gif", "animation")
+    elif content[:4] == b"RIFF" and content[8:12] == b"WEBP": kind = ("webp", "image/webp", "document")
+    elif len(content) >= 12 and content[4:8] == b"ftyp": kind = ("mp4", "video/mp4", "video")
+    else: raise RuntimeError("Downloaded card is empty, unsupported media, or an HTML error page")
+    return content, kind
+
+def archive(card, browser=None):
     caption = f"🎴 {card['name']}\n🎬 {card['series']}\n⭐ T{card['tier']} SHOOB ORIGINAL\n🔗 {card['source_url']}"
     ext = os.path.splitext(urlparse(card["media_url"]).path.lower())[1]
     if ext == ".gif": method, field, stored = "sendAnimation", "animation", "animation"
     elif card["media_type"] == "image": method, field, stored = "sendPhoto", "photo", "photo"
     elif ext in (".mp4", ".mov", ".m4v"): method, field, stored = "sendVideo", "video", "video"
     else: method, field, stored = "sendDocument", "document", "document"
-    msg = api(method, {"chat_id": ARCHIVE_CHAT, field: card["media_url"], "caption": caption})
+    try:
+        msg = api(method, {"chat_id": ARCHIVE_CHAT, field: card["media_url"], "caption": caption})
+    except TelegramError as exc:
+        if not any(text in str(exc).lower() for text in (
+            "failed to get http url content", "wrong file identifier/http url",
+            "wrong type of the web page content", "webpage_curl_failed",
+            "webpage_media_empty", "photo_invalid_dimensions", "image_process_failed"
+        )): raise
+        print("[shoob] Telegram URL fetch failed; downloading media on runner", flush=True)
+        content, (suffix, mime, stored) = download_media(card, browser)
+        field = stored
+        method = {"photo": "sendPhoto", "animation": "sendAnimation",
+                  "video": "sendVideo", "document": "sendDocument"}[stored]
+        files = {field: (f"card.{suffix}", content, mime)}
+        try:
+            msg = api(method, {"chat_id": ARCHIVE_CHAT, "caption": caption}, files=files)
+        except TelegramError as upload_error:
+            if not any(text in str(upload_error).lower() for text in (
+                "photo_invalid_dimensions", "image_process_failed", "photo_ext_invalid"
+            )): raise
+            stored = "document"
+            msg = api("sendDocument", {"chat_id": ARCHIVE_CHAT, "caption": caption},
+                      files={"document": (f"card.{suffix}", content, mime)})
     if stored == "photo": file_id = (msg.get("photo") or [{}])[-1].get("file_id")
     else: file_id = (msg.get(stored) or {}).get("file_id")
     if not file_id: raise RuntimeError("Telegram returned no file_id")
@@ -279,7 +337,7 @@ def main():
                     try:
                         if card is None: card = detail(browser, source)
                         if archived is None:
-                            started = time.monotonic(); archived = archive(card)
+                            started = time.monotonic(); archived = archive(card, browser)
                             telegram_samples.append((time.monotonic() - started) * 1000)
                         started = time.monotonic(); db_retry(conn, lambda: save_card(conn, card, archived))
                         postgres_samples.append((time.monotonic() - started) * 1000)
@@ -348,6 +406,7 @@ def main():
             try: browser.quit()
             except Exception: pass
         conn.close()
-    print(f"done pages {first}-{last}: archived={inserted} skipped={skipped} failed={failed}")
+    print(f"batch stopped at page {page}; completed {pages_done} page(s) of planned {first}-{last}: "
+          f"archived={inserted} skipped={skipped} failed={failed}", flush=True)
 
 if __name__ == "__main__": main()
