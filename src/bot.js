@@ -40,6 +40,7 @@ const TelegramBot = require("node-telegram-bot-api"),
   backup = require("./backup"),
   redeem = require("./redeem"),
   profile = require("./profile"),
+  profileCard = require("./profile-card"),
   broadcastMod = require("./broadcast"),
   attack = require("./attack"),
   fbi = require("./fbi"),
@@ -81,6 +82,8 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
     { command: "cprice", description: "💹 Set archive card value (owner)" },
     { command: "crime", description: "🕵️ Crime" },
     { command: "profile", description: "🪪 Profile / Badges" },
+    { command: "skins", description: "🧍 Profile character skins" },
+    { command: "skin", description: "🎭 Equip a profile skin" },
     { command: "help", description: "❓ Help" },
     { command: "health", description: "👌 Health" },
     { command: "mod", description: "🛡️ Appoint moderator (owner)" },
@@ -1259,18 +1262,47 @@ Use <code>/dep [amount|all]</code> to deposit or <code>/wd [amount|all]</code> t
       });
     },
     p: async (ctx) => {
-      await ctx.reply(profile.profileText(ctx, ctx.userId), {
-        title: "🪪 PROFILE",
-        color: THEME.gold,
-        html: !0,
-      });
+      try {
+        const card = await profileCard.render(ctx, bot);
+        await bot.sendPhoto(ctx.chatId, card.buffer, {
+          caption:
+            `🪪 <b>${card.user.first_name || card.user.username || "PROFILE"}</b>\n` +
+            `${card.profile.emoji} <b>${card.profile.title}</b>\n` +
+            `🎭 ${card.picked.character.name} · ${card.picked.character.title}\n` +
+            `🏆 ${card.progress.rank.toUpperCase()}` +
+            (card.progress.nextRank ? ` · ${card.progress.remaining} to ${card.progress.nextRank.toUpperCase()}` : " · MAX RANK"),
+          parse_mode: "HTML",
+          reply_to_message_id: ctx.msg && ctx.msg.message_id,
+        });
+      } catch (e) {
+        console.error("[profile-card] render:", e.message);
+        await ctx.reply(profile.profileText(ctx, ctx.userId), {
+          title: "🪪 PROFILE",
+          color: THEME.gold,
+          html: !0,
+        });
+      }
     },
-    profile: async (ctx) => {
-      await ctx.reply(profile.profileText(ctx, ctx.userId), {
-        title: "🪪 PROFILE",
-        color: THEME.gold,
-        html: !0,
-      });
+    profile: async (ctx) => handlers.p(ctx),
+    skins: async (ctx) => {
+      await ctx.reply(
+        `🎭 <b>JTF PROFILE SKINS</b>\n\n${profileCard.listSkins()}\n\nEquip with <code>/skin kael</code>`,
+        { title: "🎭 PROFILE SKINS", color: THEME.cyan, html: !0 },
+      );
+    },
+    skin: async (ctx) => {
+      const wanted = (ctx.args || []).join(" ").trim();
+      if (!wanted) return handlers.skins(ctx);
+      const result = profileCard.setSkin(ctx.userId, wanted);
+      if (!result.ok)
+        return ctx.reply(result.message, {
+          title: "🎭 PROFILE SKINS",
+          color: THEME.red,
+        });
+      await ctx.reply(
+        `✅ Equipped <b>${result.character.name}</b> · ${result.character.title}. Use <code>/p</code> to view it.`,
+        { title: "🎭 SKIN EQUIPPED", color: THEME.gold, html: !0 },
+      );
     },
     badges: async (ctx) => {
       await ctx.reply(profile.badgesText(ctx, ctx.userId), {
@@ -1385,21 +1417,30 @@ Use <code>/dep [amount|all]</code> to deposit or <code>/wd [amount|all]</code> t
         next = rank.RANKS[idx + 1],
         need = next ? rank.THRESHOLDS[idx + 1] : null,
         have = Number(u.rank_valid_matches || 0),
+        losses = Number(u.rank_consecutive_losses || 0),
         remain = next ? Math.max(0, need - have) : 0,
         emoji = ["🥉", "🥈", "🥇", "💠", "💎", "🔮", "👑", "🌌"][idx] || "🥉",
-        caption = `${emoji} <b>${cur.toUpperCase()}</b>
-
-Valid matches: <b>${have}</b>${
+        nextReward = next ? rank.rewardFor(next) : null,
+        caption = [
+          `${emoji} <b>${cur.toUpperCase()}</b>`,
+          "",
+          next ? `Valid matches: <b>${have}</b> / <b>${need}</b>` : `Valid matches: <b>${have}</b>`,
           next
-            ? ` / <b>${need}</b>
-${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.toUpperCase()}</b>`
-            : `
-👑 You are at the TOP rank.`
-        }`,
-        img = path.join(__dirname, "assets", "ranks", `${cur}.png`);
+            ? `${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.toUpperCase()}</b>`
+            : `👑 <b>MAX RANK</b>`,
+          `📉 Consecutive losses: <b>${losses}/7</b>`,
+          nextReward
+            ? `🎁 Next reward: <b>${fmt(nextReward.coins)}</b> coins${nextReward.timed ? " (timed)" : ""}`
+            : `🌌 Mythic progression complete.`,
+        ].join("\n"),
+        img = path.join(__dirname, "..", "assets", "ranks", `${cur}.png`);
       try {
         if (fs.existsSync(img)) {
-          await bot.sendPhoto(ctx.chatId, img, { caption, parse_mode: "HTML" });
+          await bot.sendPhoto(ctx.chatId, fs.createReadStream(img), {
+            caption,
+            parse_mode: "HTML",
+            reply_to_message_id: ctx.msg && ctx.msg.message_id,
+          });
           return;
         }
       } catch (e) {
@@ -1478,13 +1519,34 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
       });
     },
     hunt: async (ctx) => {
-      return archiveCardShop.showMenu(bot, ctx.chatId);
+      if (!ctx.isOwner)
+        return ctx.reply("Only the owner can force a Hunt spawn.", {
+          title: "🔒 OWNER ONLY",
+          color: THEME.red,
+        });
+      const r = await hunt.spawn({ chatId: ctx.chatId });
+      if (!r.ok)
+        await ctx.reply(r.message, { title: "🃏 HUNT", color: THEME.gold });
     },
     shunt: async (ctx) => {
-      return archiveCardShop.showMenu(bot, ctx.chatId);
+      if (!ctx.isOwner)
+        return ctx.reply("Only the owner can force a Special Hunt spawn.", {
+          title: "🔒 OWNER ONLY",
+          color: THEME.red,
+        });
+      const r = await hunt.spawnSpecial({ chatId: ctx.chatId });
+      if (!r.ok)
+        await ctx.reply(r.message, { title: "✦ SPECIAL HUNT", color: THEME.gold });
     },
     card: async (ctx) => {
-      return archiveCardShop.showMenu(bot, ctx.chatId);
+      if (!ctx.isOwner)
+        return ctx.reply("Only the owner can force a Signature spawn.", {
+          title: "🔒 OWNER ONLY",
+          color: THEME.red,
+        });
+      const r = await hunt.spawnSignature({ chatId: ctx.chatId });
+      if (!r.ok)
+        await ctx.reply(r.message, { title: "♦️ JTF SIGNATURE", color: THEME.gold });
     },
     cshop: async (ctx) => archiveCardShop.showMenu(bot, ctx.chatId),
     cprice: async (ctx) => {
