@@ -1430,6 +1430,20 @@ async function searchShoobCards(query, tier = 0, limit = 24, offset = 0) {
   return { rows: resultRows, total };
 }
 
+async function randomShoobCards(tier = 0, limit = 20) {
+  if (!pgReady || !pgPool) return [];
+  const safeTier = Math.max(0, Math.min(6, Number(tier) || 0));
+  const safeLimit = Math.max(1, Math.min(50, Number(limit) || 20));
+  const params = safeTier ? [safeTier, safeLimit] : [safeLimit];
+  const where = safeTier ? 'WHERE tier = $1' : '';
+  const limitRef = safeTier ? '$2' : '$1';
+  const result = await shoobPgQuery(`SELECT source_url, name, normalized_name, series, tier, media_url, media_type,
+      telegram_file_id, telegram_media_type, telegram_message_id, archive_chat_id
+    FROM shoob_cards ${where} AND telegram_file_id <> ''
+    ORDER BY RANDOM() LIMIT ${limitRef}`.replace('FROM shoob_cards  AND', 'FROM shoob_cards WHERE'), params);
+  return result.rows || [];
+}
+
 async function shoobCatalogueStats() {
   if (!pgReady || !pgPool) return { total: 0, unavailable: true };
   const started = Date.now();
@@ -1502,6 +1516,15 @@ function setSetting(key, value) {
      ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
     [key, String(value == null ? '' : value), now]
   );
+}
+
+function deleteSetting(key) {
+  prep('DELETE FROM settings WHERE key = ?').run(key);
+  pgRun('settings', 'DELETE FROM settings WHERE key = $1', [key]);
+}
+
+function listSettings(prefix = '') {
+  return prep('SELECT key, value, updated_at FROM settings WHERE key LIKE ? ORDER BY key').all(`${String(prefix)}%`);
 }
 
 /* ===================== HIDE ===================== */
@@ -2374,10 +2397,10 @@ module.exports = {
   // Memory
   setMemory, getMemory, getMemoriesByCategory, deleteMemory,
   // Shoob Telegram archive
-  searchShoobCards, shoobCatalogueStats, normalizeShoobSearch,
+  searchShoobCards, randomShoobCards, shoobCatalogueStats, normalizeShoobSearch,
   // Bot state
   setBotPaused, getBotPaused,
-  getSetting, setSetting,
+  getSetting, setSetting, deleteSetting, listSettings,
   // Hide
   setHidden, isHidden,
   // Ping

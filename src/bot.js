@@ -49,6 +49,7 @@ const TelegramBot = require("node-telegram-bot-api"),
   hunt = require("./hunt"),
   shoobCards = require("./shoob-cards"),
   shoobWorkflow = require("./shoob-workflow"),
+  archiveCardShop = require("./archive-card-shop"),
   crender = require("./crender"),
   customCards = require("./custom-cards"),
   staffSpectator = require("./staff-spectator"),
@@ -76,6 +77,8 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
     { command: "games", description: "🎮 Games" },
     { command: "economy", description: "💼 Economy" },
     { command: "shop", description: "🛒 Shop" },
+    { command: "cshop", description: "🎴 Archive card shop" },
+    { command: "cprice", description: "💹 Set archive card value (owner)" },
     { command: "crime", description: "🕵️ Crime" },
     { command: "profile", description: "🪪 Profile / Badges" },
     { command: "help", description: "❓ Help" },
@@ -90,14 +93,9 @@ const REACT_KEYS = Object.keys(config.reactions).filter(
     { command: "swat", description: "🚔 SWAT raid (owner)" },
     { command: "rank", description: "🏆 Your rank" },
     { command: "ranks", description: "📊 Rank ladder" },
-    { command: "waifu", description: "💝 Spawn a waifu (owner)" },
-    { command: "swaifu", description: "💍 Spawn a SUPER waifu (owner)" },
     { command: "collection", description: "💝 Your waifu collection" },
     { command: "wlb", description: "💝 Waifu leaderboard" },
     { command: "viewwaifu", description: "💝 View a waifu by number" },
-    { command: "hunt", description: "🃏 Spawn a Gen 2 card (owner)" },
-    { command: "shunt", description: "✦ Special Hunt — Old Gen card (owner)" },
-    { command: "card", description: "♦️ Spawn a JTF Signature card (owner)" },
     { command: "crender", description: "♦️ Custom card renderer" },
     { command: "customcards", description: "💾 Your custom cards" },
     { command: "cview", description: "♦️ View saved custom card" },
@@ -1433,34 +1431,13 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
       await handleSet(ctx);
     },
     waifu: async (ctx) => {
-      if (!ctx.isOwner)
-        return ctx.reply("Only the King can spawn a waifu. 👑", {
-          title: "💝 WAIFU",
-          color: THEME.red,
-        });
-      await waifu.spawn({ chatId: ctx.chatId });
+      return ctx.reply("Free card spawning is retired. Use <code>/cshop</code> for archive cards.", { title: "🎴 CARD SHOP", color: THEME.gold, html: !0 });
     },
     wspawn: async (ctx) => {
-      if (!ctx.isOwner)
-        return ctx.reply("Only the King can spawn a waifu. 👑", {
-          title: "💝 WAIFU",
-          color: THEME.red,
-        });
-      await waifu.spawn({ chatId: ctx.chatId });
+      return ctx.reply("Free card spawning is retired. Use <code>/cshop</code> for archive cards.", { title: "🎴 CARD SHOP", color: THEME.gold, html: !0 });
     },
     swaifu: async (ctx) => {
-      if (!ctx.isOwner)
-        return ctx.reply("Only the King can spawn a super waifu. 👑", {
-          title: "💍 SUPER WAIFU",
-          color: THEME.red,
-        });
-      const r = await waifu.spawnSuper({ chatId: ctx.chatId });
-      r.ok ||
-        (await ctx.reply(r.message, {
-          title: "💍 SUPER WAIFU",
-          color: THEME.gold,
-          html: !0,
-        }));
+      return ctx.reply("Free card spawning is retired. Use <code>/cshop</code> for archive cards.", { title: "🎴 CARD SHOP", color: THEME.gold, html: !0 });
     },
     collection: async (ctx) => {
       const rows = db.getUserCharacters(ctx.userId);
@@ -1501,46 +1478,36 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
       });
     },
     hunt: async (ctx) => {
-      if (!ctx.isOwner)
-        return ctx.reply("Only the King can spawn a card. 👑", {
-          title: "🃏 CARDS",
-          color: THEME.red,
-        });
-      const r = await hunt.spawn({ chatId: ctx.chatId });
-      r.ok ||
-        (await ctx.reply(r.message, {
-          title: "🃏 CARDS",
-          color: THEME.gold,
-          html: !0,
-        }));
+      return archiveCardShop.showMenu(bot, ctx.chatId);
     },
     shunt: async (ctx) => {
-      if (!ctx.isOwner)
-        return ctx.reply("Only the King can use Special Hunt. 👑", {
-          title: "✦ SPECIAL HUNT",
-          color: THEME.red,
-        });
-      const r = await hunt.spawnSpecial({ chatId: ctx.chatId });
-      r.ok ||
-        (await ctx.reply(r.message, {
-          title: "✦ SPECIAL HUNT",
-          color: THEME.gold,
-          html: !0,
-        }));
+      return archiveCardShop.showMenu(bot, ctx.chatId);
     },
     card: async (ctx) => {
-      if (!ctx.isOwner)
-        return ctx.reply("Only the King can spawn a JTF Signature card. 👑", {
-          title: "♦️ JTF SIGNATURE",
-          color: THEME.red,
-        });
-      const r = await hunt.spawnSignature({ chatId: ctx.chatId });
-      r.ok ||
-        (await ctx.reply(r.message, {
-          title: "♦️ JTF SIGNATURE",
-          color: THEME.gold,
-          html: !0,
-        }));
+      return archiveCardShop.showMenu(bot, ctx.chatId);
+    },
+    cshop: async (ctx) => archiveCardShop.showMenu(bot, ctx.chatId),
+    cprice: async (ctx) => {
+      if (!ctx.isOwner) return ctx.reply("Only the King controls card market values. 👑", { title: "🔒 OWNER ONLY", color: THEME.red });
+      const args = ctx.args || [];
+      if (String(args[0] || "").toLowerCase() === "list") {
+        const rows = db.listSettings("card_price:");
+        return ctx.reply(rows.length ? rows.slice(0, 50).map((r) => `${r.key.replace(/^card_price:/, "").replace(/:t([1-6])$/, " T$1")} — ${fmt(Number(r.value))}`).join("\n") : "No custom card prices yet.", { title: "💹 CARD PRICES", color: THEME.gold });
+      }
+      const reset = String(args[0] || "").toLowerCase() === "reset";
+      const work = reset ? args.slice(1) : args.slice();
+      const tierIndex = work.findIndex((v) => /^t[1-6]$/i.test(String(v)));
+      if (tierIndex < 1) return ctx.reply("Usage: <code>/cprice Goku t6 500b</code>\nReset: <code>/cprice reset Goku t6</code>\nList: <code>/cprice list</code>", { title: "💹 CARD PRICES", color: THEME.gold, html: !0 });
+      const name = work.slice(0, tierIndex).join(" "), cardTier = Number(String(work[tierIndex]).slice(1));
+      const key = archiveCardShop.priceKey({ name, tier: cardTier });
+      if (reset) { db.deleteSetting(key); return ctx.reply(`Default market pricing restored for ${name} T${cardTier}.`, { title: "💹 CARD PRICES", color: THEME.gold }); }
+      const raw = String(work[tierIndex + 1] || "").toLowerCase().replace(/,/g, "");
+      const match = raw.match(/^(\d+(?:\.\d+)?)([kmbt]?)$/);
+      if (!match) return ctx.reply("Invalid price. Examples: <code>500m</code>, <code>25b</code>, <code>1.5t</code>.", { title: "💹 CARD PRICES", color: THEME.red, html: !0 });
+      const scale = { "": 1, k: 1e3, m: 1e6, b: 1e9, t: 1e12 }[match[2]], amount = Math.floor(Number(match[1]) * scale);
+      if (!Number.isSafeInteger(amount) || amount <= 0) return ctx.reply("That price is outside Rimuru's safe coin range.", { title: "💹 CARD PRICES", color: THEME.red });
+      db.setSetting(key, String(amount));
+      return ctx.reply(`${name} T${cardTier} now costs <b>${fmt(amount)}</b>.`, { title: "💹 CARD PRICE SET", color: THEME.gold, html: !0 });
     },
     crender: async (ctx) => {
       await crender.start(ctx);
@@ -1666,13 +1633,15 @@ ${remain} more valid ${remain === 1 ? "match" : "matches"} to enter <b>${next.to
       });
     },
     char: async (ctx) => {
-      await handleCharLookup(ctx);
+      const result = await shoobCards.startSearch(bot, ctx.chatId, ctx.userId, (ctx.args || []).join(" "));
+      if (!result.ok) await ctx.reply(result.message, { title: "🎴 ARCHIVE SEARCH", color: THEME.gold, html: !0 });
     },
     whois: async (ctx) => {
-      await handleCharLookup(ctx);
+      const result = await shoobCards.startSearch(bot, ctx.chatId, ctx.userId, (ctx.args || []).join(" "));
+      if (!result.ok) await ctx.reply(result.message, { title: "🎴 ARCHIVE SEARCH", color: THEME.gold, html: !0 });
     },
     cardstyle: async (ctx) => {
-      await promptCharStyle(ctx, "");
+      await ctx.reply("Rimuru now uses Telegram archive originals only. No external artwork style is selected.", { title: "🎴 ARCHIVE-ONLY MODE", color: THEME.gold });
     },
     shoob: async (ctx) => {
       const result = await shoobCards.startSearch(bot, ctx.chatId, ctx.userId, (ctx.args || []).join(" "));
@@ -2001,7 +1970,7 @@ ${res.message}`,
         "No waifu at that number. Use <code>/collection</code> to see your list.",
         { title: "💝 WAIFU", color: "#FF80AB", html: !0 },
       );
-    if (depsPhoto)
+    if (depsPhoto && row.image_url && !/^https?:\/\//i.test(String(row.image_url)))
       try {
         await depsPhoto(ctx.chatId, row.image_url, {
           caption: waifu.detailCaption(row),
@@ -2027,16 +1996,9 @@ ${res.message}`,
       );
     const cached = db.getCachedHuntCharacter(row.character_id) || {},
       full = { ...cached, ...row };
-    try {
-      const sent = await hunt.sendCardPhoto(
-        ctx.chatId,
-        full,
-        hunt.detailCaption(full, { claimedAt: row.claimed_at }),
-        null,
-      );
-      if (sent) return;
-    } catch (e) {
-      console.warn("[cards] view render/send failed:", e.message);
+    if (row.image_url && !/^https?:\/\//i.test(String(row.image_url))) {
+      try { await bot.sendPhoto(ctx.chatId, row.image_url, { caption: hunt.detailCaption(full, { claimedAt: row.claimed_at }), parse_mode: "HTML" }); return; }
+      catch (e) { console.warn("[cards] archived file_id view failed:", e.message); }
     }
     await ctx.reply(hunt.detailCaption(full, { claimedAt: row.claimed_at }), {
       title: "🃏 CARDS",
@@ -2077,6 +2039,11 @@ ${res.message}`,
       check = canInteract(userId, !0);
     if (!check.allowed) {
       check.reply && (await answerCb(check.reply));
+      return;
+    }
+    if (data.startsWith("cshop:")) {
+      try { await archiveCardShop.handleCallback(bot, query); }
+      catch (e) { console.error("[card-shop] callback:", e.message); await bot.answerCallbackQuery(query.id, { text: "Card shop failed. No purchase was completed.", show_alert: true }).catch(() => {}); }
       return;
     }
     try {
@@ -2136,13 +2103,13 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
             `<b>🎮 Games</b>: /slots · /dice · /cf · /mines · /bj · /roulette · /hl · /guess · /race · /lottery
 <b>💼 Economy</b>: /balance · /dep · /wd · /donate · /transfer
 <b>🕵️ Crime</b>: /rob · /crime · /heist · /join
-<b>🛒 Shop</b>: /shop · /buy · /inv
+<b>🛒 Shop</b>: /shop · /buy · /inv · /cshop
 <b>🎣 Activities</b>: /fish · /dig
 <b>💵 Income</b>: /beg · /work · /daily · /bonus
 <b>👻 Sneaky</b>: /hide (vanish from robs &amp; heists for 60s)
 <b>🏆</b> /lb · <b>📜</b> /menu · <b>✅</b> /verify · <b>👌</b> /health · <b>🏆</b> /rank
-<b>💝</b> /waifu · /collection · /viewwaifu · /wlb
-<b>⚔️</b> /hunt · /char · /characters · /viewchar · /clb
+<b>💝</b> /collection · /viewwaifu · /wlb
+<b>🎴</b> /cshop · /char · /shoob · /characters · /viewchar · /clb
 <b>👑 Staff</b>: /sb · /broadcast (/bd) · /set (/s) · /attack · /FBI (/SWAT) · /backup · /stop
 💬 <i>Reply to me or say "Rimuru" to talk.</i>`,
             { title: "❓ HELP", color: THEME.gold, html: !0 },
@@ -2502,6 +2469,7 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
             "cancel",
             "cset",
             "creset",
+            "cprice",
           ];
           if (
             !isStaff(ctx.userId) &&
@@ -2778,16 +2746,8 @@ Welcome to the house, ${from.first_name || "mortal"}. Everything is unlocked. �
     });
   });
   (bot.on("message", onMessage), bot.on("callback_query", onCallbackQuery));
-  try {
-    waifu.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
-  } catch (e) {
-    console.error("[waifu] auto-spawn wiring failed:", e.message);
-  }
-  try {
-    hunt.startAutoSpawn(bot, { getChatIds: db.getSeenChatIds });
-  } catch (e) {
-    console.error("[hunt] auto-spawn wiring failed:", e.message);
-  }
+  try { archiveCardShop.start(bot, db.getSeenChatIds); }
+  catch (e) { console.error("[card-shop] hourly wiring failed:", e.message); }
   (setInterval(() => {
     const expired = db.expirePenalties();
     for (const u of expired)
