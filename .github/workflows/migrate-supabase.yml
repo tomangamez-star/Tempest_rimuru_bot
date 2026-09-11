@@ -56,9 +56,12 @@ jobs:
             -v "$RUNNER_TEMP/rimuru-migration:/migration:ro" \
             postgres:17-alpine \
             sh -ec '
-              pg_restore --exit-on-error --no-owner --no-privileges --schema=public --file=/tmp/rimuru-restore.sql /migration/rimuru.dump
+              # Own schema creation explicitly, whether or not the archive includes it.
+              pg_restore --list /migration/rimuru.dump > /tmp/rimuru-toc.list
+              sed -E "/^[0-9]+;[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+SCHEMA[[:space:]]+-[[:space:]]+public([[:space:]]|$)/d" /tmp/rimuru-toc.list > /tmp/rimuru-restore.list
+              pg_restore --exit-on-error --no-owner --no-privileges --schema=public --use-list=/tmp/rimuru-restore.list --file=/tmp/rimuru-restore.sql /migration/rimuru.dump
               psql --dbname="$NEW_DATABASE_URL" -X --single-transaction -v ON_ERROR_STOP=1 \
-                -c "DROP SCHEMA IF EXISTS public CASCADE;" -f /tmp/rimuru-restore.sql
+                -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;" -f /tmp/rimuru-restore.sql
             '
           echo "New database restore completed."
 
