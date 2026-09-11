@@ -51,6 +51,24 @@ jobs:
           NEW_DATABASE_URL: ${{ secrets.NEW_DATABASE_URL }}
         run: |
           set -euo pipefail
+          cat > "$RUNNER_TEMP/rimuru-migration/prepare-public.sql" <<'SQL'
+          DROP SCHEMA IF EXISTS public CASCADE;
+          CREATE SCHEMA public;
+          -- The source indexes explicitly reference public.gin_trgm_ops.
+          -- A schema-only dump does not include extension installation.
+          CREATE EXTENSION IF NOT EXISTS pg_trgm WITH SCHEMA public;
+          DO $migration$
+          BEGIN
+            IF EXISTS (
+              SELECT 1 FROM pg_extension e
+              JOIN pg_namespace n ON n.oid = e.extnamespace
+              WHERE e.extname = 'pg_trgm' AND n.nspname <> 'public'
+            ) THEN
+              ALTER EXTENSION pg_trgm SET SCHEMA public;
+            END IF;
+          END
+          $migration$;
+          SQL
           docker run --rm \
             -e NEW_DATABASE_URL \
             -v "$RUNNER_TEMP/rimuru-migration:/migration:ro" \
@@ -61,7 +79,7 @@ jobs:
               sed -E "/^[0-9]+;[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+SCHEMA[[:space:]]+-[[:space:]]+public([[:space:]]|$)/d" /tmp/rimuru-toc.list > /tmp/rimuru-restore.list
               pg_restore --exit-on-error --no-owner --no-privileges --schema=public --use-list=/tmp/rimuru-restore.list --file=/tmp/rimuru-restore.sql /migration/rimuru.dump
               psql --dbname="$NEW_DATABASE_URL" -X --single-transaction -v ON_ERROR_STOP=1 \
-                -c "DROP SCHEMA IF EXISTS public CASCADE; CREATE SCHEMA public;" -f /tmp/rimuru-restore.sql
+                -f /migration/prepare-public.sql -f /tmp/rimuru-restore.sql
             '
           echo "New database restore completed."
 
