@@ -1,0 +1,46 @@
+name: Apply JTF Final Integration
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Apply bot.js integration
+        run: node scripts/apply-jtf-final.js
+
+      - name: Syntax checks
+        run: |
+          node --check src/bot.js
+          node --check src/profile.js
+          node --check src/profile-card.js
+          node --check src/archive-card-shop.js
+
+      - name: Integration tests
+        run: |
+          node tests/archive-card-shop-integration-test.js
+          node tests/profile-exclusive-badges-test.js
+
+      - name: Commit generated bot.js change
+        run: |
+          if git diff --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add src/bot.js
+          git commit -m "feat: join JTF profile ranks skins archive shop integration"
+          git push
