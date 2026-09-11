@@ -1,0 +1,125 @@
+{
+  "version": 1,
+  "characters": [
+    {
+      "id": "kael",
+      "name": "Kael",
+      "title": "Ashblade",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/kael/default.png"
+        }
+      ]
+    },
+    {
+      "id": "nyra",
+      "name": "Nyra",
+      "title": "Moonweaver",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/nyra/default.png"
+        }
+      ]
+    },
+    {
+      "id": "razen",
+      "name": "Razen",
+      "title": "Stormfist",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/razen/default.png"
+        }
+      ]
+    },
+    {
+      "id": "veyra",
+      "name": "Veyra",
+      "title": "Crimson Thorn",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/veyra/default.png"
+        }
+      ]
+    },
+    {
+      "id": "orren",
+      "name": "Orren",
+      "title": "Iron Warden",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/orren/default.png"
+        }
+      ]
+    },
+    {
+      "id": "sorae",
+      "name": "Sorae",
+      "title": "Dawn Ranger",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/sorae/default.png"
+        }
+      ]
+    },
+    {
+      "id": "zayden",
+      "name": "Zayden",
+      "title": "Void Regent",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/zayden/default.png"
+        }
+      ]
+    },
+    {
+      "id": "amara",
+      "name": "Amara",
+      "title": "Sunforge",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/amara/default.png"
+        }
+      ]
+    },
+    {
+      "id": "lucen",
+      "name": "Lucen",
+      "title": "Frostbound",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/lucen/default.png"
+        }
+      ]
+    },
+    {
+      "id": "tsuki",
+      "name": "Tsuki",
+      "title": "Nightfox",
+      "skins": [
+        {
+          "id": "default",
+          "name": "Default",
+          "image": "assets/skins/tsuki/default.png"
+        }
+      ]
+    }
+  ]
+}
